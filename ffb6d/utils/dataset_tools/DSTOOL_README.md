@@ -8,12 +8,6 @@
   sh rastertriangle_so.sh
   cd ..
   ```
-- Compile the FPS scripts:
-  ```shell
-  cd fps/
-  python3 setup.py build_ext --inplace
-  cd ..
-  ```
 - Install python3 requirement by:
   ```shell
   pip3 install -r requirement.txt

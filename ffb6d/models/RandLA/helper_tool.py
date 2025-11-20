@@ -11,8 +11,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(BASE_DIR)
 sys.path.append(os.path.join(BASE_DIR, 'utils'))
 
-import cpp_wrappers.cpp_subsampling.grid_subsampling as cpp_subsampling
-import nearest_neighbors.lib.python.nearest_neighbors as nearest_neighbors
+import torch
 
 
 class ConfigSemanticKITTI:
@@ -166,8 +165,21 @@ class DataProcessing:
         :return: neighbor_idx: neighboring points indexes, B*N2*k
         """
 
-        neighbor_idx = nearest_neighbors.knn_batch(support_pts, query_pts, k, omp=True)
-        return neighbor_idx.astype(np.int32)
+        support = torch.as_tensor(support_pts, dtype=torch.float32)
+        queries = torch.as_tensor(query_pts, dtype=torch.float32)
+
+        if support.dim() != 3 or queries.dim() != 3:
+            raise ValueError("support_pts and query_pts must be of shape (B, N, 3)")
+
+        if torch.cuda.is_available():
+            support = support.cuda()
+            queries = queries.cuda()
+
+        # torch.cdist supports batched computation on GPU and CPU.
+        distances = torch.cdist(queries, support, p=2)
+        neighbor_idx = torch.topk(distances, k=k, largest=False, dim=-1).indices
+
+        return neighbor_idx.cpu().numpy().astype(np.int32)
 
     @staticmethod
     def data_aug(xyz, color, labels, idx, num_out):
@@ -199,7 +211,7 @@ class DataProcessing:
     @staticmethod
     def grid_sub_sampling(points, features=None, labels=None, grid_size=0.1, verbose=0):
         """
-        CPP wrapper for a grid sub_sampling (method = barycenter for points and features
+        PyTorch implementation of grid sub-sampling (method = barycenter for points and features)
         :param points: (N, 3) matrix of input points
         :param features: optional (N, d) matrix of features (floating number)
         :param labels: optional (N,) matrix of integer labels
@@ -208,15 +220,42 @@ class DataProcessing:
         :return: sub_sampled points, with features and/or labels depending of the input
         """
 
-        if (features is None) and (labels is None):
-            return cpp_subsampling.compute(points, sampleDl=grid_size, verbose=verbose)
-        elif labels is None:
-            return cpp_subsampling.compute(points, features=features, sampleDl=grid_size, verbose=verbose)
-        elif features is None:
-            return cpp_subsampling.compute(points, classes=labels, sampleDl=grid_size, verbose=verbose)
-        else:
-            return cpp_subsampling.compute(points, features=features, classes=labels, sampleDl=grid_size,
-                                           verbose=verbose)
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        pts = torch.as_tensor(points, dtype=torch.float32, device=device)
+
+        voxel_coords = torch.floor(pts / grid_size)
+        unique_coords, inverse = torch.unique(voxel_coords, return_inverse=True, dim=0)
+
+        counts = torch.bincount(inverse)
+        pts_sum = torch.zeros((unique_coords.shape[0], pts.shape[1]), device=device)
+        pts_sum.scatter_add_(0, inverse.unsqueeze(-1).expand_as(pts), pts)
+        sub_pts = pts_sum / counts.unsqueeze(1)
+
+        results = [sub_pts.cpu().numpy()]
+
+        if features is not None:
+            feats = torch.as_tensor(features, dtype=torch.float32, device=device)
+            feat_sum = torch.zeros((unique_coords.shape[0], feats.shape[1]), device=device)
+            feat_sum.scatter_add_(0, inverse.unsqueeze(-1).expand_as(feats), feats)
+            sub_feats = feat_sum / counts.unsqueeze(1)
+            results.append(sub_feats.cpu().numpy())
+
+        if labels is not None:
+            lbls = torch.as_tensor(labels, dtype=torch.long, device=device)
+            # compute majority label per voxel
+            max_label = lbls.max().item() + 1
+            one_hot = torch.zeros((lbls.shape[0], max_label), device=device)
+            one_hot.scatter_(1, lbls.view(-1, 1), 1)
+            label_sum = torch.zeros((unique_coords.shape[0], max_label), device=device)
+            label_sum.scatter_add_(0, inverse.unsqueeze(-1).expand_as(one_hot), one_hot)
+            sub_labels = torch.argmax(label_sum, dim=1)
+            results.append(sub_labels.cpu().numpy().astype(np.int32))
+
+        if len(results) == 1:
+            return results[0]
+        if len(results) == 2:
+            return results[0], results[1]
+        return results[0], results[1], results[2]
 
     @staticmethod
     def IoU_from_confusions(confusions):
@@ -249,13 +288,13 @@ class DataProcessing:
     def get_class_weights(dataset_name):
         # pre-calculate the number of points in each category
         num_per_class = []
-        if dataset_name is 'S3DIS':
+        if dataset_name == 'S3DIS':
             num_per_class = np.array([3370714, 2856755, 4919229, 318158, 375640, 478001, 974733,
                                       650464, 791496, 88727, 1284130, 229758, 2272837], dtype=np.int32)
-        elif dataset_name is 'Semantic3D':
+        elif dataset_name == 'Semantic3D':
             num_per_class = np.array([5181602, 5012952, 6830086, 1311528, 10476365, 946982, 334860, 269353],
                                      dtype=np.int32)
-        elif dataset_name is 'SemanticKITTI':
+        elif dataset_name == 'SemanticKITTI':
             num_per_class = np.array([55437630, 320797, 541736, 2578735, 3274484, 552662, 184064, 78858,
                                       240942562, 17294618, 170599734, 6369672, 230413074, 101130274, 476491114,
                                       9833174, 129609852, 4506626, 1168181])

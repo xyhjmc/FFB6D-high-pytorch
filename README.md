@@ -50,20 +50,16 @@ year = {2020}
 ## Demo Video
 See our demo video on [YouTube](https://www.youtube.com/watch?v=SSi2TnyD6Is) or [bilibili](https://www.bilibili.com/video/BV1YU4y1a7Kp?from=search&seid=8306279574921937158).
 ## Installation
-- Install CUDA 10.1 / 10.2
-- Set up python3 environment from requirement.txt:
+- Use Python **3.10** and a CUDA-enabled GPU (tested with CUDA 12.6 / RTX 4060).
+- Install PyTorch **2.X** with the appropriate CUDA wheels, e.g.:
   ```shell
-  pip3 install -r requirement.txt 
+  pip3 install torch==2.2.2 torchvision==0.17.2 --index-url https://download.pytorch.org/whl/cu121
   ```
-- Install [apex](https://github.com/NVIDIA/apex):
+- Install dependencies from requirement.txt:
   ```shell
-  git clone https://github.com/NVIDIA/apex
-  cd apex
-  export TORCH_CUDA_ARCH_LIST="6.0;6.1;6.2;7.0;7.5"  # set the target architecture manually, suggested in issue https://github.com/NVIDIA/apex/issues/605#issuecomment-554453001
-  pip3 install -v --disable-pip-version-check --no-cache-dir --global-option="--cpp_ext" --global-option="--cuda_ext" ./
-  cd ..
+  pip3 install -r requirement.txt
   ```
-- Install [normalSpeed](https://github.com/hfutcgncas/normalSpeed), a fast and light-weight normal map estimator:
+- (Optional) Install [normalSpeed](https://github.com/hfutcgncas/normalSpeed), a fast and light-weight normal map estimator:
   ```shell
   git clone https://github.com/hfutcgncas/normalSpeed.git
   cd normalSpeed/normalSpeed
@@ -72,11 +68,7 @@ See our demo video on [YouTube](https://www.youtube.com/watch?v=SSi2TnyD6Is) or 
   ```
 - Install tkinter through ``sudo apt install python3-tk``
 
-- Compile [RandLA-Net](https://github.com/qiqihaer/RandLA-Net-pytorch) operators:
-  ```shell
-  cd ffb6d/models/RandLA/
-  sh compile_op.sh
-  ```
+- Custom CUDA/C++ operators are no longer required. KNN search, grid subsampling, and FPS have been reimplemented in PyTorch/NumPy so the project builds cleanly on PyTorch 2.X.
 
 ## Code Structure
 <details>
@@ -167,7 +159,7 @@ See our demo video on [YouTube](https://www.youtube.com/watch?v=SSi2TnyD6Is) or 
   ```
   The trained checkpoints are stored in ``train_log/linemod/checkpoints/{cls}/``, ``train_log/linemod/checkpoints/ape/`` in this example.
   
-  **A tip for saving GPU memory**: you can open the mixed precision mode to save GPU memory by passing parameters ```opt_level=O1``` to ```train_lm.py```. The document for apex mixed precision trainnig can be found [here](https://nvidia.github.io/apex/amp.html?highlight=opt_level). If you use less than 8 GPU and the batch size is less than "3x8=24", it's recommended to use mixed precision trainning and increase the ```mini_batch_size``` in ```common.py``` as large as possible.
+  **A tip for saving GPU memory**: PyTorch 2.X provides native mixed precision (``torch.cuda.amp``). If you use fewer than 8 GPUs and the batch size is less than "3x8=24", consider enabling mixed precision in your training runs and increase the ```mini_batch_size``` in ```common.py``` as large as possible.
 
 
 ### Evaluating on the LineMOD Dataset
@@ -200,7 +192,7 @@ See our demo video on [YouTube](https://www.youtube.com/watch?v=SSi2TnyD6Is) or 
   ```
   The trained model checkpoints are stored in ``train_log/ycb/checkpoints/``
   
-  **A tip for saving GPU memory**: you can open the mixed precision mode to save GPU memory by passing parameters ```opt_level=O1``` to ```train_ycb.py```. The document for apex mixed precision trainnig can be found [here](https://nvidia.github.io/apex/amp.html?highlight=opt_level). If you use less than 8 GPU and the batch size is less than "3x8=24", it's recommended to use mixed precision trainning and increase the ```mini_batch_size``` in ```common.py``` as large as possible.
+  **A tip for saving GPU memory**: PyTorch 2.X provides native mixed precision (``torch.cuda.amp``). If you use fewer than 8 GPUs and the batch size is less than "3x8=24", consider enabling mixed precision in your training runs and increase the ```mini_batch_size``` in ```common.py``` as large as possible.
 
 ### Evaluating on the YCB-Video Dataset
 - Start evaluating by:
