@@ -1,7 +1,7 @@
 h5py>=3.10
 numpy>=1.24
-torch==2.2.2
-torchvision==0.17.2
+torch==2.9.1+cu126
+torchvision==0.24.1+cu126
 pandas>=2.2
 pyyaml>=6.0.1
 scipy>=1.10
