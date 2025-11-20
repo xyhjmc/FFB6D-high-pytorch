@@ -51,9 +51,9 @@ year = {2020}
 See our demo video on [YouTube](https://www.youtube.com/watch?v=SSi2TnyD6Is) or [bilibili](https://www.bilibili.com/video/BV1YU4y1a7Kp?from=search&seid=8306279574921937158).
 ## Installation
 - Use Python **3.10** and a CUDA-enabled GPU (tested with CUDA 12.6 / RTX 4060).
-- Install PyTorch **2.X** with the appropriate CUDA wheels, e.g.:
+- Install PyTorch **2.X** with the CUDA 12.6 wheels, e.g.:
   ```shell
-  pip3 install torch==2.2.2 torchvision==0.17.2 --index-url https://download.pytorch.org/whl/cu121
+  pip3 install torch==2.9.1+cu126 torchvision==0.24.1+cu126 --index-url https://download.pytorch.org/whl/cu126
   ```
 - Install dependencies from requirement.txt:
   ```shell
