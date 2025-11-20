@@ -8,12 +8,7 @@ This repository contains a PyTorch implementation of [RandLA-Net](http://arxiv.o
 
 2. Install some Python dependencies, such as scikit-learn. All packages can be installed with pip.
 
-3. Install python functions. the functions and the codes are copied from the [official implementation with Tensorflow](https://github.com/QingyongHu/RandLA-Net).
-
-```
-sh compile_op.sh
-```
-4. Download the [Semantic KITTI dataset](http://semantic-kitti.org/dataset.html#download), and preprocess the data:
+3. Download the [Semantic KITTI dataset](http://semantic-kitti.org/dataset.html#download), and preprocess the data:
   ```
   python utils/data_prepare_semantickitti.py
   ```
