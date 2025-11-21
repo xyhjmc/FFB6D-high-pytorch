@@ -21,6 +21,7 @@ import torch
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_sched
 import torch.nn as nn
+from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CyclicLR
 import torch.backends.cudnn as cudnn
@@ -33,11 +34,6 @@ from models.loss import OFLoss, FocalLoss
 from utils.pvn3d_eval_utils_kpls import TorchEval
 from utils.basic_utils import Basic_Utils
 import datasets.linemod.linemod_dataset as dataset_desc
-
-from apex.parallel import DistributedDataParallel
-from apex.parallel import convert_syncbn_model
-from apex import amp
-from apex.multi_tensor_apply import multi_tensor_applier
 
 
 parser = argparse.ArgumentParser(description="Arg parser")
@@ -103,7 +99,7 @@ parser.add_argument('--gpu', type=str, default="0,1,2,3,4,5,6,7")
 parser.add_argument('--deterministic', action='store_true')
 parser.add_argument('--keep_batchnorm_fp32', default=True)
 parser.add_argument('--opt_level', default="O0", type=str,
-                    help='opt level of apex mix presision trainig.')
+                    help='opt level for mixed precision (use "O0" to disable).')
 args = parser.parse_args()
 
 os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
@@ -135,8 +131,9 @@ def get_lr(optimizer):
         return param_group['lr']
 
 
-def checkpoint_state(model=None, optimizer=None, best_prec=None, epoch=None, it=None):
+def checkpoint_state(model=None, optimizer=None, scaler=None, best_prec=None, epoch=None, it=None):
     optim_state = optimizer.state_dict() if optimizer is not None else None
+    scaler_state = scaler.state_dict() if scaler is not None else None
     if model is not None:
         if isinstance(model, torch.nn.DataParallel) or \
                 isinstance(model, torch.nn.parallel.DistributedDataParallel):
@@ -152,7 +149,7 @@ def checkpoint_state(model=None, optimizer=None, best_prec=None, epoch=None, it=
         "best_prec": best_prec,
         "model_state": model_state,
         "optimizer_state": optim_state,
-        "amp": amp.state_dict(),
+        "scaler": scaler_state,
     }
 
 
@@ -167,7 +164,7 @@ def save_checkpoint(
         shutil.copyfile(filename, "{}.pth.tar".format(bestname_pure))
 
 
-def load_checkpoint(model=None, optimizer=None, filename="checkpoint"):
+def load_checkpoint(model=None, optimizer=None, scaler=None, filename="checkpoint"):
     filename = "{}.pth.tar".format(filename)
 
     if os.path.isfile(filename):
@@ -186,8 +183,8 @@ def load_checkpoint(model=None, optimizer=None, filename="checkpoint"):
             model.load_state_dict(ck_st)
         if optimizer is not None and ck["optimizer_state"] is not None:
             optimizer.load_state_dict(ck["optimizer_state"])
-        if ck.get("amp", None) is not None:
-            amp.load_state_dict(ck["amp"])
+        if scaler is not None and ck.get("scaler", None) is not None:
+            scaler.load_state_dict(ck["scaler"])
         print("==> Done")
         return it, epoch, best_prec
     else:
@@ -214,7 +211,7 @@ def view_labels(rgb_chw, cld_cn, labels, K=config.intrinsic_matrix['linemod']):
 
 
 def model_fn_decorator(
-    criterion, criterion_of, test=False,
+    criterion, criterion_of, test=False, use_autocast=False,
 ):
     teval = TorchEval()
 
@@ -240,23 +237,24 @@ def model_fn_decorator(
                 elif data[key].dtype in [torch.int32, torch.int16]:
                     cu_dt[key] = data[key].long().cuda()
 
-            end_points = model(cu_dt)
+            with autocast(enabled=use_autocast):
+                end_points = model(cu_dt)
 
-            labels = cu_dt['labels']
-            loss_rgbd_seg = criterion(
-                end_points['pred_rgbd_segs'], labels.view(-1)
-            ).sum()
-            loss_kp_of = criterion_of(
-                end_points['pred_kp_ofs'], cu_dt['kp_targ_ofst'], labels
-            ).sum()
-            loss_ctr_of = criterion_of(
-                end_points['pred_ctr_ofs'], cu_dt['ctr_targ_ofst'], labels
-            ).sum()
+                labels = cu_dt['labels']
+                loss_rgbd_seg = criterion(
+                    end_points['pred_rgbd_segs'], labels.view(-1)
+                ).sum()
+                loss_kp_of = criterion_of(
+                    end_points['pred_kp_ofs'], cu_dt['kp_targ_ofst'], labels
+                ).sum()
+                loss_ctr_of = criterion_of(
+                    end_points['pred_ctr_ofs'], cu_dt['ctr_targ_ofst'], labels
+                ).sum()
 
-            loss_lst = [
-                (loss_rgbd_seg, 2.0), (loss_kp_of, 1.0), (loss_ctr_of, 1.0),
-            ]
-            loss = sum([ls * w for ls, w in loss_lst])
+                loss_lst = [
+                    (loss_rgbd_seg, 2.0), (loss_kp_of, 1.0), (loss_ctr_of, 1.0),
+                ]
+                loss = sum([ls * w for ls, w in loss_lst])
 
             _, cls_rgbd = torch.max(end_points['pred_rgbd_segs'], 1)
             acc_rgbd = (cls_rgbd == labels).float().sum() / labels.numel()
@@ -349,6 +347,7 @@ class Trainer(object):
         model,
         model_fn,
         optimizer,
+        scaler=None,
         checkpoint_name="ckpt",
         best_name="best",
         lr_scheduler=None,
@@ -362,6 +361,7 @@ class Trainer(object):
             lr_scheduler,
             bnm_scheduler,
         )
+        self.scaler = scaler
 
         self.checkpoint_name, self.best_name = checkpoint_name, best_name
 
@@ -485,13 +485,16 @@ class Trainer(object):
                     self.optimizer.zero_grad()
                     _, loss, res = self.model_fn(self.model, batch, it=it)
 
-                    with amp.scale_loss(loss, self.optimizer) as scaled_loss:
-                        scaled_loss.backward()
+                    if self.scaler is not None:
+                        self.scaler.scale(loss).backward()
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                    else:
+                        loss.backward()
+                        self.optimizer.step()
                     lr = get_lr(self.optimizer)
                     if args.local_rank == 0:
                         writer.add_scalar('lr/lr', lr, it)
-
-                    self.optimizer.step()
 
                     if self.lr_scheduler is not None:
                         self.lr_scheduler.step(it)
@@ -521,7 +524,8 @@ class Trainer(object):
                             if args.local_rank == 0:
                                 save_checkpoint(
                                     checkpoint_state(
-                                        self.model, self.optimizer, val_loss, epoch, it
+                                        self.model, self.optimizer, self.scaler,
+                                        val_loss, epoch, it
                                     ),
                                     is_best,
                                     filename=self.checkpoint_name,
@@ -589,17 +593,15 @@ def train():
         n_classes=config.n_objects, n_pts=config.n_sample_points, rndla_cfg=rndla_cfg,
         n_kps=config.n_keypoints
     )
-    model = convert_syncbn_model(model)
+    model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     device = torch.device('cuda:{}'.format(args.local_rank))
     print('local_rank:', args.local_rank)
     model.to(device)
     optimizer = optim.Adam(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
-    opt_level = args.opt_level
-    model, optimizer = amp.initialize(
-        model, optimizer, opt_level=opt_level,
-    )
+    use_autocast = args.opt_level != "O0"
+    scaler = GradScaler(enabled=use_autocast)
 
     # default value
     it = -1  # for the initialize value of `LambdaLR` and `BNMomentumScheduler`
@@ -610,11 +612,11 @@ def train():
     if args.checkpoint is not None:
         if args.eval_net:
             checkpoint_status = load_checkpoint(
-                model, None, filename=args.checkpoint[:-8]
+                model, None, scaler, filename=args.checkpoint[:-8]
             )
         else:
             checkpoint_status = load_checkpoint(
-                model, optimizer, filename=args.checkpoint[:-8]
+                model, optimizer, scaler, filename=args.checkpoint[:-8]
             )
         if checkpoint_status is not None:
             it, start_epoch, best_loss = checkpoint_status
@@ -651,12 +653,12 @@ def train():
     if args.eval_net:
         model_fn = model_fn_decorator(
             FocalLoss(gamma=2), OFLoss(),
-            args.test,
+            args.test, use_autocast=use_autocast,
         )
     else:
         model_fn = model_fn_decorator(
             FocalLoss(gamma=2).to(device), OFLoss().to(device),
-            args.test,
+            args.test, use_autocast=use_autocast,
         )
 
     checkpoint_fd = config.log_model_dir
@@ -665,6 +667,7 @@ def train():
         model,
         model_fn,
         optimizer,
+        scaler,
         checkpoint_name=os.path.join(checkpoint_fd, "FFB6D_%s" % args.cls),
         best_name=os.path.join(checkpoint_fd, "FFB6D_%s_best" % args.cls),
         lr_scheduler=lr_scheduler,
