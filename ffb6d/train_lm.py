@@ -577,20 +577,20 @@ def train():
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_ds)
         train_loader = torch.utils.data.DataLoader(
             train_ds, batch_size=config.mini_batch_size, shuffle=False,
-            drop_last=True, num_workers=4, sampler=train_sampler, pin_memory=True
+            drop_last=True, num_workers=0, sampler=train_sampler, pin_memory=True
         )
 
         val_ds = dataset_desc.Dataset('test', cls_type=args.cls)
         val_sampler = torch.utils.data.distributed.DistributedSampler(val_ds)
         val_loader = torch.utils.data.DataLoader(
             val_ds, batch_size=config.val_mini_batch_size, shuffle=False,
-            drop_last=False, num_workers=4, sampler=val_sampler
+            drop_last=False, num_workers=0, sampler=val_sampler
         )
     else:
         test_ds = dataset_desc.Dataset('test', cls_type=args.cls)
         test_loader = torch.utils.data.DataLoader(
             test_ds, batch_size=config.test_mini_batch_size, shuffle=False,
-            num_workers=10
+            num_workers=0
         )
 
     rndla_cfg = ConfigRandLA
