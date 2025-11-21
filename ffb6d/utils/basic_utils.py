@@ -6,7 +6,7 @@ import torch
 import numpy as np
 
 from plyfile import PlyData
-import normalSpeed
+from utils.torch_normals import depth_normal
 
 from utils.ip_basic.ip_basic import vis_utils
 from utils.ip_basic.ip_basic import depth_map_utils_ycb as depth_map_utils
@@ -320,7 +320,7 @@ class Basic_Utils():
         self, dpt, scale_to_mm, K=intrinsic_matrix['ycb_K1'], with_show=False
     ):
         dpt_mm = (dpt.copy() * scale_to_mm).astype(np.uint16)
-        nrm_map = normalSpeed.depth_normal(dpt_mm, K[0][0], K[1][1], 5, 2000, 20, False)
+        nrm_map = depth_normal(dpt_mm, K[0][0], K[1][1], 5, 2000, 20, True)
         if with_show:
             nrm_map[np.isnan(nrm_map)] = 0.0
             nrm_map[np.isinf(nrm_map)] = 0.0
