@@ -15,7 +15,7 @@ try:
     from neupeak.utils.webcv2 import imshow, waitKey
 except:
     from cv2 import imshow, waitKey
-import normalSpeed
+from utils.torch_normals import depth_normal
 from models.RandLA.helper_tool import DataProcessing as DP
 
 
@@ -205,9 +205,7 @@ class Dataset():
         msk_dp = dpt_um > 1e-6
 
         dpt_mm = (dpt_um.copy()/10).astype(np.uint16)
-        nrm_map = normalSpeed.depth_normal(
-            dpt_mm, K[0][0], K[1][1], 5, 2000, 20, False
-        )
+        nrm_map = depth_normal(dpt_mm, K[0][0], K[1][1], 5, 2000, 20, True)
         if self.debug:
             show_nrm_map = ((nrm_map + 1.0) * 127).astype(np.uint8)
             imshow("nrm_map", show_nrm_map)

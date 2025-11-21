@@ -14,7 +14,7 @@ import scipy.io as scio
 import scipy.misc
 from glob import glob
 from termcolor import colored
-import normalSpeed
+from utils.torch_normals import depth_normal
 from models.RandLA.helper_tool import DataProcessing as DP
 try:
     from neupeak.utils.webcv2 import imshow, waitKey
@@ -249,9 +249,7 @@ class Dataset():
                     rgb = self.rgb_add_noise(rgb)
 
         dpt_mm = dpt_mm.copy().astype(np.uint16)
-        nrm_map = normalSpeed.depth_normal(
-            dpt_mm, K[0][0], K[1][1], 5, 2000, 20, False
-        )
+        nrm_map = depth_normal(dpt_mm, K[0][0], K[1][1], 5, 2000, 20, True)
         if self.DEBUG:
             show_nrm_map = ((nrm_map + 1.0) * 127).astype(np.uint8)
             imshow("nrm_map", show_nrm_map)
