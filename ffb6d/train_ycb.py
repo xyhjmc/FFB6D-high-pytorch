@@ -91,7 +91,10 @@ parser.add_argument("-cal_metrics", action="store_true")
 parser.add_argument("-view_dpt", action="store_true")
 parser.add_argument('-debug', action='store_true')
 
-parser.add_argument('--local_rank', type=int, default=0)
+# Torch distributed passes --local-rank; keep backward-compatible --local_rank.
+parser.add_argument(
+    '--local_rank', '--local-rank', dest='local_rank', type=int, default=0
+)
 parser.add_argument('--gpu_id', type=list, default=[0, 1, 2, 3, 4, 5, 6, 7])
 parser.add_argument('-n', '--nodes', default=1, type=int, metavar='N')
 parser.add_argument('-g', '--gpus', default=8, type=int,

@@ -59,13 +59,7 @@ See our demo video on [YouTube](https://www.youtube.com/watch?v=SSi2TnyD6Is) or 
   ```shell
   pip3 install -r requirement.txt
   ```
-- (Optional) Install [normalSpeed](https://github.com/hfutcgncas/normalSpeed), a fast and light-weight normal map estimator:
-  ```shell
-  git clone https://github.com/hfutcgncas/normalSpeed.git
-  cd normalSpeed/normalSpeed
-  python3 setup.py install --user
-  cd ..
-  ```
+- Surface normal estimation is handled directly in PyTorch and will run on GPU when available; no external normalSpeed dependency is needed.
 - Install tkinter through ``sudo apt install python3-tk``
 
 - Custom CUDA/C++ operators are no longer required. KNN search, grid subsampling, and FPS have been reimplemented in PyTorch/NumPy so the project builds cleanly on PyTorch 2.X.
