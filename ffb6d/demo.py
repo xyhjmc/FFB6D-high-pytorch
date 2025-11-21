@@ -14,6 +14,7 @@ import argparse
 import torch.nn as nn
 import numpy as np
 import pickle as pkl
+from glob import glob
 from common import Config, ConfigRandLA
 from models.ffb6d import FFB6D
 from datasets.ycb.ycb_dataset import Dataset as YCB_Dataset
@@ -41,6 +42,18 @@ parser.add_argument(
 )
 parser.add_argument(
     "-show", action='store_true', help="View from imshow or not."
+)
+parser.add_argument(
+    "-num_workers", type=int, default=None,
+    help="Number of dataloader workers (default: 0 when showing, else 4)."
+)
+parser.add_argument(
+    "-input_dir", type=str, default=None,
+    help="Optional directory of inputs to visualize (pkl files or image stems)."
+)
+parser.add_argument(
+    "-input_image", type=str, default=None,
+    help="Optional single image or pickle path to visualize."
 )
 args = parser.parse_args()
 
@@ -146,9 +159,50 @@ def cal_view_pred_pose(model, data, epoch=0, obj_id=-1):
         if args.show:
             imshow("projected_pose_rgb", bgr)
             imshow("original_rgb", ori_bgr)
-            waitKey()
+            key = waitKey()
+            window_closed = False
+            try:
+                window_closed = cv2.getWindowProperty(
+                    "projected_pose_rgb", cv2.WND_PROP_VISIBLE
+                ) < 1
+            except Exception:
+                pass
+            if key in [ord('q'), 27] or window_closed:
+                return False
     if epoch == 0:
         print("\n\nResults saved in {}".format(vis_dir))
+    return True
+
+
+def resolve_custom_inputs():
+    if args.input_dir is None and args.input_image is None:
+        return None
+
+    custom_list = []
+    if args.input_dir is not None:
+        if not os.path.isdir(args.input_dir):
+            raise FileNotFoundError("Input directory not found: {}".format(args.input_dir))
+        pkl_files = sorted(glob(os.path.join(args.input_dir, "*.pkl")))
+        if len(pkl_files) > 0:
+            custom_list.extend(pkl_files)
+        png_files = sorted(glob(os.path.join(args.input_dir, "*.png")))
+        stems = [os.path.splitext(os.path.basename(p))[0] for p in png_files]
+        custom_list.extend(stems)
+
+    if args.input_image is not None:
+        if args.input_image.endswith('.pkl'):
+            custom_list.append(args.input_image)
+        else:
+            custom_list.append(os.path.splitext(os.path.basename(args.input_image))[0])
+
+    # Remove duplicates while preserving order
+    seen = set()
+    uniq_list = []
+    for item in custom_list:
+        if item not in seen:
+            uniq_list.append(item)
+            seen.add(item)
+    return uniq_list if len(uniq_list) > 0 else None
 
 
 def main():
@@ -158,9 +212,16 @@ def main():
     else:
         test_ds = LM_Dataset('test', cls_type=args.cls)
         obj_id = config.lm_obj_dict[args.cls]
+    custom_items = resolve_custom_inputs()
+    if custom_items is not None:
+        test_ds.all_lst = custom_items
+        print("Overriding test list with {} custom item(s).".format(len(custom_items)))
+    num_workers = args.num_workers
+    if num_workers is None:
+        num_workers = 0 if args.show else 4
     test_loader = torch.utils.data.DataLoader(
         test_ds, batch_size=config.test_mini_batch_size, shuffle=False,
-        num_workers=20
+        num_workers=num_workers
     )
 
     rndla_cfg = ConfigRandLA
@@ -179,7 +240,10 @@ def main():
     for i, data in tqdm.tqdm(
         enumerate(test_loader), leave=False, desc="val"
     ):
-        cal_view_pred_pose(model, data, epoch=i, obj_id=obj_id)
+        should_continue = cal_view_pred_pose(model, data, epoch=i, obj_id=obj_id)
+        if should_continue is False:
+            print("Visualization interrupted by user close.")
+            break
 
 
 if __name__ == "__main__":
