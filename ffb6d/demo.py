@@ -186,14 +186,14 @@ def resolve_custom_inputs():
         if len(pkl_files) > 0:
             custom_list.extend(pkl_files)
         png_files = sorted(glob(os.path.join(args.input_dir, "*.png")))
-        stems = [os.path.splitext(os.path.basename(p))[0] for p in png_files]
+        stems = [os.path.splitext(p)[0] for p in png_files]
         custom_list.extend(stems)
 
     if args.input_image is not None:
         if args.input_image.endswith('.pkl'):
             custom_list.append(args.input_image)
         else:
-            custom_list.append(os.path.splitext(os.path.basename(args.input_image))[0])
+            custom_list.append(os.path.splitext(args.input_image)[0])
 
     # Remove duplicates while preserving order
     seen = set()
