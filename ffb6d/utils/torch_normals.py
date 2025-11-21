@@ -6,6 +6,8 @@ uses differentiable Torch kernels so it can run on GPU when available.
 """
 from __future__ import annotations
 
+import warnings
+
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -58,6 +60,13 @@ def depth_normal(
     valid = depth > 0
 
     if smooth_size and smooth_size > 1:
+        if smooth_size % 2 == 0:
+            warnings.warn(
+                "smooth_size should be odd to preserve spatial dimensions; "
+                "bumping it by 1 to avoid shape mismatch."
+            )
+            smooth_size += 1
+
         pad = smooth_size // 2
         depth = depth.unsqueeze(0).unsqueeze(0)
         depth = F.avg_pool2d(depth, kernel_size=smooth_size, stride=1, padding=pad)
