@@ -456,6 +456,8 @@ class Trainer(object):
 
         print("Totally train %d iters per gpu." % tot_iter)
 
+        iter_per_epoch = max(tot_iter // n_epochs, 1)
+
         def is_to_eval(epoch, it):
             if it == 100:
                 return True, 1
@@ -471,9 +473,6 @@ class Trainer(object):
         _, eval_frequency = is_to_eval(0, it)
 
         with tqdm.tqdm(range(start_epoch, config.n_total_epoch + 1), desc="%s_epochs" % args.cls) as tbar:
-            pbar = tqdm.tqdm(
-                total=tot_iter, leave=False, desc="train", initial=it
-            )
             for epoch in tbar:
                 if epoch > config.n_total_epoch:
                     break
@@ -488,6 +487,12 @@ class Trainer(object):
                         os.makedirs(log_dir, exist_ok=True)
                     with open(log_epoch_f, "w", encoding="utf-8") as f:
                         f.write(str(epoch))
+                epoch_pbar = tqdm.tqdm(
+                    total=iter_per_epoch,
+                    leave=False,
+                    desc="train",
+                    initial=it % iter_per_epoch,
+                )
                 for batch in train_loader:
                     self.model.train()
 
@@ -514,8 +519,8 @@ class Trainer(object):
 
                     it += 1
 
-                    pbar.update()
-                    pbar.set_postfix(dict(total_it=it, epoch=epoch))
+                    epoch_pbar.update()
+                    epoch_pbar.set_postfix(dict(total_it=it, epoch=epoch))
                     tbar.refresh()
 
                     if self.viz is not None:
@@ -525,7 +530,7 @@ class Trainer(object):
                     if eval_flag:
                         if test_loader is not None:
                             val_loss, res = self.eval_epoch(test_loader, it=it)
-                            pbar.write(f"val_loss {val_loss}")
+                            epoch_pbar.write(f"val_loss {val_loss}")
 
                             is_best = val_loss < best_loss
                             best_loss = min(best_loss, val_loss)
@@ -548,9 +553,9 @@ class Trainer(object):
                                     f.write(f"{it} {val_loss}\n")
 
                         # Reset eval schedule counter for progress bar visibility
-                        pbar.set_postfix(dict(total_it=it, epoch=epoch))
+                        epoch_pbar.set_postfix(dict(total_it=it, epoch=epoch))
 
-            pbar.close()
+                epoch_pbar.close()
             if args.local_rank == 0:
                 writer.export_scalars_to_json("./all_scalars.json")
                 writer.close()
