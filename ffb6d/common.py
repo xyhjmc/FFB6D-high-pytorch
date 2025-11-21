@@ -5,8 +5,12 @@ import numpy as np
 
 
 def ensure_fd(fd):
-    if not os.path.exists(fd):
-        os.system('mkdir -p {}'.format(fd))
+    """Create directory ``fd`` if it does not exist.
+
+    Using ``os.makedirs`` avoids shell quoting issues (e.g., spaces in paths)
+    that previously prevented checkpoint folders from being created.
+    """
+    os.makedirs(fd, exist_ok=True)
 
 
 class ConfigRandLA:
