@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as cp
 import models.RandLA.pytorch_utils as pt_utils
 from helper_tool import DataProcessing as DP
 import numpy as np
@@ -12,6 +13,7 @@ class Network(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self.use_checkpoint = getattr(config, "use_checkpoint", False)
 
         self.fc0 = pt_utils.Conv1d(config.in_c, 8, kernel_size=1, bn=True)
 
@@ -50,9 +52,15 @@ class Network(nn.Module):
         # ###########################Encoder############################
         f_encoder_list = []
         for i in range(self.config.num_layers):
-            f_encoder_i = self.dilated_res_blocks[i](
-                features, end_points['xyz'][i], end_points['neigh_idx'][i]
-            )
+            block = self.dilated_res_blocks[i]
+            if self.use_checkpoint:
+                f_encoder_i = cp.checkpoint(
+                    block, features, end_points['xyz'][i], end_points['neigh_idx'][i]
+                )
+            else:
+                f_encoder_i = block(
+                    features, end_points['xyz'][i], end_points['neigh_idx'][i]
+                )
 
             f_sampled_i = self.random_sample(f_encoder_i, end_points['sub_idx'][i])
             features = f_sampled_i

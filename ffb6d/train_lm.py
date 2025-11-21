@@ -22,7 +22,7 @@ import torch.optim as optim
 import torch.optim.lr_scheduler as lr_sched
 import torch.nn as nn
 import torch.multiprocessing as mp
-from torch.cuda.amp import GradScaler, autocast
+from torch import amp
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CyclicLR
 import torch.backends.cudnn as cudnn
@@ -241,7 +241,7 @@ def model_fn_decorator(
                 elif data[key].dtype in [torch.int32, torch.int16]:
                     cu_dt[key] = data[key].long().cuda()
 
-            with autocast(enabled=use_autocast):
+            with amp.autocast('cuda', enabled=use_autocast):
                 end_points = model(cu_dt)
 
                 labels = cu_dt['labels']
@@ -605,7 +605,7 @@ def train():
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
     use_autocast = args.opt_level != "O0"
-    scaler = GradScaler(enabled=use_autocast)
+    scaler = amp.GradScaler('cuda', enabled=use_autocast)
 
     # default value
     it = -1  # for the initialize value of `LambdaLR` and `BNMomentumScheduler`

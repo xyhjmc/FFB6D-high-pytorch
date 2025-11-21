@@ -15,6 +15,7 @@ class ConfigRandLA:
     num_points = 480 * 640 // 24  # Number of input points
     num_classes = 22  # Number of valid classes
     sub_grid_size = 0.06  # preprocess_parameter
+    use_checkpoint = True
 
     batch_size = 3  # batch_size during training
     val_batch_size = 3  # batch_size during validation and test
