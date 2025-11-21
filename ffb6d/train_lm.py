@@ -21,6 +21,7 @@ import torch
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_sched
 import torch.nn as nn
+import torch.multiprocessing as mp
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CyclicLR
@@ -697,5 +698,6 @@ def train():
 
 
 if __name__ == "__main__":
+    mp.set_start_method('spawn', force=True)
     args.world_size = args.gpus * args.nodes
     train()
