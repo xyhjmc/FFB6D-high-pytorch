@@ -430,6 +430,8 @@ class Trainer(object):
 
         print("Totally train %d iters per gpu." % tot_iter)
 
+        iter_per_epoch = max(tot_iter // n_epochs, 1)
+
         def is_to_eval(epoch, it):
             # Eval after first 100 iters to test eval function.
             if it == 100:
@@ -445,9 +447,7 @@ class Trainer(object):
         it = start_it
         _, eval_frequency = is_to_eval(0, it)
 
-        with tqdm.tqdm(range(config.n_total_epoch), desc="epochs") as tbar, tqdm.tqdm(
-            total=eval_frequency, leave=False, desc="train"
-        ) as pbar:
+        with tqdm.tqdm(range(start_epoch, config.n_total_epoch + 1), desc="epochs") as tbar:
             for epoch in tbar:
                 if epoch > config.n_total_epoch:
                     break
@@ -458,6 +458,12 @@ class Trainer(object):
                 np.random.seed()
                 if log_epoch_f is not None:
                     os.system("echo {} > {}".format(epoch, log_epoch_f))
+                epoch_pbar = tqdm.tqdm(
+                    total=iter_per_epoch,
+                    leave=False,
+                    desc="train",
+                    initial=it % iter_per_epoch,
+                )
                 for batch in train_loader:
                     self.model.train()
 
@@ -483,8 +489,8 @@ class Trainer(object):
 
                     it += 1
 
-                    pbar.update()
-                    pbar.set_postfix(dict(total_it=it))
+                    epoch_pbar.update()
+                    epoch_pbar.set_postfix(dict(total_it=it, epoch=epoch))
                     tbar.refresh()
 
                     if self.viz is not None:
@@ -492,7 +498,6 @@ class Trainer(object):
 
                     eval_flag, eval_frequency = is_to_eval(epoch, it)
                     if eval_flag:
-                        pbar.close()
 
                         if test_loader is not None:
                             val_loss, res = self.eval_epoch(test_loader, it=it)
@@ -520,10 +525,9 @@ class Trainer(object):
                                     )
                                 )
 
-                        pbar = tqdm.tqdm(
-                            total=eval_frequency, leave=False, desc="train"
-                        )
-                        pbar.set_postfix(dict(total_it=it))
+                        epoch_pbar.set_postfix(dict(total_it=it, epoch=epoch))
+
+                epoch_pbar.close()
 
             if args.local_rank == 0:
                 writer.export_scalars_to_json("./all_scalars.json")

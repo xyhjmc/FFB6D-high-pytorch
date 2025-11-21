@@ -149,7 +149,7 @@ See our demo video on [YouTube](https://www.youtube.com/watch?v=SSi2TnyD6Is) or 
   # commands in train_lm.sh
   n_gpu=8
   cls='ape'
-  python3 -m torch.distributed.launch --nproc_per_node=$n_gpu train_lm.py --gpus=$n_gpu --cls=$cls
+  torchrun --nproc_per_node=$n_gpu train_lm.py --gpus=$n_gpu --cls=$cls
   ```
   The trained checkpoints are stored in ``train_log/linemod/checkpoints/{cls}/``, ``train_log/linemod/checkpoints/ape/`` in this example.
   
@@ -162,7 +162,7 @@ See our demo video on [YouTube](https://www.youtube.com/watch?v=SSi2TnyD6Is) or 
   # commands in test_lm.sh
   cls='ape'
   tst_mdl="./linemod_pretrained/FFB6D_${cls}_best.pth.tar"
-  python3 -m torch.distributed.launch --nproc_per_node=1 train_lm.py --gpu '0' --cls $cls -eval_net -checkpoint $tst_mdl -test -test_pose # -debug
+  torchrun --nproc_per_node=1 train_lm.py --gpu '0' --cls $cls -eval_net -checkpoint $tst_mdl -test -test_pose # -debug
   ```
   You can evaluate different checkpoint by revising ``tst_mdl`` to the path of your target model.
 - **Pretrained model**: We provide our pre-trained models for each object on onedrive, [link](https://hkustconnect-my.sharepoint.com/:f:/g/personal/yhebk_connect_ust_hk/Ehg--MMyNdtLnAEurN0tm_MBQ8u_Lntrl42-BQeXO_8H8Q?e=HsZ2Yi). (The provided pretrained model here get better performance than we reported in our paper, mean ADD-0.1d 99.8). Download them and move them to their according folders. For example, move the ``FFB6D_ape_best.pth.tar`` to ``train_log/linemod/checkpoints/ape/``. Then revise ``tst_mdl=train_log/linemod/checkpoints/ape/FFB6D_ape_best.path.tar`` for testing.
@@ -182,7 +182,7 @@ See our demo video on [YouTube](https://www.youtube.com/watch?v=SSi2TnyD6Is) or 
   ```shell
   # commands in train_ycb.sh
   n_gpu=8  # number of gpu to use
-  python3 -m torch.distributed.launch --nproc_per_node=$n_gpu train_ycb.py --gpus=$n_gpu
+  torchrun --nproc_per_node=$n_gpu train_ycb.py --gpus=$n_gpu
   ```
   The trained model checkpoints are stored in ``train_log/ycb/checkpoints/``
   
@@ -193,7 +193,7 @@ See our demo video on [YouTube](https://www.youtube.com/watch?v=SSi2TnyD6Is) or 
   ```shell
   # commands in test_ycb.sh
   tst_mdl=train_log/ycb/checkpoints/FFB6D_best.pth.tar  # checkpoint to test.
-  python3 -m torch.distributed.launch --nproc_per_node=1 train_ycb.py --gpu '0' -eval_net -checkpoint $tst_mdl -test -test_pose # -debug
+  torchrun --nproc_per_node=1 train_ycb.py --gpu '0' -eval_net -checkpoint $tst_mdl -test -test_pose # -debug
   ```
   You can evaluate different checkpoints by revising the ``tst_mdl`` to the path of your target model.
 - **Pretrained model**: We provide our pre-trained models on onedrive, [here](https://hkustconnect-my.sharepoint.com/:u:/g/personal/yhebk_connect_ust_hk/EW7a5w-ytftLgexIyXuIcjwB4o0dWo1hMteMNlA1zgM7Wg?e=UE1WJs). Download the pre-trained model, move it to ``train_log/ycb/checkpoints/`` and modify ``tst_mdl`` for testing.
