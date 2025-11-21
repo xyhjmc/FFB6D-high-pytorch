@@ -24,7 +24,12 @@ class PSPModule(nn.Module):
     def forward(self, feats):
         h, w = feats.size(2), feats.size(3)
         priors = [
-            F.upsample(input=stage(feats), size=(h, w), mode='bilinear')
+            F.interpolate(
+                input=stage(feats),
+                size=(h, w),
+                mode='bilinear',
+                align_corners=False,
+            )
             for stage in self.stages
         ] + [feats]
         bottle = self.bottleneck(torch.cat(priors, 1))
@@ -65,7 +70,7 @@ class Modified_PSPNet(nn.Module):
 
         self.final_seg = nn.Sequential(
             nn.Conv2d(64, n_classes, kernel_size=1),
-            nn.LogSoftmax()
+            nn.LogSoftmax(dim=1)
         )
 
         self.classifier = nn.Sequential(
@@ -108,12 +113,12 @@ class PSPNet(nn.Module):
         self.final = nn.Sequential(
             # nn.Conv2d(64, 32, kernel_size=1),
             nn.Conv2d(64, 64, kernel_size=1),
-            nn.LogSoftmax()
+            nn.LogSoftmax(dim=1)
         )
 
         self.final_seg = nn.Sequential(
             nn.Conv2d(64, n_classes, kernel_size=1),
-            nn.LogSoftmax()
+            nn.LogSoftmax(dim=1)
         )
 
         self.classifier = nn.Sequential(

@@ -419,7 +419,8 @@ class Trainer(object):
                 for k, v in acc_dict.items():
                     print(k, v, file=of)
         if args.local_rank == 0:
-            writer.add_scalars('val_acc', acc_dict, it)
+            mean_acc_dict = {k: float(np.mean(v)) for k, v in acc_dict.items()}
+            writer.add_scalars('val_acc', mean_acc_dict, it)
 
         return total_loss / count, eval_dict
 
@@ -629,8 +630,10 @@ def train():
 
     if not args.eval_net:
         model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[args.local_rank], output_device=args.local_rank,
-            find_unused_parameters=True
+            model,
+            device_ids=[args.local_rank],
+            output_device=args.local_rank,
+            find_unused_parameters=False,
         )
         clr_div = 2
         lr_scheduler = CyclicLR(
