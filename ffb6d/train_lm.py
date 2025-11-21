@@ -92,7 +92,7 @@ parser.add_argument(
 )
 parser.add_argument('--gpu_id', type=list, default=[0, 1, 2, 3, 4, 5, 6, 7])
 parser.add_argument('-n', '--nodes', default=1, type=int, metavar='N')
-parser.add_argument('-g', '--gpus', default=8, type=int,
+parser.add_argument('-g', '--gpus', default=1, type=int,
                     help='number of gpus per node')
 parser.add_argument('-nr', '--nr', default=0, type=int,
                     help='ranking within the nodes')
