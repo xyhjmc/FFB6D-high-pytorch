@@ -41,7 +41,9 @@ class Dataset():
         print("cls_id in lm_dataset.py", self.cls_id)
         self.root = os.path.join(self.config.lm_root, 'Linemod_preprocessed')
         self.cls_root = os.path.join(self.root, "data/%02d/" % self.cls_id)
-        self.rng = np.random
+        # Use a picklable random generator so Dataset instances can be
+        # serialized when DataLoader workers are spawned.
+        self.rng = np.random.RandomState()
         meta_file = open(os.path.join(self.cls_root, 'gt.yml'), "r")
         self.meta_lst = yaml.safe_load(meta_file)
         if dataset_name == 'train':
