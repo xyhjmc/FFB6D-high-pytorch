@@ -502,7 +502,8 @@ class Trainer(object):
                         writer.add_scalar('lr/lr', lr, it)
 
                     if self.lr_scheduler is not None:
-                        self.lr_scheduler.step(it)
+                        # ``epoch``/``it`` argument is deprecated; advance scheduler per step
+                        self.lr_scheduler.step()
 
                     if self.bnm_scheduler is not None:
                         self.bnm_scheduler.step(it)
