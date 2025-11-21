@@ -470,10 +470,10 @@ class Trainer(object):
         it = start_it
         _, eval_frequency = is_to_eval(0, it)
 
-        with tqdm.tqdm(range(config.n_total_epoch), desc="%s_epochs" % args.cls) as tbar, tqdm.tqdm(
-            total=eval_frequency, leave=False, desc="train"
-        ) as pbar:
-
+        with tqdm.tqdm(range(start_epoch, config.n_total_epoch + 1), desc="%s_epochs" % args.cls) as tbar:
+            pbar = tqdm.tqdm(
+                total=tot_iter, leave=False, desc="train", initial=it
+            )
             for epoch in tbar:
                 if epoch > config.n_total_epoch:
                     break
@@ -482,8 +482,12 @@ class Trainer(object):
                 # Reset numpy seed.
                 # REF: https://github.com/pytorch/pytorch/issues/5059
                 np.random.seed()
-                if log_epoch_f is not None:
-                    os.system("echo {} > {}".format(epoch, log_epoch_f))
+                if log_epoch_f is not None and args.local_rank == 0:
+                    log_dir = os.path.dirname(log_epoch_f)
+                    if log_dir:
+                        os.makedirs(log_dir, exist_ok=True)
+                    with open(log_epoch_f, "w", encoding="utf-8") as f:
+                        f.write(str(epoch))
                 for batch in train_loader:
                     self.model.train()
 
@@ -511,7 +515,7 @@ class Trainer(object):
                     it += 1
 
                     pbar.update()
-                    pbar.set_postfix(dict(total_it=it))
+                    pbar.set_postfix(dict(total_it=it, epoch=epoch))
                     tbar.refresh()
 
                     if self.viz is not None:
@@ -519,11 +523,9 @@ class Trainer(object):
 
                     eval_flag, eval_frequency = is_to_eval(epoch, it)
                     if eval_flag:
-                        pbar.close()
-
                         if test_loader is not None:
                             val_loss, res = self.eval_epoch(test_loader, it=it)
-                            print("val_loss", val_loss)
+                            pbar.write(f"val_loss {val_loss}")
 
                             is_best = val_loss < best_loss
                             best_loss = min(best_loss, val_loss)
@@ -541,17 +543,14 @@ class Trainer(object):
                                 info_p = self.checkpoint_name.replace(
                                     '.pth.tar', '_epoch.txt'
                                 )
-                                os.system(
-                                    'echo {} {} >> {}'.format(
-                                        it, val_loss, info_p
-                                    )
-                                )
+                                os.makedirs(os.path.dirname(info_p), exist_ok=True)
+                                with open(info_p, "a", encoding="utf-8") as f:
+                                    f.write(f"{it} {val_loss}\n")
 
-                        pbar = tqdm.tqdm(
-                            total=eval_frequency, leave=False, desc="train"
-                        )
-                        pbar.set_postfix(dict(total_it=it))
+                        # Reset eval schedule counter for progress bar visibility
+                        pbar.set_postfix(dict(total_it=it, epoch=epoch))
 
+            pbar.close()
             if args.local_rank == 0:
                 writer.export_scalars_to_json("./all_scalars.json")
                 writer.close()
@@ -699,6 +698,10 @@ def train():
 
         if start_epoch == config.n_total_epoch:
             _ = trainer.eval_epoch(val_loader)
+
+    # Ensure distributed resources are cleaned up to avoid warnings
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":
