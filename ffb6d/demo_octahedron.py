@@ -30,7 +30,7 @@ except ImportError:
 
 def _build_parser():
     parser = argparse.ArgumentParser(
-        description="Visualize predicted poses as octahedron pose boxes"
+        description="Visualize predicted poses as cube pose boxes with axes"
     )
     parser.add_argument("-checkpoint", type=str, default=None, help="Checkpoint to eval")
     parser.add_argument(
@@ -71,7 +71,7 @@ def _build_parser():
         "-scale",
         type=float,
         default=1.1,
-        help="Multiplicative scale applied to the canonical octahedron radius.",
+        help="Multiplicative scale applied to the canonical cube half-edge length.",
     )
     return parser
 
@@ -107,13 +107,13 @@ def load_checkpoint(model=None, optimizer=None, filename="checkpoint"):
     return it, epoch, best_prec
 
 
-class OctahedronProjector:
+class CubeProjector:
     def __init__(self, bs_utils, dataset, scale=1.1):
         self.bs_utils = bs_utils
         self.dataset = dataset
         self.scale = scale
         self.radius_cache = {}
-        self.octahedron_cache = {}
+        self.cube_cache = {}
 
     def _canonical_radius(self, obj_id):
         if obj_id in self.radius_cache:
@@ -124,47 +124,69 @@ class OctahedronProjector:
         return radius
 
     def _canonical_vertices(self, obj_id):
-        if obj_id in self.octahedron_cache:
-            return self.octahedron_cache[obj_id]
+        if obj_id in self.cube_cache:
+            return self.cube_cache[obj_id]
         r = self._canonical_radius(obj_id) * self.scale
+        coords = [-r, r]
         verts = np.array(
             [
-                [r, 0.0, 0.0],
-                [-r, 0.0, 0.0],
-                [0.0, r, 0.0],
-                [0.0, -r, 0.0],
-                [0.0, 0.0, r],
-                [0.0, 0.0, -r],
+                [x, y, z]
+                for x in coords
+                for y in coords
+                for z in coords
             ],
             dtype=np.float32,
         )
         edges = [
+            (0, 1),
             (0, 2),
-            (2, 1),
-            (1, 3),
-            (3, 0),
             (0, 4),
-            (2, 4),
-            (1, 4),
-            (3, 4),
-            (0, 5),
-            (2, 5),
+            (1, 3),
             (1, 5),
-            (3, 5),
+            (2, 3),
+            (2, 6),
+            (3, 7),
+            (4, 5),
+            (4, 6),
+            (5, 7),
+            (6, 7),
         ]
-        self.octahedron_cache[obj_id] = (verts, edges)
-        return verts, edges
+        axis_len = r * 1.2
+        axes = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [axis_len, 0.0, 0.0],
+                [0.0, axis_len, 0.0],
+                [0.0, 0.0, axis_len],
+            ],
+            dtype=np.float32,
+        )
+        self.cube_cache[obj_id] = (verts, edges, axes)
+        return verts, edges, axes
 
     def draw(self, img, pose, obj_id, K):
-        verts, edges = self._canonical_vertices(obj_id)
-        verts_cam = np.dot(verts, pose[:, :3].T) + pose[:, 3]
+        verts, edges, axes = self._canonical_vertices(obj_id)
+        rotation = pose[:, :3]
+        translation = pose[:, 3]
+        verts_cam = np.dot(verts, rotation.T) + translation
+        axes_cam = np.dot(axes, rotation.T) + translation
         verts_2d = self.bs_utils.project_p3d(verts_cam, 1.0, K)
+        axes_2d = self.bs_utils.project_p3d(axes_cam, 1.0, K)
+
         color = self.bs_utils.get_label_color(obj_id, n_obj=22, mode=2)
         for i0, i1 in edges:
             p0 = tuple(verts_2d[i0].tolist())
             p1 = tuple(verts_2d[i1].tolist())
             img = cv2.line(img, p0, p1, color=color, thickness=2)
         img = self.bs_utils.draw_p2ds(img, verts_2d, r=3, color=color)
+
+        axis_colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]
+        for i, c in enumerate(axis_colors, start=1):
+            p0 = tuple(axes_2d[0].tolist())
+            p1 = tuple(axes_2d[i].tolist())
+            img = cv2.arrowedLine(img, p0, p1, color=c, thickness=2, tipLength=0.1)
+
+        img = self.draw_info_box(img, pose)
         return img
 
     @staticmethod
@@ -173,6 +195,44 @@ class OctahedronProjector:
         T[:3, :3] = pose[:, :3]
         T[:3, 3] = pose[:, 3]
         return "\n".join(["\t".join(["{:.6f}".format(v) for v in row]) for row in T])
+
+    def draw_info_box(self, img, pose):
+        text_lines = ["camera_T_object"]
+        text_lines.extend(self.format_homogeneous_matrix(pose).split("\n"))
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.4
+        thickness = 1
+        line_height = 0
+        box_width = 0
+        for line in text_lines:
+            (w, h), _ = cv2.getTextSize(line, font, font_scale, thickness)
+            box_width = max(box_width, w)
+            line_height = max(line_height, h)
+        padding = 6
+        line_gap = 4
+        box_height = len(text_lines) * (line_height + line_gap) + padding * 2 - line_gap
+
+        x0, y0 = 10, 10
+        x1, y1 = x0 + box_width + padding * 2, y0 + box_height
+
+        overlay = img.copy()
+        cv2.rectangle(overlay, (x0, y0), (x1, y1), (0, 0, 0), thickness=-1)
+        cv2.addWeighted(overlay, 0.6, img, 0.4, 0, dst=img)
+
+        for i, line in enumerate(text_lines):
+            y = y0 + padding + (line_height + line_gap) * (i + 1) - line_gap
+            cv2.putText(
+                img,
+                line,
+                (x0 + padding, y),
+                font,
+                font_scale,
+                (255, 255, 255),
+                thickness,
+                lineType=cv2.LINE_AA,
+            )
+        return img
 
 
 def resolve_custom_inputs(args):
@@ -269,7 +329,7 @@ def cal_view_pred_pose(args, config, bs_utils, projector, model, data, epoch=0, 
                     obj_id, projector.format_homogeneous_matrix(pose)
                 )
             )
-        vis_dir = os.path.join(config.log_eval_dir, "pose_vis_octahedron")
+        vis_dir = os.path.join(config.log_eval_dir, "pose_vis_cube")
         ensure_fd(vis_dir)
         f_pth = os.path.join(vis_dir, "{}.jpg".format(epoch))
         log_pth = os.path.join(vis_dir, "{}_pose.txt".format(epoch))
@@ -284,13 +344,13 @@ def cal_view_pred_pose(args, config, bs_utils, projector, model, data, epoch=0, 
             with open(log_pth, "w") as f:
                 f.write("\n\n".join(pose_logs))
         if args.show:
-            imshow("octahedron_pose_rgb", bgr)
+            imshow("cube_pose_rgb", bgr)
             imshow("original_rgb", ori_bgr)
             key = waitKey()
             window_closed = False
             try:
                 window_closed = cv2.getWindowProperty(
-                    "octahedron_pose_rgb", cv2.WND_PROP_VISIBLE
+                    "cube_pose_rgb", cv2.WND_PROP_VISIBLE
                 ) < 1
             except Exception:
                 pass
@@ -314,7 +374,7 @@ def main():
         obj_id = config.lm_obj_dict[args.cls]
         dataset = "linemod"
     bs_utils = Basic_Utils(config)
-    projector = OctahedronProjector(bs_utils, dataset, scale=args.scale)
+    projector = CubeProjector(bs_utils, dataset, scale=args.scale)
 
     if args.dataset == "ycb":
         test_ds = YCB_Dataset("test")
