@@ -21,6 +21,7 @@ from datasets.ycb.ycb_dataset import Dataset as YCB_Dataset
 from datasets.linemod.linemod_dataset import Dataset as LM_Dataset
 from utils.pvn3d_eval_utils_kpls import cal_frame_poses, cal_frame_poses_lm
 from utils.basic_utils import Basic_Utils
+from utils.model_complexity import ModelComplexityLogger
 try:
     from neupeak.utils.webcv2 import imshow, waitKey
 except ImportError:
@@ -62,6 +63,7 @@ if args.dataset == "ycb":
 else:
     config = Config(ds_name=args.dataset, cls_type=args.cls)
 bs_utils = Basic_Utils(config)
+complexity_logger = ModelComplexityLogger()
 
 
 def ensure_fd(fd):
@@ -97,6 +99,7 @@ def load_checkpoint(model=None, optimizer=None, filename="checkpoint"):
 
 def cal_view_pred_pose(model, data, epoch=0, obj_id=-1):
     model.eval()
+    complexity_logger.maybe_log(model, data, stage="visualization")
     with torch.set_grad_enabled(False):
         cu_dt = {}
         # device = torch.device('cuda:{}'.format(args.local_rank))

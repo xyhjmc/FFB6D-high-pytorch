@@ -30,6 +30,7 @@ from common import Config, ConfigRandLA
 import datasets.ycb.ycb_dataset as dataset_desc
 from utils.pvn3d_eval_utils_kpls import TorchEval
 from utils.basic_utils import Basic_Utils
+from utils.model_complexity import ModelComplexityLogger
 
 import models.pytorch_utils as pt_utils
 from models.ffb6d import FFB6D
@@ -346,6 +347,8 @@ class Trainer(object):
 
         self.training_best, self.eval_best = {}, {}
         self.viz = viz
+        self.complexity_logger = ModelComplexityLogger()
+        self._last_train_batch = None
 
     def eval_epoch(self, d_loader, is_test=False, test_pose=False, it=0):
         self.model.eval()
@@ -358,6 +361,10 @@ class Trainer(object):
         ):
             count += 1
             self.optimizer.zero_grad()
+
+            if i == 0:
+                stage = "evaluation" if is_test else "validation"
+                self.complexity_logger.maybe_log(self.model, data, stage=stage)
 
             _, loss, eval_res = self.model_fn(
                 self.model, data, is_eval=True, is_test=is_test, test_pose=test_pose
@@ -471,6 +478,8 @@ class Trainer(object):
                 for batch in train_loader:
                     self.model.train()
 
+                    self._last_train_batch = batch
+
                     self.optimizer.zero_grad()
                     _, loss, res = self.model_fn(self.model, batch, it=it)
 
@@ -534,6 +543,9 @@ class Trainer(object):
                         epoch_pbar.set_postfix(dict(total_it=it, epoch=epoch))
 
         epoch_pbar.close()
+
+        if self._last_train_batch is not None:
+            self.complexity_logger.maybe_log(self.model, self._last_train_batch, stage="train_end")
 
         if args.local_rank == 0:
             writer.export_scalars_to_json("./all_scalars.json")
