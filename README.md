@@ -17,6 +17,7 @@ This is the official source code for the **CVPR2021 Oral** work, **FFB6D: A Full
     - [Training on the YCB-Video Dataset](#training-on-the-ycb-video-dataset)
     - [Evaluating on the YCB-Video Dataset](#evaluating-on-the-ycb-video-dataset)
     - [Demo/visualization on the YCB-Video Dataset](#demovisualization-on-the-ycb-video-dataset)
+    - [Octahedron pose visualization demo](#octahedron-pose-visualization-demo)
   - [Results](#results)
   - [Adaptation to New Dataset](#adaptation-to-new-dataset)
   - [License](#license)
@@ -197,6 +198,28 @@ See our demo video on [YouTube](https://www.youtube.com/watch?v=SSi2TnyD6Is) or 
   ```
   You can evaluate different checkpoints by revising the ``tst_mdl`` to the path of your target model.
 - **Pretrained model**: We provide our pre-trained models on onedrive, [here](https://hkustconnect-my.sharepoint.com/:u:/g/personal/yhebk_connect_ust_hk/EW7a5w-ytftLgexIyXuIcjwB4o0dWo1hMteMNlA1zgM7Wg?e=UE1WJs). Download the pre-trained model, move it to ``train_log/ycb/checkpoints/`` and modify ``tst_mdl`` for testing.
+
+### Octahedron pose visualization demo
+Use ``ffb6d/demo_octahedron.py`` to render predicted poses as octahedron-shaped pose boxes instead of dense point clouds. This script mirrors the existing demo options and also writes each camera-to-object homogeneous transformation matrix to ``*_pose.txt`` alongside the rendered frame.
+
+- **LineMOD example** (display results interactively):
+  ```shell
+  cd ffb6d
+  cls='ape'
+  chkpt=train_log/linemod/checkpoints/${cls}/FFB6D_${cls}_best.pth.tar
+  python3 demo_octahedron.py -dataset linemod -cls $cls -checkpoint $chkpt -show
+  ```
+- **YCB-Video example** (save only):
+  ```shell
+  cd ffb6d
+  chkpt=train_log/ycb/checkpoints/FFB6D_best.pth.tar
+  python3 demo_octahedron.py -dataset ycb -checkpoint $chkpt
+  ```
+
+Key flags:
+- ``-scale`` scales the canonical octahedron radius (default ``1.1``) if you want larger or smaller pose boxes.
+- ``-input_dir`` or ``-input_image`` let you visualize a custom directory of ``.pkl`` frames or image stems instead of the default test split.
+- Results (images and pose logs) are written under ``train_log/<dataset>/eval_results/<object-or-ycb>/pose_vis_octahedron``.
 
 ### Demo/visualization on the YCB-Video Dataset
 - After training your model or downloading the pre-trained model, you can start the demo by:
