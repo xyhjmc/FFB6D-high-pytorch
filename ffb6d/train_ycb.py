@@ -447,6 +447,16 @@ class Trainer(object):
         it = start_it
         _, eval_frequency = is_to_eval(0, it)
 
+        def create_pbar(cur_it):
+            return tqdm.tqdm(
+                total=eval_frequency,
+                leave=False,
+                desc="train",
+                initial=cur_it % eval_frequency,
+            )
+
+        epoch_pbar = create_pbar(it)
+
         with tqdm.tqdm(range(start_epoch, config.n_total_epoch + 1), desc="epochs") as tbar:
             for epoch in tbar:
                 if epoch > config.n_total_epoch:
@@ -458,12 +468,6 @@ class Trainer(object):
                 np.random.seed()
                 if log_epoch_f is not None:
                     os.system("echo {} > {}".format(epoch, log_epoch_f))
-                epoch_pbar = tqdm.tqdm(
-                    total=iter_per_epoch,
-                    leave=False,
-                    desc="train",
-                    initial=it % iter_per_epoch,
-                )
                 for batch in train_loader:
                     self.model.train()
 
@@ -498,6 +502,7 @@ class Trainer(object):
 
                     eval_flag, eval_frequency = is_to_eval(epoch, it)
                     if eval_flag:
+                        epoch_pbar.close()
 
                         if test_loader is not None:
                             val_loss, res = self.eval_epoch(test_loader, it=it)
@@ -525,13 +530,14 @@ class Trainer(object):
                                     )
                                 )
 
+                        epoch_pbar = create_pbar(it)
                         epoch_pbar.set_postfix(dict(total_it=it, epoch=epoch))
 
-                epoch_pbar.close()
+        epoch_pbar.close()
 
-            if args.local_rank == 0:
-                writer.export_scalars_to_json("./all_scalars.json")
-                writer.close()
+        if args.local_rank == 0:
+            writer.export_scalars_to_json("./all_scalars.json")
+            writer.close()
         return best_loss
 
 

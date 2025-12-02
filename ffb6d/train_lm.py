@@ -472,6 +472,16 @@ class Trainer(object):
         it = start_it
         _, eval_frequency = is_to_eval(0, it)
 
+        def create_pbar(cur_it):
+            return tqdm.tqdm(
+                total=eval_frequency,
+                leave=False,
+                desc="train",
+                initial=cur_it % eval_frequency,
+            )
+
+        epoch_pbar = create_pbar(it)
+
         with tqdm.tqdm(range(start_epoch, config.n_total_epoch + 1), desc="%s_epochs" % args.cls) as tbar:
             for epoch in tbar:
                 if epoch > config.n_total_epoch:
@@ -487,12 +497,6 @@ class Trainer(object):
                         os.makedirs(log_dir, exist_ok=True)
                     with open(log_epoch_f, "w", encoding="utf-8") as f:
                         f.write(str(epoch))
-                epoch_pbar = tqdm.tqdm(
-                    total=iter_per_epoch,
-                    leave=False,
-                    desc="train",
-                    initial=it % iter_per_epoch,
-                )
                 for batch in train_loader:
                     self.model.train()
 
@@ -528,6 +532,7 @@ class Trainer(object):
 
                     eval_flag, eval_frequency = is_to_eval(epoch, it)
                     if eval_flag:
+                        epoch_pbar.close()
                         if test_loader is not None:
                             val_loss, res = self.eval_epoch(test_loader, it=it)
                             epoch_pbar.write(f"val_loss {val_loss}")
@@ -552,13 +557,13 @@ class Trainer(object):
                                 with open(info_p, "a", encoding="utf-8") as f:
                                     f.write(f"{it} {val_loss}\n")
 
-                        # Reset eval schedule counter for progress bar visibility
+                        epoch_pbar = create_pbar(it)
                         epoch_pbar.set_postfix(dict(total_it=it, epoch=epoch))
 
-                epoch_pbar.close()
-            if args.local_rank == 0:
-                writer.export_scalars_to_json("./all_scalars.json")
-                writer.close()
+        epoch_pbar.close()
+        if args.local_rank == 0:
+            writer.export_scalars_to_json("./all_scalars.json")
+            writer.close()
         return best_loss
 
 
