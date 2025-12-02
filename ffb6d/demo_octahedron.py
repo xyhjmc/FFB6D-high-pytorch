@@ -112,28 +112,33 @@ class CubeProjector:
         self.bs_utils = bs_utils
         self.dataset = dataset
         self.scale = scale
-        self.radius_cache = {}
         self.cube_cache = {}
+        self.bbox_cache = {}
 
-    def _canonical_radius(self, obj_id):
-        if obj_id in self.radius_cache:
-            return self.radius_cache[obj_id]
+    def _canonical_bbox(self, obj_id):
+        if obj_id in self.bbox_cache:
+            return self.bbox_cache[obj_id]
+
         mesh_pts = self.bs_utils.get_pointxyz(obj_id, ds_type=self.dataset)
-        radius = np.linalg.norm(mesh_pts, axis=1).max()
-        self.radius_cache[obj_id] = radius
-        return radius
+        min_pt = mesh_pts.min(axis=0)
+        max_pt = mesh_pts.max(axis=0)
+        center = (min_pt + max_pt) * 0.5
+        half_extent = (max_pt - min_pt) * 0.5
+        self.bbox_cache[obj_id] = (center, half_extent)
+        return center, half_extent
 
     def _canonical_vertices(self, obj_id):
         if obj_id in self.cube_cache:
             return self.cube_cache[obj_id]
-        r = self._canonical_radius(obj_id) * self.scale
-        coords = [-r, r]
+        center, half_extent = self._canonical_bbox(obj_id)
+        scaled_half = half_extent * self.scale
+        signs = [-1.0, 1.0]
         verts = np.array(
             [
-                [x, y, z]
-                for x in coords
-                for y in coords
-                for z in coords
+                center + scaled_half * np.array([sx, sy, sz])
+                for sx in signs
+                for sy in signs
+                for sz in signs
             ],
             dtype=np.float32,
         )
@@ -151,13 +156,13 @@ class CubeProjector:
             (5, 7),
             (6, 7),
         ]
-        axis_len = r * 1.2
+        axis_len = scaled_half.max() * 1.2
         axes = np.array(
             [
-                [0.0, 0.0, 0.0],
-                [axis_len, 0.0, 0.0],
-                [0.0, axis_len, 0.0],
-                [0.0, 0.0, axis_len],
+                center,
+                center + np.array([axis_len, 0.0, 0.0]),
+                center + np.array([0.0, axis_len, 0.0]),
+                center + np.array([0.0, 0.0, axis_len]),
             ],
             dtype=np.float32,
         )
