@@ -6,6 +6,7 @@ from __future__ import (
     unicode_literals,
 )
 import os
+import sys
 import time
 import tqdm
 import shutil
@@ -27,6 +28,10 @@ from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CyclicLR
 import torch.backends.cudnn as cudnn
 from tensorboardX import SummaryWriter
+
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
 
 from common import Config, ConfigRandLA
 import models.pytorch_utils as pt_utils
