@@ -67,17 +67,20 @@ class GeometryToolkit:
 
         quat = torch.nn.functional.normalize(quat, dim=-1)
         w, x, y, z = quat.unbind(-1)
-        B = quat.shape[0]
-        rot = torch.zeros((B, 3, 3), device=quat.device, dtype=quat.dtype)
-        rot[:, 0, 0] = 1 - 2 * (y * y + z * z)
-        rot[:, 0, 1] = 2 * (x * y - z * w)
-        rot[:, 0, 2] = 2 * (x * z + y * w)
-        rot[:, 1, 0] = 2 * (x * y + z * w)
-        rot[:, 1, 1] = 1 - 2 * (x * x + z * z)
-        rot[:, 1, 2] = 2 * (y * z - x * w)
-        rot[:, 2, 0] = 2 * (x * z - y * w)
-        rot[:, 2, 1] = 2 * (y * z + x * w)
-        rot[:, 2, 2] = 1 - 2 * (x * x + y * y)
+        rot = torch.stack(
+            [
+                1 - 2 * (y * y + z * z),
+                2 * (x * y - z * w),
+                2 * (x * z + y * w),
+                2 * (x * y + z * w),
+                1 - 2 * (x * x + z * z),
+                2 * (y * z - x * w),
+                2 * (x * z - y * w),
+                2 * (y * z + x * w),
+                1 - 2 * (x * x + y * y),
+            ],
+            dim=-1,
+        ).reshape(-1, 3, 3)
         return rot
 
     @staticmethod

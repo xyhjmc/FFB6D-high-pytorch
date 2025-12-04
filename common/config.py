@@ -78,9 +78,15 @@ def load_config() -> LGFFConfig:
         if "=" not in override:
             continue
         key, value = override.split("=", 1)
-        # Try to cast to numeric types when appropriate.
-        if value.replace(".", "", 1).isdigit():
-            value = float(value) if "." in value else int(value)
+        # Try to cast to numeric types when appropriate, including
+        # scientific notation or signed values.
+        try:
+            if value.lstrip("+-").isdigit():
+                value = int(value)
+            else:
+                value = float(value)
+        except ValueError:
+            pass
         cfg.update({key: value})
 
     # Default camera intrinsics fall back to the original FFB6D values
