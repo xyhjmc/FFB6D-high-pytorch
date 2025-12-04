@@ -1,4 +1,4 @@
-from lgff.losses.ffb6d_loss import (
+from lgff.losses.loss_block import (
     BerHuLoss,
     CosLoss,
     DepthL1Loss,
@@ -11,7 +11,7 @@ from lgff.losses.ffb6d_loss import (
     PcldSmoothL1Loss,
     of_l1_loss,
 )
-from lgff.losses.losses import LGFFLoss
+from lgff.losses.lgff_loss import LGFFLoss
 
 __all__ = [
     "LGFFLoss",
