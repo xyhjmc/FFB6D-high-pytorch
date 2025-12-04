@@ -1,4 +1,10 @@
-"""Training loop for single-class LGFF."""
+"""
+单类别 LGFF 的训练脚本，封装了训练与验证流程。
+提供 ``TrainerSC`` 类：初始化时绑定模型、优化器、损失函数与数据
+加载器，并从配置中读取训练轮数；``_run_loader`` 用于在训练或验证
+模式下跑完一个 DataLoader、累计损失与度量；``train`` 方法驱动全程
+训练并通过日志器记录每个 epoch 的统计信息。
+"""
 from __future__ import annotations
 
 from typing import Dict, Optional

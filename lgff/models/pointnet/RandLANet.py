@@ -1,3 +1,10 @@
+"""
+RandLA-Net 点云分支实现，提供高效的随机采样与注意力特征聚合。
+封装 ``Network`` 类，构建多层 dilated residual block、随机下采样、
+特征上采样与分类/分割头；辅助函数覆盖参数统计、精度评估与预测
+后处理，作为 LGFF 融合网络的点云特征提取器。
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

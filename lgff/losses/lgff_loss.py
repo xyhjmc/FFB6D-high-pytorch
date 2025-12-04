@@ -1,4 +1,9 @@
-"""Loss functions for LGFF assembled from reusable loss blocks."""
+"""
+LGFF 的组合损失脚本，基于通用损失块拼装任务相关项。
+定义 ``LGFFLoss`` 模块，融合 L1/MSE、几何姿态约束以及来自
+``loss_block`` 的配件，计算关键点偏移、深度、中心度与姿态的多项
+损失，并返回附带的度量字典供训练日志记录。
+"""
 from __future__ import annotations
 
 from typing import Dict, Tuple

@@ -1,4 +1,9 @@
-# 模型工具函数库：提供共享MLP、卷积封装与统计评估等PyTorch基础组件。
+"""
+PyTorch 工具函数与层封装，服务于 LGFF 与 RandLA-Net 模块。
+实现共享 MLP、卷积/反卷积包装类、DropPath 与自定义激活操作，
+同时提供精度评估函数、模型保存/加载、随机种子设置等训练期间常用
+辅助方法，便于复用基础组件和实验管理。
+"""
 from __future__ import (
     division,
     absolute_import,

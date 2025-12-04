@@ -1,3 +1,10 @@
+"""
+ResNet 特征提取骨干库，用于 PSPNet 与 LGFF 相关模型。
+定义加载 ImageNet 预训练权重的工具 ``load_weights_sequential``、
+基础卷积与残差模块（``BasicBlock``、``Bottleneck``）、ResNet 组装类
+以及 resnet18/34/50/101/152 构造函数，供上层网络直接调用。
+"""
+
 from collections import OrderedDict
 import math
 import random
