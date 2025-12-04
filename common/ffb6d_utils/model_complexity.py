@@ -1,3 +1,4 @@
+"""网络复杂度统计工具，负责计算参数量与FLOPs等指标。"""
 import numpy as np
 import torch
 from torch.profiler import ProfilerActivity, profile

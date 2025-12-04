@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""FFB6D常用的图像与点云处理工具函数，包含投影、姿态变换等基础方法。"""
 import os
 import cv2
 import random
@@ -6,10 +7,10 @@ import torch
 import numpy as np
 
 from plyfile import PlyData
-from utils.torch_normals import depth_normal
+from common.ffb6d_utils.torch_normals import depth_normal
 
-from utils.ip_basic.ip_basic import vis_utils
-from utils.ip_basic.ip_basic import depth_map_utils_ycb as depth_map_utils
+from common.ffb6d_utils.ip_basic.ip_basic import vis_utils
+from common.ffb6d_utils.ip_basic.ip_basic import depth_map_utils_ycb as depth_map_utils
 
 
 intrinsic_matrix = {

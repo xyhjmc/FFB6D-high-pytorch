@@ -1,4 +1,6 @@
 """
+将深度图转为法线图的PyTorch实现，方便在GPU上进行可微分的法线估计。
+
 PyTorch implementation of depth to normal map conversion.
 
 The interface mirrors the original ``normalSpeed.depth_normal`` helper but

@@ -1,4 +1,5 @@
 #!/usr/bin/env mdl
+"""数据集生成相关的网格、图像与系统工具函数集合。"""
 import os
 import cv2
 import math

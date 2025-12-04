@@ -1,4 +1,5 @@
 #!/usr/bin/env mdl
+"""使用pyrender生成RGBD数据并提取SIFT关键点的脚本。"""
 import os
 import cv2
 import math
@@ -10,8 +11,8 @@ from tqdm import tqdm
 from scipy import stats
 from glob import glob
 import json
-from utils import PoseUtils, MeshUtils, SysUtils, ImgPcldUtils
-from fps.fps_utils import farthest_point_sampling
+from common.ffb6d_utils.dataset_tools.utils import PoseUtils, MeshUtils, SysUtils, ImgPcldUtils
+from common.ffb6d_utils.dataset_tools.fps import farthest_point_sampling
 
 
 pose_utils = PoseUtils()

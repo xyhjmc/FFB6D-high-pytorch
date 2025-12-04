@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""MeanShift 聚类的PyTorch实现，供关键点过滤与姿态估计使用。"""
 import os
 import cv2
 import time
