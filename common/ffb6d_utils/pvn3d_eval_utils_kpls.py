@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""PVN3D评估流程与关键点评分工具，封装姿态估计验证与后处理逻辑。"""
 import os
 import time
 import torch
@@ -7,8 +8,8 @@ import pickle as pkl
 import concurrent.futures
 
 from common import Config
-from utils.basic_utils import Basic_Utils
-from utils.meanshift_pytorch import MeanShiftTorch
+from common.ffb6d_utils.basic_utils import Basic_Utils
+from common.ffb6d_utils.meanshift_pytorch import MeanShiftTorch
 try:
     from neupeak.utils.webcv2 import imshow, waitKey
 except Exception:

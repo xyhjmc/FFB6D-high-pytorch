@@ -28,9 +28,9 @@ from tensorboardX import SummaryWriter
 
 from common import Config, ConfigRandLA
 import datasets.ycb.ycb_dataset as dataset_desc
-from utils.pvn3d_eval_utils_kpls import TorchEval
-from utils.basic_utils import Basic_Utils
-from utils.model_complexity import ModelComplexityLogger
+from common.ffb6d_utils.pvn3d_eval_utils_kpls import TorchEval
+from common.ffb6d_utils.basic_utils import Basic_Utils
+from common.ffb6d_utils.model_complexity import ModelComplexityLogger
 
 import models.pytorch_utils as pt_utils
 from models.ffb6d import FFB6D

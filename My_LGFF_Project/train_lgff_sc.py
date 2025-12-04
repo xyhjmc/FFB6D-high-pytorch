@@ -1,29 +1,45 @@
-# lgff/train_lgff_sc.py
-"""
-最后让 Codex 写两个很薄的脚本，负责：
+"""单类别LGFF模型的训练入口，负责构建数据、模型并驱动训练循环。"""
+from __future__ import annotations
 
-解析命令行和 config；
+import torch
+from torch.utils.data import DataLoader
 
-构建 dataset, dataloader；
-
-构建 model, optimizer, scheduler；
-
-构建 loss, trainer；
-
-调 trainer.train()。
-"""
-from lgff.models.lgff_sc import LGFF_SC
-from lgff.datasets.single_loader import SingleObjectDataset
+from common import load_config, get_logger
+from lgff.datasets import SingleObjectDataset
+from lgff.engines import TrainerSC
 from lgff.losses import LGFFLoss
-from lgff.engines.trainer_sc import TrainerSC
-from common.config import load_config  # TODO: 从 common 里引
+from lgff.models import LGFF_SC
+from lgff.utils import build_geometry
+
 
 def main():
     cfg = load_config()
-    # TODO: 构建 dataset / dataloader
-    # TODO: 构建模型
-    # TODO: 构建优化器、loss、trainer
-    # trainer.train()
+    logger = get_logger("lgff.sc", log_file=f"{cfg.log_dir}/train.log")
+    geometry = build_geometry(cfg.camera_intrinsic)
+
+    train_ds = SingleObjectDataset(cfg, split="train")
+    val_ds = SingleObjectDataset(cfg, split="val") if cfg.annotation_file else None
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        num_workers=cfg.num_workers,
+        drop_last=False,
+    )
+    val_loader = (
+        DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers)
+        if val_ds
+        else None
+    )
+
+    model = LGFF_SC(cfg, geometry)
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    loss_fn = LGFFLoss(cfg, geometry)
+
+    trainer = TrainerSC(model, optimizer, loss_fn, train_loader, val_loader, cfg, logger)
+    trainer.train()
+
 
 if __name__ == "__main__":
     main()

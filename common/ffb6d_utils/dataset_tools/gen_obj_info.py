@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
+"""生成物体点云/关键点信息的辅助脚本。"""
 import os
 import numpy as np
 import glob
 from plyfile import PlyData
 from tqdm import tqdm
 import pickle as pkl
-from fps.fps_utils import farthest_point_sampling
+from common.ffb6d_utils.dataset_tools.fps import farthest_point_sampling
 from argparse import ArgumentParser
-from utils import MeshUtils, ImgPcldUtils, SysUtils
+from common.ffb6d_utils.dataset_tools.utils import MeshUtils, ImgPcldUtils, SysUtils
 
 
 parser = ArgumentParser()

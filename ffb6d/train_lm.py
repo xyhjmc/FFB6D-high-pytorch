@@ -32,10 +32,9 @@ from common import Config, ConfigRandLA
 import models.pytorch_utils as pt_utils
 from models.ffb6d import FFB6D
 from models.loss import OFLoss, FocalLoss
-from utils.pvn3d_eval_utils_kpls import TorchEval
-from utils.basic_utils import Basic_Utils
 import datasets.linemod.linemod_dataset as dataset_desc
-from utils.model_complexity import ModelComplexityLogger
+from common.ffb6d_utils.pvn3d_eval_utils_kpls import TorchEval
+from common.ffb6d_utils.basic_utils import Basic_Utils
 
 
 parser = argparse.ArgumentParser(description="Arg parser")
@@ -729,3 +728,4 @@ if __name__ == "__main__":
     mp.set_start_method('spawn', force=True)
     args.world_size = args.gpus * args.nodes
     train()
+from common.ffb6d_utils.model_complexity import ModelComplexityLogger

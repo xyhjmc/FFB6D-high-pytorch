@@ -19,8 +19,8 @@ from common import Config, ConfigRandLA
 from models.ffb6d import FFB6D
 from datasets.ycb.ycb_dataset import Dataset as YCB_Dataset
 from datasets.linemod.linemod_dataset import Dataset as LM_Dataset
-from utils.pvn3d_eval_utils_kpls import cal_frame_poses, cal_frame_poses_lm
-from utils.basic_utils import Basic_Utils
+from common.ffb6d_utils.pvn3d_eval_utils_kpls import cal_frame_poses, cal_frame_poses_lm
+from common.ffb6d_utils.basic_utils import Basic_Utils
 
 try:
     from neupeak.utils.webcv2 import imshow, waitKey

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""基于光栅化渲染生成RGBD与SIFT关键点的工具脚本。"""
 import os
 import cv2
 import time
@@ -13,7 +14,7 @@ from tqdm import tqdm
 from scipy import stats
 from glob import glob
 from cv2 import imshow, waitKey
-from utils import ImgPcldUtils, MeshUtils, PoseUtils, SysUtils
+from common.ffb6d_utils.dataset_tools.utils import ImgPcldUtils, MeshUtils, PoseUtils, SysUtils
 
 
 SO_P = './raster_triangle/rastertriangle_so.so'

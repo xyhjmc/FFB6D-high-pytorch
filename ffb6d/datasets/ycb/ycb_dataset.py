@@ -8,14 +8,14 @@ import torchvision.transforms as transforms
 from PIL import Image
 from common import Config
 import pickle as pkl
-from utils.basic_utils import Basic_Utils
+from common.ffb6d_utils.basic_utils import Basic_Utils
 import scipy.io as scio
 import scipy.misc
 try:
     from neupeak.utils.webcv2 import imshow, waitKey
 except:
     from cv2 import imshow, waitKey
-from utils.torch_normals import depth_normal
+from common.ffb6d_utils.torch_normals import depth_normal
 from models.RandLA.helper_tool import DataProcessing as DP
 
 
