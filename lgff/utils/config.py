@@ -73,7 +73,7 @@ def load_config() -> LGFFConfig:
     # Default camera intrinsics fall back to the original FFB6D values so
     # that imported geometry utilities can operate without further adaptation.
     if not cfg.camera_intrinsic:
-        from ffb6d.utils.basic_utils import intrinsic_matrix
+        from common.ffb6d_utils.basic_utils import intrinsic_matrix
 
         cfg.camera_intrinsic = intrinsic_matrix.get("ycb_K1")
 

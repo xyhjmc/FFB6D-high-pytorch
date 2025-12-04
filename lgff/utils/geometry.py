@@ -13,12 +13,12 @@ from typing import Optional, Tuple
 import numpy as np
 import torch
 
-from ffb6d.utils.basic_utils import (
+from common.ffb6d_utils.basic_utils import (
     Basic_Utils,
     best_fit_transform,
     intrinsic_matrix as ffb6d_intrinsics,
 )
-from ffb6d.utils.dataset_tools.utils import ImgPcldUtils
+from common.ffb6d_utils.dataset_tools.utils import ImgPcldUtils
 
 
 class GeometryToolkit:
