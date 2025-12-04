@@ -1,10 +1,8 @@
-"""Single-class dataset loader for LGFF.
-
-This loader follows a BOP-style layout and reuses camera/geometry
-utilities from the original FFB6D codebase.  Each sample dictionary is
-expected to contain RGB/depth paths along with pose/keypoint metadata.
-When annotation files are not provided, synthetic placeholders are
-returned so the training loop can still exercise the pipeline.
+"""
+LGFF 单类别数据加载脚本，遵循 BOP 风格的数据布局。
+``SingleLoader`` 读取配置中的数据路径，利用 FFB6D 的相机与几何工具
+解析 RGB/深度图、关键点与姿态标注；当缺失标注时返回占位符以便流水线
+依然可运行。还包含默认相机内参生成与姿态读取等辅助函数。
 """
 from __future__ import annotations
 

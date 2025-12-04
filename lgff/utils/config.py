@@ -1,4 +1,9 @@
-"""Configuration utilities for the LGFF sub-project."""
+"""
+LGFF 项目的配置读取与解析工具。
+支持 YAML/命令行参数解析，``LGFFConfig`` 数据类统一描述训练/验证所需
+的路径、超参数与硬件开关；提供 ``get_cfg_defaults``、``load_config`` 等
+便捷函数，用于在脚本入口快速构建配置对象。
+"""
 from __future__ import annotations
 
 import argparse

@@ -1,4 +1,8 @@
-"""Loss functions ported from the original FFB6D implementation."""
+"""
+LGFF 使用的损失函数集合，移植自原始 FFB6D 项目。
+实现 ``FocalLoss``、``L6D`` 等分类与姿态相关损失，以及平滑与概率约束
+所需的辅助函数，供 ``lgff_loss`` 等上层组合调用。
+"""
 
 import time
 import random

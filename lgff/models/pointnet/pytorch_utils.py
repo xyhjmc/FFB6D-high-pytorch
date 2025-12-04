@@ -1,3 +1,10 @@
+"""
+PointNet/RandLA-Net 共用的 PyTorch 工具层集合。
+包含 ``SharedMLP``、``Seq``, ``FC`` 等基础网络组件，支持批归一化、
+实例归一化和多种激活；同时提供辅助的 ``sigmoid``、``relu``、
+``leaky_relu`` 工厂方法，便于快速搭建点云分支。
+"""
+
 import torch.nn as nn
 from typing import List, Tuple
 

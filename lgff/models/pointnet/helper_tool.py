@@ -1,3 +1,11 @@
+"""
+RandLA-Net 辅助工具脚本，集中管理数据配置与点云预处理函数。
+包含多套数据集配置类（SemanticKITTI、S3DIS、Semantic3D），提供
+模型训练超参与数据增强参数；``DataProcessing`` 静态方法覆盖点云与
+标签加载、坐标变换、降采样、分块等操作，并提供色彩映射与 id/name
+转换工具，便于在训练和可视化阶段复用。
+"""
+
 # from open3d import linux as open3d
 from os.path import join
 import numpy as np

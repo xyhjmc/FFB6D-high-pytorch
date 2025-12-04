@@ -1,8 +1,9 @@
-"""LGFF-facing geometry helpers built on top of FFB6D utilities.
-
-The original FFB6D project already provides a number of geometry
-utilities.  To avoid duplicating them under ``common/``, LGFF keeps its
-own thin wrappers here and directly reuses the FFB6D implementations.
+"""
+LGFF 的几何工具脚本，在 FFB6D 工具基础上提供轻量封装。
+主要暴露 ``set_camera_intrinsics``、``pcld_processor`` 等接口，包装
+相机内参设置、点云与深度图转换、位姿估计与点云采样流程；通过复用
+FFB6D 的 ``Basic_Utils`` 与 ``ImgPcldUtils``，为上层模型提供统一的几
+何处理入口。
 """
 from __future__ import annotations
 

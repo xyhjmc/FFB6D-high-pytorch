@@ -1,3 +1,10 @@
+"""
+PSPNet 图像分支实现，封装池化金字塔与上采样解码模块。
+提供 ``PSPModule`` 与 ``PSPUpsample`` 构件，组合为 ``PSPNet`` 类，
+用于提取多尺度语义特征并输出深层特征与辅助分类支路，供 LGFF
+基干网络集成。
+"""
+
 import torch
 from torch import nn
 from torch.nn import functional as F

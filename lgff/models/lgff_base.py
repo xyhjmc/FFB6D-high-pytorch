@@ -1,4 +1,9 @@
-"""LGFF base network built from the original FFB6D fusion design."""
+"""
+LGFF 基础网络，实现由 FFB6D 演化而来的 RGB-D 融合主干。
+包含 PSPNet 与 RandLA-Net 特征提取器、逐阶段的下采样/上采样融合
+模块、关键点与中心点的预测头，以及 ``forward`` 中的多模态特征融合
+流程，供单类别与类条件模型继承使用。
+"""
 from __future__ import annotations
 
 import torch
