@@ -1,5 +1,6 @@
-from common.config import LGFFConfig, load_config
-from common.geometry import GeometryToolkit
-from common.logger import get_logger
+"""Expose the original FFB6D configuration helpers."""
 
-__all__ = ["LGFFConfig", "load_config", "GeometryToolkit", "get_logger"]
+from ffb6d.common import Config, ConfigRandLA, config
+
+__all__ = ["Config", "ConfigRandLA", "config"]
+

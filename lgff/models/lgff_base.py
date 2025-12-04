@@ -4,7 +4,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from common.geometry import GeometryToolkit
+from lgff.utils.geometry import GeometryToolkit
 
 
 class LGFFBase(nn.Module):
