@@ -4,7 +4,7 @@ from __future__ import annotations
 import torch
 from torch.utils.data import DataLoader
 
-from common import load_config, get_logger
+from lgff.utils import get_logger, load_config
 from lgff.datasets import SingleObjectDataset
 from lgff.engines import TrainerSC
 from lgff.losses import LGFFLoss

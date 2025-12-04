@@ -4,8 +4,8 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from common.config import LGFFConfig
-from common.geometry import GeometryToolkit
+from lgff.utils.config import LGFFConfig
+from lgff.utils.geometry import GeometryToolkit
 from lgff.models.lgff_base import LGFFBase
 
 

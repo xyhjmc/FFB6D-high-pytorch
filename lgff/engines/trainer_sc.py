@@ -6,8 +6,8 @@ from typing import Dict, Optional
 import torch
 from torch.utils.data import DataLoader
 
-from common.config import LGFFConfig
-from common.logger import get_logger
+from lgff.utils.config import LGFFConfig
+from lgff.utils.logger import get_logger
 
 
 class TrainerSC:

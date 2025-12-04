@@ -1,10 +1,4 @@
-"""Configuration utilities for the LGFF sub-project.
-
-The LGFF setup reuses helpers from the original FFB6D codebase.  This
-module keeps configuration handling lightweight by loading YAML files
-into a small dataclass while providing defaults suitable for
-single-class experiments.
-"""
+"""Configuration utilities for the LGFF sub-project."""
 from __future__ import annotations
 
 import argparse
@@ -22,12 +16,7 @@ def _read_yaml(path: str) -> Dict[str, Any]:
 
 @dataclass
 class LGFFConfig:
-    """Minimal configuration container for LGFF.
-
-    The goal is to provide the pieces of metadata that multiple modules
-    expect (dataset info, camera intrinsics, keypoint counts, etc.) while
-    remaining compatible with utilities pulled from FFB6D.
-    """
+    """Minimal configuration container for LGFF."""
 
     dataset_name: str = "bop-single"
     dataset_root: str = "datasets/bop"
@@ -49,18 +38,10 @@ class LGFFConfig:
 
 
 def load_config() -> LGFFConfig:
-    """Load an LGFF configuration from command line / YAML.
-
-    The loader behaves similarly to FFB6D's ad-hoc configuration logic
-    but with a narrower focus on the single-class LGFF pipeline.  If a
-    YAML file is provided via ``--config``, its keys update the default
-    :class:`LGFFConfig` instance.  Additional key/value overrides can be
-    supplied via ``--opt key=value`` pairs.
-    """
+    """Load an LGFF configuration from command line / YAML."""
 
     parser = argparse.ArgumentParser(description="LGFF configuration")
-    parser.add_argument("--config", type=str, default=None,
-                        help="Path to a YAML config file.")
+    parser.add_argument("--config", type=str, default=None, help="Path to a YAML config file.")
     parser.add_argument(
         "--opt",
         type=str,
@@ -83,9 +64,8 @@ def load_config() -> LGFFConfig:
             value = float(value) if "." in value else int(value)
         cfg.update({key: value})
 
-    # Default camera intrinsics fall back to the original FFB6D values
-    # so that imported geometry utilities can operate without further
-    # adaptation.
+    # Default camera intrinsics fall back to the original FFB6D values so
+    # that imported geometry utilities can operate without further adaptation.
     if not cfg.camera_intrinsic:
         from ffb6d.utils.basic_utils import intrinsic_matrix
 
@@ -97,3 +77,4 @@ def load_config() -> LGFFConfig:
 
 
 __all__ = ["LGFFConfig", "load_config"]
+

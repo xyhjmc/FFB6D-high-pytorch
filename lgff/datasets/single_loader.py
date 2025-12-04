@@ -17,9 +17,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from common.config import LGFFConfig
-from common.geometry import GeometryToolkit
-from lgff.utils.geometry import build_geometry
+from lgff.utils.config import LGFFConfig
+from lgff.utils.geometry import GeometryToolkit, build_geometry
 
 
 class SingleObjectDataset(Dataset):
