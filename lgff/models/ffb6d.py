@@ -1,10 +1,11 @@
+# 网络整合文件：组合PSPNet与RandLA-Net完成FFB6D多模态特征融合任务。
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from lgff.models.backbone.pspnet import PSPNet
 from lgff.models.pointnet.RandLANet import Network as RandLANet
-from lgff.models.utils import pytorch_utils as pt_utils
+from lgff.utils import pytorch_utils as pt_utils
 
 
 psp_models = {

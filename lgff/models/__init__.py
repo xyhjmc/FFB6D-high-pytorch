@@ -1,3 +1,4 @@
+# 模型存储库：集中导出网络骨干、融合模型与点云编码器，便于在训练脚本中统一调用。
 from lgff.models.backbone import Modified_PSPNet, PSPNet
 from lgff.models.ffb6d import FFB6D
 from lgff.models.lgff_base import LGFFBase
