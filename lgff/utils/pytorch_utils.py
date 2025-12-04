@@ -1,3 +1,4 @@
+# 模型工具函数库：提供共享MLP、卷积封装与统计评估等PyTorch基础组件。
 from __future__ import (
     division,
     absolute_import,
