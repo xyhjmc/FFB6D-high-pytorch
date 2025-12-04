@@ -25,6 +25,7 @@ class LGFFConfig:
     depth_scale: float = 1000.0
     num_workers: int = 4
     batch_size: int = 2
+    num_classes: int = 2
     num_points: int = 20000
     num_keypoints: int = 8
     log_dir: str = "train_log/lgff"
