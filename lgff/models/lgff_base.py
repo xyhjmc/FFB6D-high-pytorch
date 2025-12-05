@@ -4,10 +4,13 @@ Encapsulates the core RGB-D fusion logic (Projection & Sampling).
 """
 from __future__ import annotations
 
+from typing import Tuple, Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# 跟 LGFF_SC 保持一致的几何工具路径
 from lgff.utils.geometry import GeometryToolkit
 
 
@@ -80,7 +83,7 @@ class LGFFBase(nn.Module):
         self,
         feature_map: torch.Tensor,
         uv: torch.Tensor,
-        img_size: tuple[int, int],
+        img_size: Tuple[int, int],
     ) -> torch.Tensor:
         """
         Sample features from a 2D feature map using 2D coordinates.
@@ -153,27 +156,35 @@ class LGFFBase(nn.Module):
         geo_feat: torch.Tensor,
         points: torch.Tensor,
         intrinsic: torch.Tensor,
-        img_shape: tuple[int, int],
+        img_shape: Tuple[int, int],
+        valid_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         High-level helper to perform projection, sampling, and basic fusion.
 
         Args:
-            rgb_feat:  [B, C_rgb, H_f, W_f]  RGB feature map from backbone.
-            geo_feat:  [B, C_geo, N]        点级几何特征 (例如 PointNet 输出).
-            points:    [B, N, 3]            点云 (camera coords).
-            intrinsic: [B, 3, 3] or [1,3,3] 相机内参.
-            img_shape: (H_in, W_in)         原图分辨率 (与 uv 对应).
+            rgb_feat:   [B, C_rgb, H_f, W_f]  RGB feature map from backbone.
+            geo_feat:   [B, C_geo, N]        点级几何特征 (例如 PointNet 输出).
+            points:     [B, N, 3]            点云 (camera coords).
+            intrinsic:  [B, 3, 3] or [1,3,3] 相机内参.
+            img_shape:  (H_in, W_in)         原图分辨率 (与 uv 对应).
+            valid_mask: [B, N] or None       可选前景 / 有效点掩膜 (扩展用)。
 
         Returns:
             fused_feat: [B, C_rgb + C_geo, N]  拼接后的特征 (用于后续 MLP/Attention).
-            rgb_emb:   [B, C_rgb, N]          纯 RGB 点特征 (可用于可视化/辅助 loss).
+            rgb_emb:    [B, C_rgb, N]          纯 RGB 点特征 (可用于可视化/辅助 loss).
         """
         # 1. 3D → 2D 投影 (像素坐标)
         uv = self.project_points(points, intrinsic)  # [B,N,2]
 
         # 2. 在特征图上采样 RGB 特征
         rgb_emb = self.sample_features(rgb_feat, uv, img_shape)  # [B,C_rgb,N]
+
+        # （预留）如果未来你希望对 invalid 点做特殊处理，可以在这里用 valid_mask
+        # 比如把无效点的 rgb_emb 清零，暂时先不动：
+        # if valid_mask is not None:
+        #     m = valid_mask.unsqueeze(1)  # [B,1,N]
+        #     rgb_emb = rgb_emb * m
 
         # 3. 简单拼接 (更多花活可以在子类覆写)
         fused = torch.cat([rgb_emb, geo_feat], dim=1)  # [B,C_rgb+C_geo,N]
