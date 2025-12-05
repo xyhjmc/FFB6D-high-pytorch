@@ -1,5 +1,4 @@
 """
-"""
 Evaluation entry point for Single-Class LGFF.
 
 This script mirrors the training entry (`train_lgff_sc.py`) but focuses on
