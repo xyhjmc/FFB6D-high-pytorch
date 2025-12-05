@@ -110,7 +110,7 @@ class EvaluatorSC:
         # 对齐四元数符号，随后用特征向量法进行加权平均
         top_q = F.normalize(top_q, dim=-1)
         ref_q = top_q[:, :1, :]
-        sign = torch.sign(torch.sum(ref_q * top_q, dim=-1, keepdim=True)).clamp(min=0.0)
+        sign = torch.sign(torch.sum(ref_q * top_q, dim=-1, keepdim=True))
         sign[sign == 0] = 1.0  # 处理 dot=0 的边界情形
         top_q = top_q * sign
 
