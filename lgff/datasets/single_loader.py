@@ -5,10 +5,11 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image
+from plyfile import PlyData
 
 import torch
 from torch.utils.data import Dataset
@@ -31,6 +32,7 @@ class SingleObjectDataset(Dataset):
         - intrinsic:   [3, 3]    float32 (相机内参，对应当前网络输入分辨率)
         - cls_id:      []        long (单类固定为 0)
         - points:      [N, 3]    float32 (= point_cloud, 便于 loss 复用)
+        - model_points:[M, 3]    float32 (CAD 模型点，单位 m)
     """
 
     def __init__(self, cfg: LGFFConfig, split: str = "train") -> None:
@@ -48,6 +50,11 @@ class SingleObjectDataset(Dataset):
 
         # BOP 中的物体 ID（与模型 ID 对应），需要在 YAML 中指定
         self.obj_id = getattr(cfg, "obj_id", 1)
+
+        # CAD 模型点，供 ADD / ADD-S 计算使用
+        self.num_model_points = getattr(cfg, "num_model_points", cfg.num_points)
+        self.model_points = self._load_model_points()
+        self.model_points_torch = torch.from_numpy(self.model_points)
 
         # 颜色增强 (仅训练开启)
         if split == "train":
@@ -183,6 +190,41 @@ class SingleObjectDataset(Dataset):
                         }
                     )
 
+    def _load_model_points(self) -> np.ndarray:
+        """读取 CAD 模型点 (单位 m)。
+
+        优先使用 ``models_eval``，若不存在则回退到 ``models``。默认下采样到
+        ``num_model_points`` 以兼顾精度和计算量。
+        """
+
+        model_dir_candidates = [self.root / "models_eval", self.root / "models"]
+        ply_path: Optional[Path] = None
+        for d in model_dir_candidates:
+            candidate = d / f"obj_{self.obj_id:06d}.ply"
+            if candidate.exists():
+                ply_path = candidate
+                break
+
+        if ply_path is None:
+            print(
+                f"[Warning] CAD model for obj_id={self.obj_id} not found under {self.root}."
+            )
+            return np.zeros((self.num_model_points, 3), dtype=np.float32)
+
+        ply = PlyData.read(ply_path)
+        v = ply["vertex"].data
+        pts = np.stack([v["x"], v["y"], v["z"]], axis=1).astype(np.float32)
+
+        # BOP 模型单位通常为毫米，转为米以匹配深度/位姿单位
+        pts = pts / 1000.0
+
+        if pts.shape[0] > self.num_model_points:
+            rng = np.random.default_rng(seed=0)
+            choice = rng.choice(pts.shape[0], self.num_model_points, replace=False)
+            pts = pts[choice]
+
+        return pts
+
     # ------------------------------------------------------------------
     # IO & geometry helpers
     # ------------------------------------------------------------------
@@ -316,6 +358,7 @@ class SingleObjectDataset(Dataset):
             "intrinsic": torch.from_numpy(K),
             "cls_id": torch.tensor(0, dtype=torch.long),  # 单类固定 0
             "points": points_t,
+            "model_points": self.model_points_torch,
         }
 
 
