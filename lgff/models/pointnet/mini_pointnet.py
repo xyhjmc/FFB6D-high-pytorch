@@ -7,6 +7,7 @@ Features:
 - Optional SE-style channel attention (AvgPool based).
 - Optional Global Feature extraction (MaxPool or AvgPool).
 - Mask support for ROI/padding handling.
+
 """
 
 from __future__ import annotations

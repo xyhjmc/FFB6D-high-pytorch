@@ -7,6 +7,7 @@ Fixes & Features:
 - Robust stride/dilation modification for 3x3 and 5x5 kernels.
 - Supports output_stride in {8,16,32}, with effective_output_stride recorded.
 - Optional return_intermediate for low-level features (skip/multi-scale friendly).
+
 """
 from __future__ import annotations
 
