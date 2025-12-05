@@ -6,6 +6,7 @@ from __future__ import (
     unicode_literals,
 )
 import os
+import sys
 import time
 import tqdm
 import shutil
@@ -25,6 +26,10 @@ from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CyclicLR
 import torch.backends.cudnn as cudnn
 from tensorboardX import SummaryWriter
+
+# 将项目根目录添加到Python路径
+parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, parent_dir)
 
 from common import Config, ConfigRandLA
 import datasets.ycb.ycb_dataset as dataset_desc
