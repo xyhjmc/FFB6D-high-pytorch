@@ -1,20 +1,18 @@
-"""
-Robust Single-Class Trainer for LGFF.
-Features: AMP, Gradient Clipping, TensorBoard Logging, Checkpointing.
-"""
+# lgff/engines/trainer_sc.py
 from __future__ import annotations
 
 import os
 import logging
 import math
-from typing import Optional, Dict
+from typing import Optional, Dict, Any
+from dataclasses import asdict
 
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torch.cuda.amp import autocast, GradScaler
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR, StepLR
 
 from lgff.utils.config import LGFFConfig
 from lgff.models.lgff_sc import LGFF_SC
@@ -67,15 +65,38 @@ class TrainerSC:
             weight_decay=getattr(cfg, "weight_decay", 1e-4),
         )
 
-        # 3. Scheduler
-        # 默认使用 ReduceLROnPlateau（你也可以在外部自行覆盖 self.scheduler）
-        self.scheduler = ReduceLROnPlateau(
-            self.optimizer,
-            mode="min",
-            factor=0.5,
-            patience=5,
-            verbose=True,
-        )
+        # 3. Scheduler Configuration
+        scheduler_type = getattr(cfg, "scheduler", "plateau").lower()
+        self.logger.info(f"Initializing Scheduler: {scheduler_type}")
+
+        if scheduler_type == "plateau":
+            self.scheduler = ReduceLROnPlateau(
+                self.optimizer,
+                mode="min",
+                factor=getattr(cfg, "lr_factor", 0.5),
+                patience=getattr(cfg, "lr_patience", 5),
+                min_lr=getattr(cfg, "lr_min", 1e-6),
+                verbose=True,
+            )
+        elif scheduler_type == "cosine":
+            self.scheduler = CosineAnnealingLR(
+                self.optimizer,
+                T_max=getattr(cfg, "epochs", 50),
+                eta_min=getattr(cfg, "lr_min", 1e-6),
+            )
+        elif scheduler_type == "step":
+            self.scheduler = StepLR(
+                self.optimizer,
+                step_size=getattr(cfg, "lr_step_size", 20),
+                gamma=getattr(cfg, "lr_factor", 0.5),
+            )
+        elif scheduler_type == "none":
+            self.scheduler = None
+        else:
+            self.logger.warning(
+                f"Unknown scheduler type '{scheduler_type}', defaulting to None."
+            )
+            self.scheduler = None
 
         # 4. Data Loaders
         self.train_loader = train_loader
@@ -109,45 +130,47 @@ class TrainerSC:
             train_metrics = self._train_one_epoch(epoch)
 
             # --- Validation & Scheduler ---
+            metric_for_sched: Optional[float] = None
+
             if self.val_loader is not None:
                 val_metrics = self._validate(epoch)
-                val_loss = val_metrics.get("loss_total", float("nan"))
+                val_loss = float(val_metrics.get("loss_total", float("nan")))
 
                 # NaN/Inf 防御
                 if not math.isfinite(val_loss):
                     self.logger.warning(
-                        f"Epoch {epoch_idx}: val_loss is NaN/Inf "
-                        f"({val_loss}), skip scheduler.step this epoch."
+                        f"Epoch {epoch_idx}: val_loss is NaN/Inf ({val_loss}), "
+                        f"skipping scheduler/save."
                     )
-                    metric_for_sched: Optional[float] = None
                 else:
                     metric_for_sched = val_loss
-
-                self._step_scheduler(metric_for_sched)
-
-                # best model 更新
-                if math.isfinite(val_loss) and val_loss < self.best_val_loss:
-                    self.best_val_loss = val_loss
-                    self._save_checkpoint(epoch, is_best=True)
+                    # best model 更新
+                    if val_loss < self.best_val_loss:
+                        self.best_val_loss = val_loss
+                        self._save_checkpoint(epoch, is_best=True)
             else:
-                train_loss = train_metrics.get("loss_total", float("nan"))
+                # 无验证集，使用 train loss
+                train_loss = float(train_metrics.get("loss_total", float("nan")))
                 if not math.isfinite(train_loss):
                     self.logger.warning(
-                        f"Epoch {epoch_idx}: train_loss is NaN/Inf "
-                        f"({train_loss}), skip scheduler.step this epoch."
+                        f"Epoch {epoch_idx}: train_loss is NaN/Inf, skipping scheduler."
                     )
-                    metric_for_sched = None
                 else:
                     metric_for_sched = train_loss
 
-                self._step_scheduler(metric_for_sched)
+            # 更新学习率
+            self._step_scheduler(metric_for_sched)
 
             # Regular checkpoint
             self._save_checkpoint(epoch, is_best=False)
 
+            best_info = (
+                f"{self.best_val_loss:.6f}"
+                if self.best_val_loss != float("inf")
+                else "N/A"
+            )
             self.logger.info(
-                f"Epoch [{epoch_idx}/{epochs}] finished. "
-                f"Best Val Loss: {self.best_val_loss:.6f}"
+                f"Epoch [{epoch_idx}/{epochs}] finished. Best Val Loss: {best_info}"
             )
 
         self.writer.close()
@@ -160,11 +183,11 @@ class TrainerSC:
         meters: Dict[str, AverageMeter] = {}
 
         if len(self.train_loader) == 0:
-            # 极端防御：train_loader 为空，直接报错提示配置问题
-            raise RuntimeError("Train loader is empty. Please check your dataset / sampler.")
+            raise RuntimeError(
+                "Train loader is empty. Please check your dataset / sampler."
+            )
 
         for i, batch in enumerate(self.train_loader):
-            # Move batch to device
             batch = {
                 k: v.to(self.device) if isinstance(v, torch.Tensor) else v
                 for k, v in batch.items()
@@ -172,56 +195,68 @@ class TrainerSC:
 
             self.optimizer.zero_grad(set_to_none=True)
 
-            # --- Forward (with AMP) ---
             with autocast(enabled=self.use_amp):
                 outputs = self.model(batch)
                 loss, metrics = self.loss_fn(outputs, batch)
-                # 防御: metrics 为空时，用 loss_total 填充
+
+                # 确保 metrics 为 dict
                 if not isinstance(metrics, dict) or len(metrics) == 0:
-                    metrics = {"loss_total": float(loss.detach().item())}
+                    metrics = {"loss_total": loss.detach()}
 
-            # --- Backward (with AMP) ---
+            # 统一把 metric 转成 float（支持 0-dim tensor / float / int）
+            processed_metrics: Dict[str, float] = {}
+            for k, v in metrics.items():
+                if isinstance(v, torch.Tensor):
+                    # 如果是标量 tensor 直接 item；否则取 mean
+                    if v.ndim == 0:
+                        v_val = float(v.detach().item())
+                    else:
+                        v_val = float(v.detach().mean().item())
+                else:
+                    v_val = float(v)
+                processed_metrics[k] = v_val
+
+            # backward + grad clip（max_grad_norm 可配置）
             self.scaler.scale(loss).backward()
-
-            # 先 unscale 再做梯度裁剪
             self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=2.0)
 
-            # Optimizer step + scaler update
+            max_grad_norm = getattr(self.cfg, "max_grad_norm", 2.0)
+            if max_grad_norm is not None and max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), max_norm=max_grad_norm
+                )
+
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
-            # --- Logging & Meters ---
+            # Logging
             bs = batch["rgb"].size(0)
-
-            # 初始化 meters
             if not meters:
-                for k in metrics.keys():
+                for k in processed_metrics.keys():
                     meters[k] = AverageMeter()
-
-            for k, v in metrics.items():
+            for k, v in processed_metrics.items():
                 meters[k].update(v, bs)
 
             if i % getattr(self.cfg, "log_interval", 10) == 0:
                 epoch_idx = epoch + 1
                 log_str = f"Epoch [{epoch_idx}][{i}/{len(self.train_loader)}] "
-                log_str += " | ".join([f"{k}: {m.val:.4f}" for k, m in meters.items()])
+                log_str += " | ".join(
+                    [f"{k}: {m.val:.4f}" for k, m in meters.items()]
+                )
                 self.logger.info(log_str)
 
-                # TensorBoard: 当前 batch 的值
                 for k, m in meters.items():
                     self.writer.add_scalar(f"Train/{k}", m.val, self.global_step)
                 self.writer.add_scalar(
-                    "Train/LR", self.optimizer.param_groups[0]["lr"], self.global_step
+                    "Train/LR",
+                    self.optimizer.param_groups[0]["lr"],
+                    self.global_step,
                 )
 
             self.global_step += 1
 
-        # End-of-epoch summary
         if not meters:
-            # 理论上不会触发，除非 loss_fn 完全没返回 metrics
-            self.logger.warning("No training metrics were recorded in this epoch.")
-            avg_metrics = {"loss_total": float("nan")}
+            avg_metrics: Dict[str, float] = {"loss_total": float("nan")}
         else:
             avg_metrics = {k: m.avg for k, m in meters.items()}
 
@@ -233,8 +268,6 @@ class TrainerSC:
     # ------------------------------------------------------------------
     def _validate(self, epoch: int) -> Dict[str, float]:
         if self.val_loader is None or len(self.val_loader) == 0:
-            self.logger.warning("Validation loader is None or empty. Skipping validation.")
-            # 兜底返回一个只有 loss_total 的字典，防止外部访问报错
             return {"loss_total": float("nan")}
 
         self.model.eval()
@@ -247,75 +280,82 @@ class TrainerSC:
                     for k, v in batch.items()
                 }
 
-                # 可以选择性使用 AMP 做验证
                 with autocast(enabled=self.use_amp):
                     outputs = self.model(batch)
                     _, metrics = self.loss_fn(outputs, batch)
+
                     if not isinstance(metrics, dict) or len(metrics) == 0:
-                        # 验证阶段至少要有一个 loss_total，方便 scheduler
                         metrics = {"loss_total": float("nan")}
 
-                bs = batch["rgb"].size(0)
-
-                if not meters:
-                    for k in metrics.keys():
-                        meters[k] = AverageMeter()
-
+                processed_metrics: Dict[str, float] = {}
                 for k, v in metrics.items():
+                    if isinstance(v, torch.Tensor):
+                        if v.ndim == 0:
+                            v_val = float(v.detach().item())
+                        else:
+                            v_val = float(v.detach().mean().item())
+                    else:
+                        v_val = float(v)
+                    processed_metrics[k] = v_val
+
+                bs = batch["rgb"].size(0)
+                if not meters:
+                    for k in processed_metrics.keys():
+                        meters[k] = AverageMeter()
+                for k, v in processed_metrics.items():
                     meters[k].update(v, bs)
 
         if not meters:
-            self.logger.warning("No validation metrics were recorded in this epoch.")
-            avg_metrics = {"loss_total": float("nan")}
+            avg_metrics: Dict[str, float] = {"loss_total": float("nan")}
         else:
             avg_metrics = {k: m.avg for k, m in meters.items()}
 
-        # TensorBoard: epoch 级别验证指标
         for k, v in avg_metrics.items():
+            # 这里保持 epoch 作为 X 轴；Train 用 global_step，不冲突
             self.writer.add_scalar(f"Val/{k}", v, epoch + 1)
 
         self.logger.info(f"Epoch {epoch + 1} Val Summary: {avg_metrics}")
         return avg_metrics
 
     # ------------------------------------------------------------------
-    # Scheduler 统一封装：兼容 ReduceLROnPlateau 和其他 LR scheduler
+    # Scheduler 统一封装
     # ------------------------------------------------------------------
     def _step_scheduler(self, metric: Optional[float]) -> None:
         if self.scheduler is None:
             return
 
-        # ReduceLROnPlateau 需要 metric；如果 metric 无效，就直接跳过
         if isinstance(self.scheduler, ReduceLROnPlateau):
             if metric is None:
                 self.logger.warning(
-                    "Scheduler is ReduceLROnPlateau but metric is None; "
-                    "skip scheduler.step() this epoch."
+                    "ReduceLROnPlateau is enabled but metric is None, "
+                    "scheduler.step skipped for this epoch."
                 )
                 return
             self.scheduler.step(metric)
         else:
-            # 其他 scheduler 一般不需要参数
+            # Cosine / Step 等不需要 metric
             try:
                 self.scheduler.step()
             except TypeError:
-                # 极端情况：自定义 scheduler 需要参数，但我们没有
-                self.logger.warning(
-                    "scheduler.step() expected a metric but none was provided; "
-                    "skip scheduler.step() this epoch."
-                )
+                # 某些 scheduler 实现需要额外参数时，防御性忽略
+                pass
 
     # ------------------------------------------------------------------
     # Checkpoint 保存 / 恢复
     # ------------------------------------------------------------------
     def _save_checkpoint(self, epoch: int, is_best: bool = False) -> None:
-        state = {
+        state: Dict[str, Any] = {
             "epoch": epoch,
             "state_dict": self.model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
-            "scheduler": self.scheduler.state_dict() if self.scheduler is not None else None,
+            "scheduler": (
+                self.scheduler.state_dict() if self.scheduler is not None else None
+            ),
             "scaler": self.scaler.state_dict(),
             "best_val_loss": self.best_val_loss,
             "global_step": self.global_step,
+            # 方便以后追踪用的是哪一份 cfg（不影响现有逻辑）
+            "config": asdict(self.cfg) if hasattr(self.cfg, "__dataclass_fields__") else self.cfg.__dict__
         }
         last_path = os.path.join(self.output_dir, "checkpoint_last.pth")
         torch.save(state, last_path)
@@ -332,11 +372,16 @@ class TrainerSC:
         self.model.load_state_dict(checkpoint["state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer"])
 
-        if "scheduler" in checkpoint and checkpoint["scheduler"] is not None:
+        if (
+            "scheduler" in checkpoint
+            and checkpoint["scheduler"] is not None
+            and self.scheduler is not None
+        ):
             try:
                 self.scheduler.load_state_dict(checkpoint["scheduler"])
             except Exception as e:
                 self.logger.warning(f"Failed to load scheduler state: {e}")
+
         if "scaler" in checkpoint:
             try:
                 self.scaler.load_state_dict(checkpoint["scaler"])

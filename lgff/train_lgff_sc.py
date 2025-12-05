@@ -2,12 +2,8 @@
 Training entry point for Single-Class LGFF.
 Uses LGFFConfig/load_config for configuration, sets up environment,
 and launches the TrainerSC.
-
-Usage examples:
-    python train_lgff_sc.py --config configs/helmet_config.yaml
-    python train_lgff_sc.py --config configs/helmet_config.yaml --opt epochs=50 lr=5e-5
-    python train_lgff_sc.py --config configs/drill.yaml --resume output/drill/checkpoint_last.pth
 """
+
 import argparse
 import os
 import sys
@@ -17,13 +13,22 @@ import logging
 import torch
 from torch.utils.data import DataLoader
 
-# 确保项目根目录在 python path 中
+# ---------------------------------------------------------------------
+# 路径补丁：确保可以从项目根目录或 lgff 子目录运行
+# ---------------------------------------------------------------------
 sys.path.append(os.getcwd())
 
-from common.ffb6d_utils.model_complexity import ModelComplexityLogger
+# ---------------------------------------------------------------------
+# 模块导入
+# ---------------------------------------------------------------------
 from lgff.utils.config import LGFFConfig, load_config
-from lgff.utils.geometry import GeometryToolkit
-from lgff.utils.logger import setup_logger, get_logger
+from lgff.utils.logger import setup_logger
+
+try:
+    from common.geometry import GeometryToolkit
+except ImportError:
+    from lgff.utils.geometry import GeometryToolkit
+
 from lgff.datasets.single_loader import SingleObjectDataset
 from lgff.models.lgff_sc import LGFF_SC
 from lgff.losses.lgff_loss import LGFFLoss
@@ -31,22 +36,23 @@ from lgff.engines.trainer_sc import TrainerSC
 
 
 def parse_args():
-    """
-    这里只解析和“训练入口”相关的额外参数；
-    配置本身（--config, --opt）交给 common.config.load_config 处理。
-    """
-    parser = argparse.ArgumentParser(description="Train LGFF Single-Class Model")
+    """只解析与训练脚本本身相关的参数。"""
+    parser = argparse.ArgumentParser(
+        description="Train LGFF Single-Class Model",
+        add_help=True,
+    )
+
     parser.add_argument(
         "--resume",
         type=str,
         default=None,
-        help="Path to checkpoint to resume from",
+        help="Path to checkpoint to resume from (e.g., output/exp/checkpoint_last.pth)",
     )
     parser.add_argument(
         "--work-dir",
         type=str,
         default=None,
-        help="Override output directory (default: cfg.log_dir)",
+        help="Override output directory (default: defined in config.log_dir)",
     )
     parser.add_argument(
         "--seed",
@@ -54,83 +60,68 @@ def parse_args():
         default=42,
         help="Random seed for reproducibility",
     )
-    # 用 parse_known_args 保留给 load_config 的 --config / --opt 等参数
+
+    # 注意：不要在这里解析 --config / --opt，
+    # 让 lgff.utils.config.load_config 去处理它们。
     args, _ = parser.parse_known_args()
     return args
 
 
-def set_random_seed(seed: int) -> None:
+def set_random_seed(seed: int, deterministic: bool = False) -> None:
+    """设置随机种子；deterministic=True 更可复现，False 更快。"""
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    # 下面两句看需求：benchmark=True 更快但略减弱可复现性
-    torch.backends.cudnn.deterministic = False
-    torch.backends.cudnn.benchmark = True
+
+    if deterministic:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+    else:
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
 
 
 def main():
-    # 1. 解析入口参数（不含 config）
+    # 1. 解析脚本参数
     args = parse_args()
 
-    # 2. 使用 common.config.load_config() 读取 LGFFConfig
-    #    load_config 内部会处理:
-    #      --config xxx.yaml
-    #      --opt key=value ...
+    # 2. 加载配置 (会处理 --config / --opt，并保存 config_used.yaml)
     cfg: LGFFConfig = load_config()
 
-    # 3. work_dir / log_dir 统一
-    #    注意：logger 的正确使用顺序是：
-    #      (1) 先确定 work_dir
-    #      (2) 再 setup_logger()
-    #      (3) 然后其他地方才能 get_logger("lgff.train")
+    # 3. work_dir 优先级：CLI > config
     if args.work_dir is not None:
-        work_dir = args.work_dir
-    else:
-        # 默认使用 cfg.work_dir（load_config 内部保证至少和 log_dir 一致）
-        work_dir = cfg.work_dir or cfg.log_dir
+        cfg.work_dir = args.work_dir
+        os.makedirs(cfg.work_dir, exist_ok=True)
 
-    os.makedirs(work_dir, exist_ok=True)
+    # 4. 初始化日志
+    log_file = os.path.join(cfg.work_dir, "train.log")
+    logger = setup_logger(log_file, name="lgff.train")
 
-    # 4. 初始化 logger（务必在任何 get_logger 调用之前）
-    log_file = os.path.join(work_dir, "train.log")
-    setup_logger(log_file, name="lgff.train")
-    logger = get_logger("lgff.train")
-    logger.setLevel(logging.INFO)
+    config_used_path = os.path.join(cfg.work_dir, "config_used.yaml")
+    logger.info("==========================================")
+    logger.info("LGFF Training Launcher")
+    logger.info(f"Work Dir      : {cfg.work_dir}")
+    logger.info(f"Config Used   : {config_used_path}")
+    logger.info("==========================================")
 
-    logger.info(f"Loaded LGFFConfig via common.config.load_config()")
-    logger.info(f"Work directory: {work_dir}")
+    # 5. 随机数种子
+    set_random_seed(args.seed, deterministic=False)
+    logger.info(f"Random Seed   : {args.seed}")
 
-    # 5. 随机种子 & 设备信息
-    set_random_seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using device: {device}")
-    if torch.cuda.is_available():
-        logger.info(
-            f"CUDA devices: {torch.cuda.device_count()}, "
-            f"current: {torch.cuda.get_device_name(0)}"
-        )
-
-    # 6. 初始化 Geometry Toolkit
-    # 如果你的 GeometryToolkit 以后支持传入内参，可以改成：
-    # geometry = GeometryToolkit(intrinsic=cfg.camera_intrinsic)
+    # 6. 几何工具
     geometry = GeometryToolkit()
 
-    # 7. 数据集与 DataLoader
+    # 7. 数据集 & DataLoader
     logger.info("Initializing Datasets...")
 
     train_ds = SingleObjectDataset(cfg, split="train")
+    val_split_name = getattr(cfg, "val_split", "test")
+    val_ds = SingleObjectDataset(cfg, split=val_split_name)
 
-    # 验证集 split 可以以后写进 LGFFConfig，这里给一个默认 / 可选方案
-    val_split = getattr(cfg, "val_split", "val")  # cfg 里如果没有就用 "val"
-    if val_split not in ("train", "val", "test"):
-        logger.warning(f"Unknown val_split={val_split}, fallback to 'val'.")
-        val_split = "val"
-    val_ds = SingleObjectDataset(cfg, split=val_split)
+    logger.info(f"  - Train Set : {len(train_ds)} samples")
+    logger.info(f"  - Val Set   : {len(val_ds)} samples (split='{val_split_name}')")
 
-    logger.info(f"Train Dataset Size: {len(train_ds)}")
-    logger.info(f"Val Dataset Size: {len(val_ds)}")
-
-    batch_size = getattr(cfg, "batch_size", 2)
+    batch_size = getattr(cfg, "batch_size", 8)
     num_workers = getattr(cfg, "num_workers", 4)
 
     train_loader = DataLoader(
@@ -142,66 +133,45 @@ def main():
         drop_last=True,
     )
 
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=False,
-    )
+    val_loader = None
+    if len(val_ds) > 0:
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=False,
+        )
+    else:
+        logger.warning("Validation dataset is empty! Training will proceed without validation.")
 
-    if len(val_ds) == 0:
-        logger.warning("Validation dataset is empty, val_loader will be set to None.")
-        val_loader = None
-
-    # 8. 构建模型
-    logger.info("Building LGFF_SC model...")
+    # 8. 模型
+    logger.info("Building Model (LGFF_SC)...")
     model = LGFF_SC(cfg, geometry)
 
-    # 8.1 模型复杂度统计（参数量 / FLOPs）
-    complexity_logger = ModelComplexityLogger()
-    try:
-        sample_batch = next(iter(train_loader))
-        complexity_info = complexity_logger.maybe_log(model, sample_batch, stage="train_init")
-        if complexity_info:
-            logger.info(
-                " | ".join(
-                    [
-                        "[ModelComplexity] Stage=train_init",
-                        f"Params: {complexity_info['params']:,} ({complexity_info['param_mb']:.2f} MB)",
-                        f"GFLOPs: {complexity_info['gflops']:.3f}" if complexity_info.get("gflops") is not None else "GFLOPs: N/A",
-                    ]
-                )
-            )
-    except StopIteration:
-        logger.warning("Train loader is empty; skip complexity logging.")
-    except Exception as exc:
-        logger.warning(f"Model complexity logging failed: {exc}")
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"  - Trainable Params: {n_params / 1e6:.2f}M")
 
-    # 8.2 重新实例化一次 train_loader，避免消耗首个 batch
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=True,
-    )
+    if torch.cuda.is_available():
+        model = model.cuda()
+        logger.info("Using CUDA.")
+    else:
+        logger.info("CUDA not available, using CPU.")
 
-    # 9. 构建损失函数
-    logger.info("Building LGFFLoss...")
+    # 9. 损失
+    logger.info("Building Loss (LGFFLoss)...")
     loss_fn = LGFFLoss(cfg, geometry)
 
-    # 10. 构造 Trainer
-    logger.info("Initializing TrainerSC...")
+    # 10. 训练器
+    logger.info("Initializing Trainer...")
     trainer = TrainerSC(
         model=model,
         loss_fn=loss_fn,
         train_loader=train_loader,
         val_loader=val_loader,
         cfg=cfg,
-        output_dir=work_dir,
+        output_dir=cfg.work_dir,
         resume_path=args.resume,
     )
 
@@ -210,7 +180,7 @@ def main():
     try:
         trainer.fit()
     except KeyboardInterrupt:
-        logger.info("Training interrupted by user (KeyboardInterrupt).")
+        logger.info("Training interrupted by user.")
     except Exception as e:
         logger.exception(f"Training failed with error: {e}")
         raise
