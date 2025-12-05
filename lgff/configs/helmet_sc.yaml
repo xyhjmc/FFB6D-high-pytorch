@@ -1,0 +1,54 @@
+# ==========================
+# LGFF Single-Class Config
+# Target: Helmet (BOP 格式, 从完整数据集中筛选 obj_id=1)
+# File: configs/helmet_sc.yaml
+# ==========================
+
+# ---------- Dataset / BOP ----------
+dataset_name: "bop-single"
+
+# 指向「整个」BOP 数据集根目录，而不是单独某个物体的子文件夹
+# 例如：
+#   datasets/bop/mine_tools
+#   datasets/bop/lm         (LINEMOD)
+dataset_root: "datasets/bop/mine_tools"
+
+# 只用 obj_id 来筛选安全帽样本
+obj_id: 1
+
+# 网络输入分辨率 (H, W)
+resize_h: 480
+resize_w: 640
+
+# 深度缩放：depth_m = raw_depth / depth_scale
+depth_scale: 1000.0
+
+# 每次采样的点云点数
+num_points: 1024
+num_keypoints: 8
+
+# 验证 split 的名称，要和你的 BOP 文件夹对应
+# 比如你有 mine_tools/test/... 就用 "test"
+val_split: "test"
+
+# ---------- Dataloader ----------
+batch_size: 8
+num_workers: 4
+
+# ---------- Training Hyper-params ----------
+epochs: 80
+lr: 0.001
+weight_decay: 0.0001
+use_amp: true
+log_interval: 10
+
+# ---------- Model / Loss ----------
+rgb_feat_dim: 128
+geo_feat_dim: 128
+w_rate: 0.015
+sym_class_ids: []   # helmet 非严格对称，先当非对称
+
+
+# ---------- Logging / Output ----------
+log_dir: "output/helmet_sc"
+# work_dir 不写的话会默认等于 log_dir
