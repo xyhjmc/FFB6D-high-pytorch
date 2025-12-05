@@ -20,6 +20,7 @@ from torch.utils.data import DataLoader
 # 确保项目根目录在 python path 中
 sys.path.append(os.getcwd())
 
+from common.ffb6d_utils.model_complexity import ModelComplexityLogger
 from lgff.utils.config import LGFFConfig, load_config
 from lgff.utils.geometry import GeometryToolkit
 from lgff.utils.logger import setup_logger, get_logger
@@ -158,8 +159,35 @@ def main():
     logger.info("Building LGFF_SC model...")
     model = LGFF_SC(cfg, geometry)
 
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info(f"Model Parameters: {n_params / 1e6:.2f}M")
+    # 8.1 模型复杂度统计（参数量 / FLOPs）
+    complexity_logger = ModelComplexityLogger()
+    try:
+        sample_batch = next(iter(train_loader))
+        complexity_info = complexity_logger.maybe_log(model, sample_batch, stage="train_init")
+        if complexity_info:
+            logger.info(
+                " | ".join(
+                    [
+                        "[ModelComplexity] Stage=train_init",
+                        f"Params: {complexity_info['params']:,} ({complexity_info['param_mb']:.2f} MB)",
+                        f"GFLOPs: {complexity_info['gflops']:.3f}" if complexity_info.get("gflops") is not None else "GFLOPs: N/A",
+                    ]
+                )
+            )
+    except StopIteration:
+        logger.warning("Train loader is empty; skip complexity logging.")
+    except Exception as exc:
+        logger.warning(f"Model complexity logging failed: {exc}")
+
+    # 8.2 重新实例化一次 train_loader，避免消耗首个 batch
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=True,
+    )
 
     # 9. 构建损失函数
     logger.info("Building LGFFLoss...")
