@@ -29,9 +29,9 @@ from torch.optim.lr_scheduler import CyclicLR
 import torch.backends.cudnn as cudnn
 from tensorboardX import SummaryWriter
 
-ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
-if ROOT_DIR not in sys.path:
-    sys.path.insert(0, ROOT_DIR)
+parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# 将项目根目录添加到Python路径
+sys.path.insert(0, parent_dir)
 
 from common import Config, ConfigRandLA
 import models.pytorch_utils as pt_utils
@@ -40,6 +40,7 @@ from models.loss import OFLoss, FocalLoss
 import datasets.linemod.linemod_dataset as dataset_desc
 from common.ffb6d_utils.pvn3d_eval_utils_kpls import TorchEval
 from common.ffb6d_utils.basic_utils import Basic_Utils
+from common.ffb6d_utils.model_complexity import ModelComplexityLogger
 
 
 parser = argparse.ArgumentParser(description="Arg parser")
@@ -733,4 +734,3 @@ if __name__ == "__main__":
     mp.set_start_method('spawn', force=True)
     args.world_size = args.gpus * args.nodes
     train()
-from common.ffb6d_utils.model_complexity import ModelComplexityLogger

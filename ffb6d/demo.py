@@ -7,6 +7,7 @@ from __future__ import (
     unicode_literals,
 )
 import os
+import sys
 import tqdm
 import cv2
 import torch
@@ -15,6 +16,11 @@ import torch.nn as nn
 import numpy as np
 import pickle as pkl
 from glob import glob
+
+parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# 将项目根目录添加到Python路径
+sys.path.insert(0, parent_dir)
+
 from common import Config, ConfigRandLA
 from models.ffb6d import FFB6D
 from datasets.ycb.ycb_dataset import Dataset as YCB_Dataset
