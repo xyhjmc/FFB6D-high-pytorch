@@ -11,8 +11,10 @@ import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from torch.cuda.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR, StepLR
+
+from torch.amp import autocast, GradScaler  # ✅ 新 AMP API
+from tqdm.auto import tqdm  # ✅ 进度条
 
 from lgff.utils.config import LGFFConfig
 from lgff.models.lgff_sc import LGFF_SC
@@ -70,13 +72,13 @@ class TrainerSC:
         self.logger.info(f"Initializing Scheduler: {scheduler_type}")
 
         if scheduler_type == "plateau":
+            # ⚠️ 不加 verbose，兼容旧版 PyTorch
             self.scheduler = ReduceLROnPlateau(
                 self.optimizer,
                 mode="min",
                 factor=getattr(cfg, "lr_factor", 0.5),
                 patience=getattr(cfg, "lr_patience", 5),
                 min_lr=getattr(cfg, "lr_min", 1e-6),
-                verbose=True,
             )
         elif scheduler_type == "cosine":
             self.scheduler = CosineAnnealingLR(
@@ -102,8 +104,8 @@ class TrainerSC:
         self.train_loader = train_loader
         self.val_loader = val_loader
 
-        # 5. AMP Scaler
-        self.scaler = GradScaler(enabled=getattr(cfg, "use_amp", True))
+        # 5. AMP Scaler（新 API）
+        self.scaler = GradScaler("cuda", enabled=getattr(cfg, "use_amp", True))
         self.use_amp = self.scaler.is_enabled()
 
         # 6. Logging / State
@@ -131,6 +133,7 @@ class TrainerSC:
 
             # --- Validation & Scheduler ---
             metric_for_sched: Optional[float] = None
+            val_metrics: Dict[str, float] = {"loss_total": float("nan")}
 
             if self.val_loader is not None:
                 val_metrics = self._validate(epoch)
@@ -164,19 +167,35 @@ class TrainerSC:
             # Regular checkpoint
             self._save_checkpoint(epoch, is_best=False)
 
+            # -------- 清晰的 Epoch 总结日志 --------
+            train_loss_log = float(train_metrics.get("loss_total", float("nan")))
+            val_loss_log = float(val_metrics.get("loss_total", float("nan")))
+
+            train_str = f"{train_loss_log:.6f}" if math.isfinite(train_loss_log) else "NaN"
+            if self.val_loader is not None:
+                val_str = f"{val_loss_log:.6f}" if math.isfinite(val_loss_log) else "NaN"
+            else:
+                val_str = "N/A"
+
             best_info = (
                 f"{self.best_val_loss:.6f}"
                 if self.best_val_loss != float("inf")
                 else "N/A"
             )
+            lr_now = self.optimizer.param_groups[0]["lr"]
+
             self.logger.info(
-                f"Epoch [{epoch_idx}/{epochs}] finished. Best Val Loss: {best_info}"
+                f"Epoch [{epoch_idx}/{epochs}] Summary | "
+                f"Train loss_total={train_str} | "
+                f"Val loss_total={val_str} | "
+                f"LR={lr_now:.2e} | "
+                f"Best Val={best_info}"
             )
 
         self.writer.close()
 
     # ------------------------------------------------------------------
-    # 单个 epoch 的训练
+    # 单个 epoch 的训练（带 tqdm 进度条，并保留每轮的最后一行）
     # ------------------------------------------------------------------
     def _train_one_epoch(self, epoch: int) -> Dict[str, float]:
         self.model.train()
@@ -187,7 +206,14 @@ class TrainerSC:
                 "Train loader is empty. Please check your dataset / sampler."
             )
 
-        for i, batch in enumerate(self.train_loader):
+        pbar = tqdm(
+            enumerate(self.train_loader),
+            total=len(self.train_loader),
+            desc=f"[Train] Epoch {epoch + 1}",
+            leave=True,   # ✅ 训练条保留在终端
+        )
+
+        for i, batch in pbar:
             batch = {
                 k: v.to(self.device) if isinstance(v, torch.Tensor) else v
                 for k, v in batch.items()
@@ -195,7 +221,7 @@ class TrainerSC:
 
             self.optimizer.zero_grad(set_to_none=True)
 
-            with autocast(enabled=self.use_amp):
+            with autocast("cuda", enabled=self.use_amp):
                 outputs = self.model(batch)
                 loss, metrics = self.loss_fn(outputs, batch)
 
@@ -207,7 +233,6 @@ class TrainerSC:
             processed_metrics: Dict[str, float] = {}
             for k, v in metrics.items():
                 if isinstance(v, torch.Tensor):
-                    # 如果是标量 tensor 直接 item；否则取 mean
                     if v.ndim == 0:
                         v_val = float(v.detach().item())
                     else:
@@ -237,6 +262,15 @@ class TrainerSC:
             for k, v in processed_metrics.items():
                 meters[k].update(v, bs)
 
+            # 更新 tqdm 状态栏
+            show_keys = list(processed_metrics.keys())
+            main_key = "loss_total" if "loss_total" in show_keys else show_keys[0]
+            pbar.set_postfix({
+                main_key: f"{meters[main_key].val:.4f}",
+                "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
+            })
+
+            # 按 log_interval 写 TensorBoard 日志 + logger
             if i % getattr(self.cfg, "log_interval", 10) == 0:
                 epoch_idx = epoch + 1
                 log_str = f"Epoch [{epoch_idx}][{i}/{len(self.train_loader)}] "
@@ -264,7 +298,7 @@ class TrainerSC:
         return avg_metrics
 
     # ------------------------------------------------------------------
-    # 验证阶段
+    # 验证阶段（带 tqdm 进度条，并保留每轮的最后一行）
     # ------------------------------------------------------------------
     def _validate(self, epoch: int) -> Dict[str, float]:
         if self.val_loader is None or len(self.val_loader) == 0:
@@ -274,13 +308,20 @@ class TrainerSC:
         meters: Dict[str, AverageMeter] = {}
 
         with torch.no_grad():
-            for i, batch in enumerate(self.val_loader):
+            pbar = tqdm(
+                enumerate(self.val_loader),
+                total=len(self.val_loader),
+                desc=f"[Val]   Epoch {epoch + 1}",
+                leave=True,   # ✅ 验证条保留在终端
+            )
+
+            for i, batch in pbar:
                 batch = {
                     k: v.to(self.device) if isinstance(v, torch.Tensor) else v
                     for k, v in batch.items()
                 }
 
-                with autocast(enabled=self.use_amp):
+                with autocast("cuda", enabled=self.use_amp):
                     outputs = self.model(batch)
                     _, metrics = self.loss_fn(outputs, batch)
 
@@ -305,13 +346,21 @@ class TrainerSC:
                 for k, v in processed_metrics.items():
                     meters[k].update(v, bs)
 
+                # 更新 tqdm 状态
+                main_key = (
+                    "loss_total"
+                    if "loss_total" in meters
+                    else list(meters.keys())[0]
+                )
+                pbar.set_postfix({main_key: f"{meters[main_key].val:.4f}"})
+
         if not meters:
             avg_metrics: Dict[str, float] = {"loss_total": float("nan")}
         else:
             avg_metrics = {k: m.avg for k, m in meters.items()}
 
         for k, v in avg_metrics.items():
-            # 这里保持 epoch 作为 X 轴；Train 用 global_step，不冲突
+            # Val 用 epoch 作为 X 轴
             self.writer.add_scalar(f"Val/{k}", v, epoch + 1)
 
         self.logger.info(f"Epoch {epoch + 1} Val Summary: {avg_metrics}")
@@ -337,7 +386,6 @@ class TrainerSC:
             try:
                 self.scheduler.step()
             except TypeError:
-                # 某些 scheduler 实现需要额外参数时，防御性忽略
                 pass
 
     # ------------------------------------------------------------------
@@ -354,8 +402,11 @@ class TrainerSC:
             "scaler": self.scaler.state_dict(),
             "best_val_loss": self.best_val_loss,
             "global_step": self.global_step,
-            # 方便以后追踪用的是哪一份 cfg（不影响现有逻辑）
-            "config": asdict(self.cfg) if hasattr(self.cfg, "__dataclass_fields__") else self.cfg.__dict__
+            "config": (
+                asdict(self.cfg)
+                if hasattr(self.cfg, "__dataclass_fields__")
+                else self.cfg.__dict__
+            ),
         }
         last_path = os.path.join(self.output_dir, "checkpoint_last.pth")
         torch.save(state, last_path)

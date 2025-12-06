@@ -1,14 +1,3 @@
-"""
-Evaluation entry point for Single-Class LGFF.
-
-This script mirrors the training entry (`train_lgff_sc.py`) but focuses on
-loading a trained checkpoint, running inference on a chosen split, and
-reporting simple metrics (ADD / ADD-S / <2cm accuracy).
-
-Usage examples:
-    python lgff/eval_sc.py --config configs/helmet_sc.yaml --checkpoint output/helmet_sc/checkpoint_best.pth
-    python lgff/eval_sc.py --config configs/helmet_sc.yaml --checkpoint output/helmet_sc/checkpoint_last.pth --split val
-"""
 from __future__ import annotations
 
 import argparse
@@ -26,8 +15,14 @@ sys.path.append(os.getcwd())
 
 from common.ffb6d_utils.model_complexity import ModelComplexityLogger
 from lgff.utils.config import LGFFConfig, load_config
-from lgff.utils.geometry import GeometryToolkit
 from lgff.utils.logger import setup_logger, get_logger
+
+# 和 train_lgff_sc 一样的导入策略，保证兼容
+try:
+    from common.geometry import GeometryToolkit
+except ImportError:
+    from lgff.utils.geometry import GeometryToolkit
+
 from lgff.datasets.single_loader import SingleObjectDataset
 from lgff.models.lgff_sc import LGFF_SC
 from lgff.engines.evaluator_sc import EvaluatorSC
@@ -141,6 +136,8 @@ def main() -> None:
     # Model
     model = LGFF_SC(cfg, geometry)
     load_model_weights(model, args.checkpoint, device)
+    model = model.to(device)
+    model.eval()
 
     # Complexity stats (params/FLOPs)
     complexity_logger = ModelComplexityLogger()
@@ -153,7 +150,11 @@ def main() -> None:
                     [
                         "[ModelComplexity] Stage=eval",
                         f"Params: {complexity_info['params']:,} ({complexity_info['param_mb']:.2f} MB)",
-                        f"GFLOPs: {complexity_info['gflops']:.3f}" if complexity_info.get("gflops") is not None else "GFLOPs: N/A",
+                        (
+                            f"GFLOPs: {complexity_info['gflops']:.3f}"
+                            if complexity_info.get("gflops") is not None
+                            else "GFLOPs: N/A"
+                        ),
                     ]
                 )
             )
