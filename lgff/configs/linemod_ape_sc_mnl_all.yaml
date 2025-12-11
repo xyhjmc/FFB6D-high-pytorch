@@ -1,77 +1,75 @@
-# lgff/configs/linemod_ape_sc.yaml
+# =========================================
+# LGFF Single-Class Config (LINEMOD - APE)
+# =========================================
 
-# ===================== Dataset =====================
-dataset_name: "bop-single"                # 按 SingleObjectDataset 里原来的分支来
-dataset_root: "/home/xyh/PycharmProjects/FFB6D-high-pytorch/lgff/data/linemod_ape_crop128_all"
+# ---------- Dataset / BOP ----------
+dataset_name: "bop-single"
 
-obj_id: 1                                 # LINEMOD ape 在 BOP 里是 1
-num_classes: 1
-num_points: 1024                          # 每帧采样的点数量（和 dataloader 对应）
-val_split: "test"                         # 我们刚才裁剪的是 test 子集
+# 指向完整的 BOP 数据集根目录（LINEMOD = lm）。
+# 训练/评估时只会通过 obj_id=1 过滤出 ape 的图像。
+dataset_root: "datasets/bop/lm"
 
-# 裁剪后图片已是 128×128，这里保持一致（只是个 sanity 配置）
+obj_id: 1
+num_points: 1024
+num_keypoints: 8
+val_split: "test"               # 与裁剪脚本输出的 split 对齐
+
+# 裁剪后输入尺寸
 resize_h: 128
 resize_w: 128
 
-depth_scale: 1000.0                       # BOP LM 默认 1000，和裁剪脚本一致
+# 深度缩放（BOP 默认毫米 -> 米）
+depth_scale: 1000.0
 
+# ---------- Dataloader ----------
 batch_size: 32
 num_workers: 8
 
-# ===================== Training Hyper-params =====================
-epochs: 50                                # 先跑 80 轮，后面看曲线再改
-lr: 1.0e-4
-weight_decay: 1.0e-5
+# ---------- Training Hyper-params ----------
+epochs: 50
+lr: 0.0001
+weight_decay: 0.00001
 use_amp: true
-log_interval: 20                          # 每 20 个 iteration 打一条日志
+log_interval: 20
 
-# 学习率调度器：plateau / cosine / step / none
+# LR Scheduler（plateau / cosine / step / none）
 scheduler: "plateau"
-
-# plateau 参数
 lr_patience: 10
 lr_factor: 0.5
-lr_min: 1.0e-6
-
-# step / cosine 时会用到
+lr_min: 0.000001
 lr_step_size: 30
 
 # 梯度裁剪
 max_grad_norm: 2.0
 
-# ===================== Model / Backbone =====================
+# ---------- Model / Backbone ----------
 backbone_name: "mobilenet_v3_large"
-backbone_arch: "large"                    # MobileNetV3-Small
-backbone_output_stride: 8                 # 高分辨率特征图
+backbone_arch: "large"
+backbone_output_stride: 8
 backbone_pretrained: true
-backbone_freeze_bn: true                  # 小 batch 建议冻结 BN
-backbone_return_intermediate: false       # 暂时不用低层特征
+backbone_freeze_bn: true
+backbone_return_intermediate: false
 backbone_low_level_index: 2
 
 rgb_feat_dim: 128
 geo_feat_dim: 128
 
-# ===================== PointNet Branch =====================
-point_input_dim: 3                        # (x, y, z)
+# ---------- PointNet Branch ----------
+point_input_dim: 3
 point_hidden_dims: [64, 128]
 point_norm: "bn"
 point_use_se: true
 point_dropout: 0.0
 
-# ===================== Head =====================
+# ---------- Head ----------
 head_hidden_dim: 128
 head_feat_dim: 64
 head_dropout: 0.0
 
-# ===================== Loss & Symmetry =====================
-                        # 你之前用的默认
-sym_class_ids: []                         # ape 非对称
+# ---------- Loss & Symmetry ----------
 w_rate: 0.015
-lambda_t: 0.5
-lambda_conf: 0.1
-t_z_weight: 1.8
-conf_alpha: 5.0
+sym_class_ids: []          # ape 非对称
 
-# ===================== Logging / Output =====================
-log_dir: "/home/xyh/PycharmProjects/FFB6D-high-pytorch/output/linemod_ape_sc_mnl_all"
-work_dir: "/home/xyh/PycharmProjects/FFB6D-high-pytorch/output/linemod_ape_sc_mnl_all"
+# ---------- Logging / Output ----------
+log_dir: "output/linemod_ape_sc_mnl_all"
+# 不写 work_dir 会默认使用 log_dir

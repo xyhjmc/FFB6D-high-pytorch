@@ -219,10 +219,18 @@ class EvaluatorSC:
         # 尽量带上 scene_id / im_id 等 dataset 信息（如果存在）
         scene_ids = None
         im_ids = None
+        cls_id_arr = None
         if "scene_id" in batch:
             scene_ids = batch["scene_id"].detach().cpu().numpy()
         if "im_id" in batch:
             im_ids = batch["im_id"].detach().cpu().numpy()
+        if isinstance(cls_ids, torch.Tensor):
+            cls_id_tensor = cls_ids
+            if cls_id_tensor.dim() > 1:
+                cls_id_tensor = cls_id_tensor.view(-1)
+            cls_id_arr = cls_id_tensor.detach().cpu().numpy()
+        elif cls_ids is not None:
+            cls_id_arr = np.asarray(cls_ids)
 
         # 取出 numpy 数组
         add_np   = batch_metrics["add"].numpy()
@@ -277,7 +285,7 @@ class EvaluatorSC:
                 "index": int(self.sample_counter),
                 "scene_id": int(scene_ids[i]) if scene_ids is not None else -1,
                 "im_id": int(im_ids[i]) if im_ids is not None else -1,
-                "cls_id": int(cls_id_scalar) if cls_id_scalar is not None else -1,
+                "cls_id": int(cls_id_arr[i]) if cls_id_arr is not None else int(getattr(self.cfg, "obj_id", -1)),
                 "is_symmetric": bool(sym_mask_np[i]),
                 "add": float(add_np[i]),
                 "add_s": float(adds_np[i]),
