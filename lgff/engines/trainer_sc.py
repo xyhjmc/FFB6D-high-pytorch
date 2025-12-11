@@ -63,6 +63,11 @@ class TrainerSC:
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
 
+        # loss 分量历史记录（仅统计，不影响训练）
+        self.loss_components_path = os.path.join(
+            self.output_dir, "loss_components_history.csv"
+        )
+
         # 1. Device & Model
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = model.to(self.device)
@@ -199,6 +204,9 @@ class TrainerSC:
 
             # 记录 epoch 级别的指标到 self.history
             self._record_epoch_metrics(epoch_idx, train_metrics, val_metrics)
+
+            # 仅统计：记录 loss 分量、权重与占比（与原始定义保持一致）
+            self._append_loss_components(epoch_idx, train_metrics)
 
             # -------- 清晰的 Epoch 总结日志 --------
             train_loss_log = float(train_metrics.get("loss_total", float("nan")))
@@ -529,6 +537,91 @@ class TrainerSC:
             val_entry = {"epoch": epoch_idx}
             val_entry.update({k: float(v) for k, v in val_metrics.items()})
             self.history["val"].append(val_entry)
+
+    # ------------------------------------------------------------------
+    # 记录 loss 分量、权重与占比（仅用于监控）
+    # ------------------------------------------------------------------
+    def _append_loss_components(self, epoch_idx: int, train_metrics: Dict[str, float]) -> None:
+        component_keys = [
+            "loss_add",
+            "loss_t",
+            "loss_conf",
+            "loss_add_cad",
+            "loss_kp_of",
+        ]
+        short_names = {
+            "loss_add": "add",
+            "loss_t": "t",
+            "loss_conf": "conf",
+            "loss_add_cad": "add_cad",
+            "loss_kp_of": "kp_of",
+        }
+
+        lambdas = {
+            "loss_add": getattr(self.cfg, "lambda_add", 1.0),
+            "loss_t": getattr(self.cfg, "lambda_t", 0.5),
+            "loss_conf": getattr(self.cfg, "lambda_conf", 0.1),
+            "loss_add_cad": getattr(self.cfg, "lambda_add_cad", 0.0),
+            "loss_kp_of": getattr(self.cfg, "lambda_kp_of", 0.6),
+        }
+
+        total_loss = float(train_metrics.get("loss_total", 0.0))
+        components = {k: float(train_metrics.get(k, 0.0)) for k in component_keys}
+
+        weighted = {f"w_{short_names[k]}": lambdas[k] * components[k] for k in component_keys}
+
+        ratios = {}
+        for k in component_keys:
+            num = weighted[f"w_{short_names[k]}"]
+            if math.isfinite(total_loss) and abs(total_loss) > 1e-8:
+                ratios[f"ratio_{short_names[k]}"] = num / total_loss
+            else:
+                ratios[f"ratio_{short_names[k]}"] = 0.0
+
+        row = {"epoch": epoch_idx}
+        row.update(components)
+        row.update(weighted)
+        row.update(ratios)
+
+        write_header = not os.path.exists(self.loss_components_path)
+        with open(self.loss_components_path, "a", encoding="utf-8", newline="") as f:
+            fieldnames = [
+                "epoch",
+                "loss_add",
+                "loss_t",
+                "loss_conf",
+                "loss_add_cad",
+                "loss_kp_of",
+                "w_add",
+                "w_t",
+                "w_conf",
+                "w_add_cad",
+                "w_kp_of",
+                "ratio_add",
+                "ratio_t",
+                "ratio_conf",
+                "ratio_add_cad",
+                "ratio_kp_of",
+            ]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if write_header:
+                writer.writeheader()
+            writer.writerow({k: row.get(k, 0.0) for k in fieldnames})
+
+        # 简短日志，帮助人工检查量纲/权重
+        def _fmt_ratio(full_key: str) -> str:
+            short = short_names.get(full_key, full_key)
+            return f"{ratios.get(f'ratio_{short}', 0.0)*100:.0f}%"
+
+        summary_lines = [
+            f"[LossBreakdown] epoch={epoch_idx} | total={total_loss:.6f}",
+            f"  - add:   {components['loss_add']:.6f} ({_fmt_ratio('loss_add')})",
+            f"  - t:     {components['loss_t']:.6f} ({_fmt_ratio('loss_t')})",
+            f"  - conf:  {components['loss_conf']:.6f} ({_fmt_ratio('loss_conf')})",
+            f"  - cad:   {components['loss_add_cad']:.6f} ({_fmt_ratio('loss_add_cad')})",
+            f"  - kp_of: {components['loss_kp_of']:.6f} ({_fmt_ratio('loss_kp_of')})",
+        ]
+        self.logger.info("\n".join(summary_lines))
 
     # ------------------------------------------------------------------
     # 把 history 存成 JSON / CSV（epoch 维度）
