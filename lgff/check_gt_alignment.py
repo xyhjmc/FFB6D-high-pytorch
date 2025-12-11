@@ -19,11 +19,18 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
+from pathlib import Path
 from typing import Iterable, List
 
 import cv2
 import numpy as np
 import torch
+
+# Ensure the project root is on sys.path when executed as a script
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from lgff.utils.config import LGFFConfig, load_config
 from lgff.datasets.single_loader import SingleObjectDataset
