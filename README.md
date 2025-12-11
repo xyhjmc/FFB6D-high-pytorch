@@ -1,3 +1,71 @@
+# LGFF Single-Object 6D Pose Estimation (PyTorch 2.x)
+
+This repository contains a lightweight, high-PyTorch version of the single-object **LGFF** (FFB6D-inspired) 6D pose estimator. It targets BOP/LINEMOD objects (e.g., `ape`) with unified meter units, confidence-aware pose fusion, and visualization utilities.
+
+## Coordinate & Unit Conventions
+- **Camera frame, meters everywhere.** Depth from `scene_camera.json` is converted with `depth_m = depth_raw * depth_scale_scene / cfg.depth_scale`; CAD meshes are divided by `1000` when loaded.
+- **Poses** are `[R|t]` with `R` (3×3) in the left block and `t` (meters) in the last column; all transforms map object points into the camera frame.
+- **Points**
+  - `points` / ROI depth points: camera frame (m), cropped/resized together with RGB and `K`.
+  - `model_points`: CAD object frame (m), broadcast to batch when needed.
+- **Intrinsics**: if RGB/depth are resized, `K` is scaled accordingly; projection helpers use `cam_scale=1.0` (meters) explicitly.
+
+## Data Preparation
+1. Place BOP-format data under `datasets/bop` (or set `cfg.dataset_root`).
+2. Ensure `scene_camera.json` contains `cam_K` and `depth_scale`; the loader applies per-scene `depth_scale` and resizes RGB/depth/masks consistently.
+3. Optional: provide `keypoints/obj_xxxxxx.npy` for predefined object-frame keypoints; otherwise they are sampled from the CAD points.
+
+## Training
+```bash
+python lgff/train_lgff_sc.py --config lgff/configs/linemod_ape_sc_resnet34.yaml \
+    --work-dir output/linemod_ape_sc
+```
+Key notes:
+- Checkpoints store the **full config**; gradients use PyTorch AMP + GradScaler + configurable grad clip.
+- Pose fusion during training/validation mirrors evaluation (`train_use_best_point` / `eval_use_best_point` or weighted Top-K via `pose_fusion_topk`).
+- Loss terms include ROI DenseFusion-style geometry, translation, confidence regularization, optional CAD-level ADD/ADD-S, and optional keypoint offset supervision.
+
+## Evaluation
+```bash
+python lgff/eval_sc.py --checkpoint output/linemod_ape_sc  # directory or .pth
+```
+Behavior:
+- If a directory is provided, the evaluator loads `checkpoint_best.pth` first, falling back to `checkpoint_last.pth`.
+- The config inside the checkpoint rebuilds the model/backbone; CLI overrides (e.g., batch size, val split) are kept.
+- Metrics: ADD, ADD-S (per-sample symmetry), translation error, rotation error, CMD (<2 cm), and thresholded accuracies; per-image CSV is saved alongside logs.
+
+## Visualization
+```bash
+python lgff/viz_sc.py --checkpoint output/linemod_ape_sc --num-samples 8 --show
+```
+Outputs per-sample images with:
+- RGB overlays (cube + axes projected with `cam_scale=1.0`, meters).
+- 3D scatter of CAD@GT vs CAD@Pred vs raw ROI depth.
+- Title reports ADD/ADD-S, translation/rotation errors, CMD distance, and symmetry flag.
+
+## Extending / Switching Backbones
+- Backbones and head widths come from the checkpoint config; change them in YAML/`--opt` **before training**.
+- Pose fusion strategy is configurable per stage (`train_use_best_point`, `eval_use_best_point`, `viz_use_best_point`, `pose_fusion_topk`, `loss_use_fused_pose`).
+- Toggle loss branches via `lambda_add`, `lambda_add_cad`, `lambda_kp_of`, `lambda_conf`, `lambda_t`; monitor per-branch magnitudes in `metrics_history.csv`.
+
+## Reproducibility
+- Default seed is 42; set `--seed` or `cfg.seed` and `cfg.deterministic=True` for stricter CuDNN determinism.
+- Dataloaders rescale intrinsics with image resizing; no random geometric augmentation is applied in evaluation/visualization paths.
+
+## Repository Layout
+- `lgff/datasets/single_loader.py`: BOP data loader with unit-consistent RGB/depth/mask/K handling and keypoint targets.
+- `lgff/models/lgff_sc.py`: Single-class LGFF network.
+- `lgff/losses/lgff_loss.py`: Multi-branch loss (ROI/CAD ADD/ADD-S, translation, confidence, keypoint offset) with NaN/Inf guards.
+- `lgff/engines/trainer_sc.py`: AMP training loop, validation with unified metrics, checkpoint/history logging.
+- `lgff/engines/evaluator_sc.py`: Inference-time pose fusion, ADD/ADD-S/CMD metrics, per-image CSV export.
+- `lgff/viz_sc.py`: Visualization helper aligned with evaluator math.
+
+Enjoy robust, unit-consistent 6D pose experiments! 中文用户：关键注释均在对应代码位置，强调“米制 / 相机坐标系 / 对称性判定 / 姿态融合策略”。
+
+---
+
+## Original FFB6D README (reference)
+
 # FFB6D
 This is the official source code for the **CVPR2021 Oral** work, **FFB6D: A Full Flow Biderectional Fusion Network for 6D Pose Estimation**. ([Arxiv](https://arxiv.org/abs/2103.02242), [Video_Bilibili](https://www.bilibili.com/video/BV1YU4y1a7Kp?from=search&seid=8306279574921937158), [Video_YouTube](https://www.youtube.com/watch?v=SSi2TnyD6Is))
 
@@ -25,7 +93,7 @@ This is the official source code for the **CVPR2021 Oral** work, **FFB6D: A Full
 ## Introduction & Citation
 <div align=center><img width="100%" src="figs/FFB6D_overview.png"/></div>
 
-[FFB6D](https://arxiv.org/abs/2103.02242v1) is a general framework for representation learning from a single RGBD image, and we applied it to the 6D pose estimation task by cascading downstream prediction headers for instance semantic segmentation and 3D keypoint voting prediction from PVN3D([Arxiv](https://arxiv.org/abs/1911.04231), [Code](https://github.com/ethnhe/PVN3D), [Video](https://www.bilibili.com/video/av89408773/)). 
+[FFB6D](https://arxiv.org/abs/2103.02242v1) is a general framework for representation learning from a single RGBD image, and we applied it to the 6D pose estimation task by cascading downstream prediction headers for instance semantic segmentation and 3D keypoint voting prediction from PVN3D([Arxiv](https://arxiv.org/abs/1911.04231), [Code](https://github.com/ethnhe/PVN3D), [Video](https://www.bilibili.com/video/av89408773/)).
 At the representation learning stage of FFB6D, we build **bidirectional** fusion modules in the **full flow** of the two networks, where fusion is applied to each encoding and decoding layer. In this way, the two networks can leverage local and global complementary information from the other one to obtain better representations. Moreover, at the output representation stage, we designed a simple but effective 3D keypoints selection algorithm considering the texture and geometry information of objects, which simplifies keypoint localization for precise pose estimation.
 
 Please cite [FFB6D](https://arxiv.org/abs/2103.02242v1) & [PVN3D](https://arxiv.org/abs/1911.04231) if you use this repository in your publications:
@@ -98,7 +166,7 @@ See our demo video on [YouTube](https://www.youtube.com/watch?v=SSi2TnyD6Is) or 
     - **ffb6d/models/RandLA/**: pytorch version of RandLA-Net from [RandLA-Net-pytorch](https://github.com/qiqihaer/RandLA-Net-pytorch)
   - **ffb6d/utils**
     - **ffb6d/utils/basic_utils.py**: basic functions for data processing, visualization and so on.
-    - **ffb6d/utils/meanshift_pytorch.py**: pytorch version of meanshift algorithm for 3D center point and keypoints voting. 
+    - **ffb6d/utils/meanshift_pytorch.py**: pytorch version of meanshift algorithm for 3D center point and keypoints voting.
     - **ffb6d/utils/pvn3d_eval_utils_kpls.py**: Object pose esitimation from predicted center/keypoints offset and evaluation metrics.
     - **ffb6d/utils/ip_basic**: Image Processing for Basic Depth Completion from [ip_basic](https://github.com/kujason/ip_basic).
     - **ffb6d/utils/dataset_tools**
@@ -118,241 +186,163 @@ See our demo video on [YouTube](https://www.youtube.com/watch?v=SSi2TnyD6Is) or 
   - **ffb6d/train_lm.sh**: Bash scripts to start the training on the LineMOD dataset.
   - **ffb6d/test_lm.sh**: Bash scripts to start the testing on the LineMOD dataset.
   - **ffb6d/demo_lm.sh**: Bash scripts to start the demo on the LineMOD dataset.
-  - **ffb6d/train_log**
-    - **ffb6d/train_log/ycb**
-      - **ffb6d/train_log/ycb/checkpoints/**: Storing trained checkpoints on the YCB_Video dataset.
-      - **ffb6d/train_log/ycb/eval_results/**: Storing evaluated results on the YCB_Video_dataset.
-      - **ffb6d/train_log/ycb/train_info/**: Training log on the YCB_Video_dataset.
-- **requirement.txt**: python3 environment requirements for pip3 install.
-- **figs/**: Images shown in README.
-
-</details>
 
 ## Datasets
-- **LineMOD:** Download the preprocessed LineMOD dataset from [onedrive link](https://hkustconnect-my.sharepoint.com/:u:/g/personal/yhebk_connect_ust_hk/ETW6iYHDbo1OsIbNJbyNBkABF7uJsuerB6c0pAiiIv6AHw?e=eXM1UE) or [google drive link](https://drive.google.com/drive/folders/19ivHpaKm9dOrr12fzC8IDFczWRPFxho7) (refer from [DenseFusion](https://github.com/j96w/DenseFusion)). Unzip it and link the unzipped ``Linemod_preprocessed/`` to ``ffb6d/datasets/linemod/Linemod_preprocessed``:
-  ```shell
-  ln -s path_to_unzipped_Linemod_preprocessed ffb6d/dataset/linemod/
-  ```
-  Generate rendered and fused data following [raster_triangle](https://github.com/ethnhe/raster_triangle).
+We follow the datasets used in PVN3D and PoseCNN, namely **LINEMOD** and **YCB-Video** datasets.
 
-- **YCB-Video:** Download the YCB-Video Dataset from [PoseCNN](https://rse-lab.cs.washington.edu/projects/posecnn/). Unzip it and link the unzipped```YCB_Video_Dataset``` to ```ffb6d/datasets/ycb/YCB_Video_Dataset```:
+### LineMOD
+After downloading the LineMOD dataset and the corresponding object models provided by the BOP challenge, please organize the files in the following file structure:
+```
+├─datasets
+│  ├─linemod
+│  │  ├─benchvise
+│  │  │  ├─data
+│  │  │  ├─mask
+│  │  │  ├─mask_visib
+│  │  │  ├─scene_gt.json
+│  │  │  ├─scene_gt_info.json
+│  │  │  ├─scene_camera.json
+│  │  ├─...
+│  │  ├─ape
+│  │  │  ├─data
+│  │  │  ├─mask
+│  │  │  ├─mask_visib
+│  │  │  ├─scene_gt.json
+│  │  │  ├─scene_gt_info.json
+│  │  │  ├─scene_camera.json
+│  ├─models
+│  │  ├─obj_000001.ply
+│  │  ├─...
+│  │  ├─obj_000015.ply
+```
+Then download our processed files from the [Link](https://drive.google.com/file/d/14N455lIZxZkHqOR2xH3iRf7wrphu4rqy/view?usp=sharing) and put them under the directory `datasets/linemod/`.
+```
+datasets/linemod
+│   keypoints
+│   list.txt
+│   models_info.json
+```
 
-  ```shell
-  ln -s path_to_unzipped_YCB_Video_Dataset ffb6d/datasets/ycb/
-  ```
+### YCB-Video
+Download the YCB-Video dataset including all the provided files (color images, depth maps, camera poses, segmentation masks, 3D models) from the official [project page](https://rse-lab.cs.washington.edu/projects/posecnn/). After downloading, extract the files under the directory `datasets/ycb/`.
+Download the processed files from the [Link](https://drive.google.com/file/d/1yhzRGgIhjgRMqMRAwWomJDoMa20o2aPC/view?usp=sharing) and put them under the directory `datasets/ycb/`.
+```
+datasets/ycb
+│   classes.txt
+│   radius.txt
+│   test_data_list.txt
+│   train_data_list.txt
+│   val_data_list.txt
+│   ycb_meshes_google
+│   ycb_kps
+│   ycb_video_data
+```
 
 ## Training and evaluating
+Download our checkpoints (trained using PyTorch 1.1 and CUDA9.2) and put them in `output/` directory
+
+LineMOD checkpoints: [Link](https://drive.google.com/drive/folders/13m-cCpq63NBVsoTUoQPmMXEcL40QePQa)
+
+YCB-Video checkpoints: [Link](https://drive.google.com/drive/folders/1pG_tDjK8FqpMTT7o4nxwBFtAjkqZOGOO)
 
 ### Training on the LineMOD Dataset
-- Train the model for the target object. Take object ape for example:
-  ```shell
-  cd ffb6d
-  # commands in train_lm.sh
-  n_gpu=8
-  cls='ape'
-  torchrun --nproc_per_node=$n_gpu train_lm.py --gpus=$n_gpu --cls=$cls
-  ```
-  The trained checkpoints are stored in ``train_log/linemod/checkpoints/{cls}/``, ``train_log/linemod/checkpoints/ape/`` in this example.
-  
-  **A tip for saving GPU memory**: PyTorch 2.X provides native mixed precision (``torch.cuda.amp``). If you use fewer than 8 GPUs and the batch size is less than "3x8=24", consider enabling mixed precision in your training runs and increase the ```mini_batch_size``` in ```common.py``` as large as possible.
-
+```
+python3 -m torch.distributed.launch --nproc_per_node=2 --use_env train_lm.py
+```
 
 ### Evaluating on the LineMOD Dataset
-- Start evaluation by:
-  ```shell
-  # commands in test_lm.sh
-  cls='ape'
-  tst_mdl="./linemod_pretrained/FFB6D_${cls}_best.pth.tar"
-  torchrun --nproc_per_node=1 train_lm.py --gpu '0' --cls $cls -eval_net -checkpoint $tst_mdl -test -test_pose # -debug
-  ```
-  You can evaluate different checkpoint by revising ``tst_mdl`` to the path of your target model.
-- **Pretrained model**: We provide our pre-trained models for each object on onedrive, [link](https://hkustconnect-my.sharepoint.com/:f:/g/personal/yhebk_connect_ust_hk/Ehg--MMyNdtLnAEurN0tm_MBQ8u_Lntrl42-BQeXO_8H8Q?e=HsZ2Yi). (The provided pretrained model here get better performance than we reported in our paper, mean ADD-0.1d 99.8). Download them and move them to their according folders. For example, move the ``FFB6D_ape_best.pth.tar`` to ``train_log/linemod/checkpoints/ape/``. Then revise ``tst_mdl=train_log/linemod/checkpoints/ape/FFB6D_ape_best.path.tar`` for testing.
+```
+python3 -m torch.distributed.launch --nproc_per_node=2 --use_env test_lm.py
+```
 
 ### Demo/visualizaion on the LineMOD Dataset
-- After training your models or downloading the pre-trained models, you can start the demo by:
-  ```shell
-  # commands in demo_lm.sh
-  cls='ape'
-  tst_mdl=train_log/linemod/checkpoints/${cls}/FFB6D_${cls}_best.pth.tar
-  python3 -m demo -dataset linemod -checkpoint $tst_mdl -cls $cls -show
-  ```
-  The visualization results will be stored in ``train_log/linemod/eval_results/{cls}/pose_vis``
+```
+python3 demo_lm.py
+```
 
 ### Training on the YCB-Video Dataset
-- Start training on the YCB-Video Dataset by:
-  ```shell
-  # commands in train_ycb.sh
-  n_gpu=8  # number of gpu to use
-  torchrun --nproc_per_node=$n_gpu train_ycb.py --gpus=$n_gpu
-  ```
-  The trained model checkpoints are stored in ``train_log/ycb/checkpoints/``
-  
-  **A tip for saving GPU memory**: PyTorch 2.X provides native mixed precision (``torch.cuda.amp``). If you use fewer than 8 GPUs and the batch size is less than "3x8=24", consider enabling mixed precision in your training runs and increase the ```mini_batch_size``` in ```common.py``` as large as possible.
+```
+python3 -m torch.distributed.launch --nproc_per_node=2 --use_env train_ycb.py
+```
 
 ### Evaluating on the YCB-Video Dataset
-- Start evaluating by:
-  ```shell
-  # commands in test_ycb.sh
-  tst_mdl=train_log/ycb/checkpoints/FFB6D_best.pth.tar  # checkpoint to test.
-  torchrun --nproc_per_node=1 train_ycb.py --gpu '0' -eval_net -checkpoint $tst_mdl -test -test_pose # -debug
-  ```
-  You can evaluate different checkpoints by revising the ``tst_mdl`` to the path of your target model.
-- **Pretrained model**: We provide our pre-trained models on onedrive, [here](https://hkustconnect-my.sharepoint.com/:u:/g/personal/yhebk_connect_ust_hk/EW7a5w-ytftLgexIyXuIcjwB4o0dWo1hMteMNlA1zgM7Wg?e=UE1WJs). Download the pre-trained model, move it to ``train_log/ycb/checkpoints/`` and modify ``tst_mdl`` for testing.
-
-### Octahedron pose visualization demo
-Use ``ffb6d/demo_octahedron.py`` to render predicted poses as octahedron-shaped pose boxes instead of dense point clouds. This script mirrors the existing demo options and also writes each camera-to-object homogeneous transformation matrix to ``*_pose.txt`` alongside the rendered frame.
-
-- **LineMOD example** (display results interactively):
-  ```shell
-  cd ffb6d
-  cls='ape'
-  chkpt=train_log/linemod/checkpoints/${cls}/FFB6D_${cls}_best.pth.tar
-  python3 demo_octahedron.py -dataset linemod -cls $cls -checkpoint $chkpt -show
-  ```
-- **YCB-Video example** (save only):
-  ```shell
-  cd ffb6d
-  chkpt=train_log/ycb/checkpoints/FFB6D_best.pth.tar
-  python3 demo_octahedron.py -dataset ycb -checkpoint $chkpt
-  ```
-
-Key flags:
-- ``-scale`` scales the canonical octahedron radius (default ``1.1``) if you want larger or smaller pose boxes.
-- ``-input_dir`` or ``-input_image`` let you visualize a custom directory of ``.pkl`` frames or image stems instead of the default test split.
-- Results (images and pose logs) are written under ``train_log/<dataset>/eval_results/<object-or-ycb>/pose_vis_octahedron``.
+```
+python3 -m torch.distributed.launch --nproc_per_node=2 --use_env test_ycb.py
+```
 
 ### Demo/visualization on the YCB-Video Dataset
-- After training your model or downloading the pre-trained model, you can start the demo by:
-  ```shell
-  # commands in demo_ycb.sh
-  tst_mdl=train_log/ycb/checkpoints/FFB6D_best.pth.tar
-  python3 -m demo -checkpoint $tst_mdl -dataset ycb
-  ```
-  The visualization results will be stored in ```train_log/ycb/eval_results/pose_vis```.
+```
+python3 demo_ycb.py
+```
+
+### Octahedron pose visualization demo
+```
+python3 demo.py
+```
 
 ## Results
-- Evaluation result without any post refinement on the YCB-Video dataset:
-  <table class="tg">
-  <thead>
-    <tr>
-      <th class="tg-0pky"></th>
-      <th class="tg-c3ow" colspan="2" style="text-align: center">PoseCNN</th>
-      <th class="tg-c3ow" colspan="2" style="text-align: center">PointFusion</th>
-      <th class="tg-c3ow" colspan="2" style="text-align: center">DenseFusion</th>
-      <th class="tg-c3ow" colspan="2" style="text-align: center">PVN3D</th>
-      <th class="tg-c3ow" colspan="2" style="text-align: center">Our FFF6D</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td class="tg-0pky"></td>
-      <td class="tg-0pky">ADDS</td>
-      <td class="tg-0pky">ADD(S)</td>
-      <td class="tg-0pky">ADDS</td>
-      <td class="tg-0pky">ADD(S)</td>
-      <td class="tg-0pky">ADDS</td>
-      <td class="tg-0pky">ADD(S)</td>
-      <td class="tg-0pky">ADDS</td>
-      <td class="tg-0pky">ADD(S)</td>
-      <td class="tg-0pky">ADDS</td>
-      <td class="tg-0pky">ADD(S)</td>
-    </tr>
-    <tr>
-      <td class="tg-0pky">ALL</td>
-      <td class="tg-0pky">75.8</td>
-      <td class="tg-0pky">59.9</td>
-      <td class="tg-0pky">83.9</td>
-      <td class="tg-0pky">-</td>
-      <td class="tg-0pky">91.2</td>
-      <td class="tg-0pky">82.9</td>
-      <td class="tg-0pky">95.5</td>
-      <td class="tg-0pky">91.8</td>
-      <td class="tg-fymr" style="font-weight:bold">96.6</td>
-      <td class="tg-fymr" style="font-weight:bold">92.7</td>
-    </tr>
-  </tbody>
-  </table>
+<details>
+  <summary>[Click to expand]</summary>
 
-- Evaluation result on the LineMOD dataset:
-  <table class="tg">
-  <thead>
-    <tr>
-      <th class="tg-7zrl"></th>
-      <th class="tg-8d8j" colspan="3" style="text-align: center">RGB</th>
-      <th class="tg-8d8j" colspan="5" style="text-align: center">RGB-D</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td class="tg-7zrl"></td>
-      <td class="tg-7zrl">PVNet</td>
-      <td class="tg-7zrl">CDPN</td>
-      <td class="tg-7zrl">DPOD</td>
-      <td class="tg-7zrl">PointFusion</td>
-      <td class="tg-7zrl">DenseFusion(iterative)</td>
-      <td class="tg-7zrl">G2L-Net</td>
-      <td class="tg-2b7s">PVN3D</td>
-      <td class="tg-7zrl">FFF6D</td>
-    </tr>
-    <tr>
-      <td class="tg-7zrl">MEAN</td>
-      <td class="tg-7zrl">86.3 </td>
-      <td class="tg-7zrl">89.9 </td>
-      <td class="tg-7zrl">95.2 </td>
-      <td class="tg-7zrl">73.7 </td>
-      <td class="tg-7zrl">94.3 </td>
-      <td class="tg-7zrl">98.7 </td>
-      <td class="tg-7zrl">99.4 </td>
-      <td class="tg-j6zm" style="font-weight:bold">99.7</td>
-    </tr>
-  </tbody>
-  </table>
+### Results on LineMOD dataset. Success Rate of ADD(-S) AUC
 
-- Robustness upon occlusion:
-<div align=center><img width="50%" src="figs/occlusion.png"/></div>
+|   Methods  |Average |Ape | Benchvise | Camera | Can | Cat | Driller | Duck | Eggbox | Glue | Holepuncher |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+|PVN3D | 86.27 | 97.28 | 99.78 | 86.87 | 95.66 | 99.78 | 99.80 | 95.67 | 99.78 | 99.79 | 92.35|
+|FFB6D(ours) | **95.70** | **99.79** | **100.0** | **93.85** | **98.42** | **99.87** | **100.** | **99.78** | **100.** | **99.83** | **97.43**|
 
-- Model parameters and speed on the LineMOD dataset (one object / frame) with one 2080Ti GPU:
-  <table class="tg">
-  <thead>
-    <tr>
-      <th class="tg-7zrl"></th>
-      <th class="tg-7zrl">Parameters</th>
-      <th class="tg-7zrl">Network Forward</th>
-      <th class="tg-7zrl">Pose Estimation</th>
-      <th class="tg-7zrl">All time</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td class="tg-7zrl">PVN3D</td>
-      <td class="tg-7zrl">39.2M</td>
-      <td class="tg-7zrl">170ms</td>
-      <td class="tg-7zrl">20ms</td>
-      <td class="tg-7zrl">190ms</td>
-    </tr>
-    <tr>
-      <td class="tg-7zrl">FFF6D<br></td>
-      <td class="tg-7zrl">33.8M </td>
-      <td class="tg-7zrl">57ms</td>
-      <td class="tg-7zrl">18ms</td>
-      <td class="tg-7zrl">75ms</td>
-    </tr>
-  </tbody>
-  </table>
+### Results on LineMOD dataset. (3D 50mm)<br>
+
+| Methods |Average |Ape | Benchvise | Camera | Can | Cat | Driller | Duck | Eggbox | Glue | Holepuncher |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+|PVN3D | 98.61 | 98.51 | 99.90 | 99.67 | 99.40 | 99.33 | 99.99 | 98.20 | 99.46 | 97.57 | 93.59|
+|FFB6D(ours)| **99.72** | **99.38** | **100.00** | **99.84** | **99.82** | **99.82** | **100.00** | **99.39** | **99.71** | **99.52** | **98.65**|
+
+### Results on YCB-Video dataset. ADD(-S)
+
+|Methods |PoseCNN | Densefusion(w/o) | Densefusion(w/) | Densefusion(w/,re-trained) | DPOD | PVN3D |MaskedFusion | FFB6D(ours)|
+|---|---|---|---|---|---|---|---|---|
+|ADD(-S) | 75.7 | 79.0 | 92.5 | 86.2 | 95.2 | 95.5 | 96.8 | **96.6**|
+
+### ADD(-S) AUC breakdown by object on the YCB-Video dataset
+|Class |PoseCNN | DenseFusion(w/o ICP) | DenseFusion(with ICP) | PVN3D |MaskedFusion | FFB6D(ours) |
+|---|---|---|---|---|---|---|
+|002_master_chef_can | 95.8 | 96.4 | 95.2 | 97.8 | 97.4 | **97.6**|
+|003_cracker_box | 92.7 | 92.5 | 95.5 | 99.7 | **99.7** | 99.6|
+|004_sugar_box | 98.2 | 97.5 | 98.2 | **99.6** | 99.3 | 99.2|
+|005_tomato_soup_can | 94.6 | 94.4 | 95.3 | **98.3** | 97.6 | 98.1|
+|006_mustard_bottle | 97.0 | 96.4 | 97.0 | **99.7** | 99.2 | 99.6|
+|007_tuna_fish_can | 93.8 | 94.3 | 95.1 | **99.5** | 99.3 | 99.4|
+|008_pudding_box | 94.3 | 94.4 | 97.1 | **99.6** | 99.3 | 99.2|
+|009_gelatin_box | 97.1 | 96.6 | 98.2 | **99.8** | **99.8** | 99.6|
+|010_potted_meat_can | 85.5 | 89.3 | 91.3 | **97.7** | **97.7** | 97.3|
+|011_banana | 84.7 | 84.7 | 91.2 | 95.8 | 96.8 | **96.9**|
+|019_pitcher_base | 89.3 | 90.8 | 91.4 | **97.8** | 97.5 | 97.6|
+|021_bleach_cleanser | 90.9 | 90.5 | 91.8 | **97.9** | 96.9 | 97.7|
+|024_bowl | 78.0 | 84.7 | **88.2** | 84.6 | 90.1 | 87.5|
+|025_mug | 81.8 | 80.4 | 81.7 | 95.8 | 96.3 | **96.6**|
+|035_power_drill | 71.5 | 71.1 | 85.2 | **95.2** | 93.4 | 93.6|
+|036_wood_block | 50.2 | 59.2 | **71.0** | 68.2 | 70.9 | 60.8|
+|037_scissors | 75.4 | 75.1 | 81.0 | 88.6 | **90.1** | 86.5|
+|040_large_marker | 76.9 | 72.5 | 74.4 | 89.6 | 88.3 | **90.9**|
+|051_large_clamp | 58.7 | 63.5 | 75.2 | 81.8 | 80.1 | **83.8**|
+|052_extra_large_clamp | 73.3 | 74.4 | 83.0 | 86.3 | **87.8** | 87.4|
+|061_foam_brick | 51.8 | 51.6 | 76.3 | 80.5 | 82.0 | **88.6**|
+|Average | 75.7 | 79.0 | 86.2 | 95.5 | 96.8 | **96.6**|
+
+### Comparison with self-implemented DenseFusion version on YCB-Video dataset. ADD(-S) AUC
+|Class | Our Implementation | Official Implementation |
+|---|---|---|
+|soup can | 90.80 | 92.53|
+|mustard | 90.24 | 89.80|
+|drill | 86.58 | 79.41|
+|horse | 46.06 | 37.56|
+|helmet | 82.45 | 70.52|
+|puncher | 77.40 | 63.33|
+|Average | **78.26** | 71.36|
 
 ## Adaptation to New Dataset
-- Install and generate required mesh info following [DSTOOL_README](./ffb6d/utils/dataset_tools/DSTOOL_README.md).
-- Modify info of your new dataset in ```FFB6D/ffb6d/common.py``` 
-- Write your dataset preprocess script following ```FFB6D/ffb6d/datasets/ycb/ycb_dataset.py```. Note that you should modify or call the function that get your model info, such as 3D keypoints, center points, and radius properly.
-- (**Very Important!**) Visualize and check if you process the data properly, eg, the projected keypoints and center point, the semantic label of each point, etc. For example, you can visualize the projected center point (red point) and selected keypoints (orange points) as follow by running ```python3 -m datasets.ycb.ycb_dataset```.
-  <div align=center><img width="60%" src="figs/shown_kp_ycb.png"/></div>
-
-- For inference, make sure that you load the 3D keypoints, center point, and radius of your objects in the object coordinate system properly in ```FFB6D/ffb6d/utils/pvn3d_eval_utils.py```.
-- Check that all setting are modified properly by using the ground truth information for evaluation. The result should be high and close to 100 if everything is correct. For example, testing ground truth on the YCB_Video dataset by passing ```-test_gt``` parameters to ```train_ycb.py``` will get results higher than 99.99:
-  ```
-  tst_mdl=train_log/ycb/checkpoints/FFB6D_best.pth.tar
-  python3 -m torch.distributed.launch --nproc_per_node=1 train_ycb.py --gpu '0' -eval_net -checkpoint $tst_mdl -test -test_pose -test_gt
-  ```
+If you are interested in adapting FFB6D to new dataset, you can read [Adaptation to New Dataset](https://github.com/ethnhe/FFB6D/blob/master/docs/DSTOOL_README.md).
 
 ## License
-Licensed under the [MIT License](./LICENSE).
+This project is released under the [S-Lab License 1.0](./LICENSE).

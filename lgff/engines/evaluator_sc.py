@@ -157,7 +157,7 @@ class EvaluatorSC:
         使用公共工具函数 fuse_pose_from_outputs 得到 [B,3,4] 的 [R|t]。
         配置项 eval_use_best_point / TopK 加权融合逻辑都在该函数内部处理。
         """
-        return fuse_pose_from_outputs(outputs, self.geometry, self.cfg)
+        return fuse_pose_from_outputs(outputs, self.geometry, self.cfg, stage="eval")
 
     # ------------------------------------------------------------------ #
     # GT 预处理
@@ -235,19 +235,18 @@ class EvaluatorSC:
         succ_cmd_np = batch_metrics["cmd_acc"].numpy()  # 0 / 1
 
         # 再计算一次「用于 CMD 的距离」dist_for_cmd（与 compute_batch_pose_metrics 一致）
-        cls_id_scalar: Optional[int] = None
+        sym_ids = torch.as_tensor(getattr(self.cfg, "sym_class_ids", []), device=pred_rt.device)
+        sym_mask_np = np.zeros(B, dtype=bool)
         if isinstance(cls_ids, torch.Tensor):
             cid = cls_ids
             if cid.dim() > 1:
                 cid = cid.view(-1)
-            if cid.numel() > 0:
-                cls_id_scalar = int(cid[0].item())
+            cid = cid.to(pred_rt.device)
+            if sym_ids.numel() > 0:
+                sym_mask = (cid.unsqueeze(1) == sym_ids.view(1, -1)).any(dim=1)
+                sym_mask_np = sym_mask.detach().cpu().numpy().astype(bool)
 
-        is_symmetric = (
-            cls_id_scalar in getattr(self.cfg, "sym_class_ids", [])
-        ) if cls_id_scalar is not None else False
-
-        dist_for_cmd_np = adds_np if is_symmetric else add_np  # [B]
+        dist_for_cmd_np = np.where(sym_mask_np, adds_np, add_np)  # [B]
 
         # GT / Pred t 也一起记录下来（方便分析偏差）
         gt_r = gt_rt[:, :3, :3]
@@ -279,7 +278,7 @@ class EvaluatorSC:
                 "scene_id": int(scene_ids[i]) if scene_ids is not None else -1,
                 "im_id": int(im_ids[i]) if im_ids is not None else -1,
                 "cls_id": int(cls_id_scalar) if cls_id_scalar is not None else -1,
-                "is_symmetric": bool(is_symmetric),
+                "is_symmetric": bool(sym_mask_np[i]),
                 "add": float(add_np[i]),
                 "add_s": float(adds_np[i]),
                 "t_err": float(t_err_np[i]),

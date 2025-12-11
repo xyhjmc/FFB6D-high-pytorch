@@ -107,8 +107,11 @@ def main():
     logger.info("==========================================")
 
     # 5. 随机数种子
-    set_random_seed(args.seed, deterministic=False)
-    logger.info(f"Random Seed   : {args.seed}")
+    seed_value = args.seed if args.seed is not None else getattr(cfg, "seed", 42)
+    set_random_seed(seed_value, deterministic=getattr(cfg, "deterministic", False))
+    logger.info(
+        f"Random Seed   : {seed_value} | deterministic={getattr(cfg, 'deterministic', False)}"
+    )
 
     # 6. 几何工具
     geometry = GeometryToolkit()

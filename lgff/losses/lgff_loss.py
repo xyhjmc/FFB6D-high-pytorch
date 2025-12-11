@@ -19,6 +19,7 @@ import torch.nn.functional as F
 
 from lgff.utils.config import LGFFConfig
 from lgff.utils.geometry import GeometryToolkit
+from lgff.utils.pose_metrics import fuse_pose_from_outputs
 
 
 class LGFFLoss(nn.Module):
@@ -62,6 +63,13 @@ class LGFFLoss(nn.Module):
         kp_targ_ofst: [B, N, K, 3] 或 [B, K, N, 3]
         labels:       [B, N] 或 [B, N, 1]，>0 表示该点属于物体
         """
+        assert pred_kp_ofs.dim() == 4 and pred_kp_ofs.size(-1) == 3, (
+            "pred_kp_ofs shape must be [B, K, N, 3]"
+        )
+        assert kp_targ_ofst.dim() == 4 and kp_targ_ofst.size(-1) == 3, (
+            "kp_targ_ofst must be [B, N, K, 3] or [B, K, N, 3]"
+        )
+
         B, K, N, C = pred_kp_ofs.shape
 
         # 处理 labels -> [B, N]
@@ -117,6 +125,26 @@ class LGFFLoss(nn.Module):
         points_cam = batch["points"]    # [B, N, 3]
         B, N, _ = points_cam.shape
 
+        # 逐样本对称性标记（用于 ROI / CAD 两级 ADD/ADD-S）
+        sym_ids = torch.as_tensor(
+            getattr(self.cfg, "sym_class_ids", []), device=points_cam.device
+        )
+        sym_mask = torch.zeros(B, dtype=torch.bool, device=points_cam.device)
+        cls_id_tensor = batch.get("cls_id", None)
+        if cls_id_tensor is not None:
+            cls_flat = cls_id_tensor.view(-1).to(points_cam.device)
+            if sym_ids.numel() > 0:
+                sym_mask = (cls_flat.unsqueeze(1) == sym_ids.view(1, -1)).any(dim=1)
+
+        # 姿态融合：与 Evaluator / viz 完全一致，默认用 train_use_best_point
+        fused_rt = fuse_pose_from_outputs(
+            outputs,
+            geometry=self.geometry,
+            cfg=self.cfg,
+            stage="train",
+        )
+        fused_t = fused_rt[:, :3, 3]
+
         # ======================================================
         # Part 1: Translation Loss (Weighted L1, detach conf)
         # ======================================================
@@ -126,8 +154,12 @@ class LGFFLoss(nn.Module):
         # 防止 conf 通过平移 loss 学坏：只用它做加权，不回传梯度
         conf_norm = (conf_stable / conf_sum).detach()    # [B, N]
 
-        # conf 加权平均得到最终平移
-        t_pred_final = (pred_t * conf_norm.unsqueeze(-1)).sum(dim=1)  # [B, 3]
+        # 默认直接使用融合后的平移（保持与评估一致）；如需旧行为可配置
+        use_fused_t = getattr(self.cfg, "loss_use_fused_pose", True)
+        if use_fused_t:
+            t_pred_final = fused_t  # [B, 3]
+        else:
+            t_pred_final = (pred_t * conf_norm.unsqueeze(-1)).sum(dim=1)
 
         diff_t = t_pred_final - gt_t                     # [B, 3]
         abs_diff_t = torch.abs(diff_t)
@@ -136,6 +168,7 @@ class LGFFLoss(nn.Module):
             device=diff_t.device, dtype=diff_t.dtype
         )
         loss_t = (abs_diff_t * axis_weight).mean()
+        loss_t = torch.nan_to_num(loss_t, nan=0.0, posinf=1e4, neginf=1e4)
 
         # ======================================================
         # Part 2: DenseFusion-style ROI 几何项 (ADD/ADD-S on ROI)
@@ -158,20 +191,15 @@ class LGFFLoss(nn.Module):
         points_pred = p_rotated + pred_t                 # [B, N, 3]
         points_target = points_cam                       # [B, N, 3]
 
-        # 对称类判断
-        cls_id_tensor = batch.get("cls_id", None)
-        if cls_id_tensor is None:
-            cls_id = 0
-        else:
-            cls_id = int(cls_id_tensor[0].item()) if torch.is_tensor(cls_id_tensor) else int(cls_id_tensor[0])
-        is_symmetric = cls_id in self.sym_class_ids
-
-        # ROI 内点的误差
-        if is_symmetric:
-            dist_matrix = torch.cdist(points_pred, points_target, p=2)  # [B, N, N]
-            loss_dist, _ = torch.min(dist_matrix, dim=2)                # [B, N]
-        else:
-            loss_dist = torch.norm(points_pred - points_target, dim=2, p=2)  # [B, N]
+        # ROI 内点的误差（逐样本处理是否对称）
+        loss_dist = torch.norm(points_pred - points_target, dim=2, p=2)  # [B, N]
+        if sym_mask.any():
+            sym_indices = torch.where(sym_mask)[0]
+            for idx in sym_indices:
+                dist_matrix = torch.cdist(
+                    points_pred[idx : idx + 1], points_target[idx : idx + 1], p=2
+                )
+                loss_dist[idx] = torch.min(dist_matrix, dim=2).values.squeeze(0)
 
         # ======================================================
         # Part 3: Dense Loss + Confidence Regularization
@@ -182,6 +210,7 @@ class LGFFLoss(nn.Module):
         loss_dense = (
             loss_dist * conf_clamped - self.w_rate * torch.log(conf_clamped)
         ).mean()
+        loss_dense = torch.nan_to_num(loss_dense, nan=0.0, posinf=1e4, neginf=1e4)
 
         # 3.2 显式 conf 回归：误差小 -> conf 接近 1，误差大 -> conf 接近 0
         with torch.no_grad():
@@ -191,34 +220,38 @@ class LGFFLoss(nn.Module):
             target_conf = torch.exp(-self.conf_alpha * d_clipped)  # [B, N]
 
         loss_conf_reg = F.mse_loss(conf, target_conf)
+        loss_conf_reg = torch.nan_to_num(loss_conf_reg, nan=0.0, posinf=1e4, neginf=1e4)
 
         # ======================================================
         # Part 4: 可选 CAD 级 ADD Loss（与 Evaluator 对齐）
         # ======================================================
         loss_add_cad = points_cam.new_tensor(0.0)
         if self.lambda_add_cad > 0.0 and ("model_points" in batch):
-            # 1) 取每个 batch 中最高 conf 的点作为全局 pose 代表
-            idx_max = conf.argmax(dim=1)  # [B]
-            idx_exp = idx_max.view(B, 1, 1)
+            # 1) 默认使用融合姿态（与评估一致）；如需旧版 best-point 可在 cfg 中关闭
+            use_fused_pose = getattr(self.cfg, "loss_use_fused_pose", True)
+            if use_fused_pose:
+                pred_rt_cad = fused_rt  # [B, 3, 4]
+            else:
+                idx_max = conf.argmax(dim=1)  # [B]
+                idx_exp = idx_max.view(B, 1, 1)
+                best_q = torch.gather(pred_q, 1, idx_exp.expand(-1, 1, 4)).squeeze(1)  # [B, 4]
+                best_t = torch.gather(pred_t, 1, idx_exp.expand(-1, 1, 3)).squeeze(1)  # [B, 3]
+                best_q = F.normalize(best_q, dim=-1)
+                best_r = self.geometry.quat_to_rot(best_q)  # [B, 3, 3]
+                pred_rt_cad = torch.cat([best_r, best_t.unsqueeze(-1)], dim=2)
 
-            best_q = torch.gather(pred_q, 1, idx_exp.expand(-1, 1, 4)).squeeze(1)  # [B, 4]
-            best_t = torch.gather(pred_t, 1, idx_exp.expand(-1, 1, 3)).squeeze(1)  # [B, 3]
-
-            best_q = F.normalize(best_q, dim=-1)
-            best_r = self.geometry.quat_to_rot(best_q)  # [B, 3, 3]
-
-            pred_rt_cad = torch.cat([best_r, best_t.unsqueeze(-1)], dim=2)  # [B, 3, 4]
             gt_rt_cad = gt_pose                                            # [B, 3, 4]
 
             model_points = batch["model_points"]  # [M, 3] 或 [B, M, 3]
             if model_points.dim() == 2:
                 model_points = model_points.unsqueeze(0).expand(B, -1, -1)
 
-            if is_symmetric:
-                add_cad = self.geometry.compute_adds(pred_rt_cad, gt_rt_cad, model_points)
-            else:
-                add_cad = self.geometry.compute_add(pred_rt_cad, gt_rt_cad, model_points)
-            loss_add_cad = add_cad.mean()
+            add_cad = self.geometry.compute_add(pred_rt_cad, gt_rt_cad, model_points)
+            adds_cad = self.geometry.compute_adds(pred_rt_cad, gt_rt_cad, model_points)
+
+            loss_add_cad_batch = torch.where(sym_mask, adds_cad, add_cad)
+            loss_add_cad = loss_add_cad_batch.mean()
+            loss_add_cad = torch.nan_to_num(loss_add_cad, nan=0.0, posinf=1e4, neginf=1e4)
 
         # ======================================================
         # Part 5: [NEW] Keypoint Offset Loss（FFB6D-style）
@@ -235,6 +268,7 @@ class LGFFLoss(nn.Module):
                 kp_targ_ofst=batch["kp_targ_ofst"],   # [B, N, K, 3] or [B, K, N, 3]
                 labels=batch["labels"],               # [B, N] 或 [B, N, 1]
             )
+            loss_kp_of = torch.nan_to_num(loss_kp_of, nan=0.0, posinf=1e4, neginf=1e4)
 
         # ======================================================
         # Final Loss
@@ -246,6 +280,7 @@ class LGFFLoss(nn.Module):
             + self.lambda_add_cad * loss_add_cad
             + self.lambda_kp_of * loss_kp_of
         )
+        total_loss = torch.nan_to_num(total_loss, nan=0.0, posinf=1e4, neginf=1e4)
 
         # ======================================================
         # Metrics（用于日志记录/对比曲线）

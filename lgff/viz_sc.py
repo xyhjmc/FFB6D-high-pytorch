@@ -33,13 +33,13 @@ from torch.utils.data import DataLoader
 sys.path.append(os.getcwd())
 
 from common.ffb6d_utils.model_complexity import ModelComplexityLogger
-from lgff.utils.config import LGFFConfig, load_config
+from lgff.utils.config import LGFFConfig, load_config, merge_cfg_from_checkpoint
 from lgff.utils.geometry import GeometryToolkit
 from lgff.utils.logger import setup_logger, get_logger
 from lgff.datasets.single_loader import SingleObjectDataset
 from lgff.models.lgff_sc import LGFF_SC
 from lgff.engines.evaluator_sc import EvaluatorSC
-from lgff.eval_sc import load_model_weights
+from lgff.eval_sc import load_model_weights, resolve_checkpoint_path
 
 
 # ----------------------------------------------------------------------
@@ -175,6 +175,7 @@ def project_primitives(
     K: np.ndarray,
     bs_utils,
 ) -> Tuple[np.ndarray, np.ndarray]:
+    # cam_scale 固定为 1.0：所有点、位姿均在相机坐标系且单位为米
     verts_cam = np.dot(verts_model, rotation.T) + translation
     axes_cam = np.dot(axes_model, rotation.T) + translation
     verts_2d = bs_utils.project_p3d(verts_cam, 1.0, K)
@@ -304,21 +305,17 @@ def main() -> None:
     args = parse_args()
 
     # 1) 先用当前工程的配置系统载入基础 cfg（会打印 [Config] Final config saved ...）
-    cfg: LGFFConfig = load_config()
+    cfg_cli: LGFFConfig = load_config()
 
     # 2) 再从 checkpoint 中恢复训练时的 config（保证 backbone / 维度完全一致）
-    ckpt = torch.load(args.checkpoint, map_location="cpu")
-    if "config" in ckpt:
-        cfg_dict = ckpt["config"]
-        if not isinstance(cfg_dict, dict) and hasattr(cfg_dict, "__dict__"):
-            cfg_dict = dict(cfg_dict.__dict__)
-        if isinstance(cfg_dict, dict):
-            cfg = LGFFConfig(**cfg_dict)
-        print(
-            f"[viz_sc] Loaded config from checkpoint: "
-            f"obj_id={getattr(cfg, 'obj_id', None)}, "
-            f"dataset={getattr(cfg, 'dataset', None)}"
-        )
+    ckpt_path = resolve_checkpoint_path(args.checkpoint)
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    cfg = merge_cfg_from_checkpoint(cfg_cli, ckpt.get("config"))
+    print(
+        f"[viz_sc] Loaded config from checkpoint: "
+        f"obj_id={getattr(cfg, 'obj_id', None)}, "
+        f"dataset={getattr(cfg, 'dataset', None)}"
+    )
 
     # 3) 工作目录和保存目录
     work_dir = args.work_dir or getattr(cfg, "work_dir", None) or getattr(cfg, "log_dir", "output")
@@ -336,7 +333,8 @@ def main() -> None:
 
     logger.info(
         f"Visualizing split={split} | batch_size={args.batch_size} | "
-        f"num_workers={num_workers} | num_samples={args.num_samples}"
+        f"num_workers={num_workers} | num_samples={args.num_samples} | "
+        f"checkpoint={ckpt_path}"
     )
 
     geometry = GeometryToolkit()
@@ -359,7 +357,7 @@ def main() -> None:
 
     # 6) Model
     model = LGFF_SC(cfg, geometry)
-    load_model_weights(model, args.checkpoint, device)
+    load_model_weights(model, ckpt_path, device, checkpoint=ckpt)
     model = model.to(device)
     model.eval()
 
@@ -533,7 +531,7 @@ def main() -> None:
 
                 title = (
                     f"sample_{saved:03d} | scene={scene_id} im={im_id} cls={cls_id} "
-                    f"| ADD={add:.4f}m ADD-S={add_s:.4f}m "
+                    f"| sym={is_sym} | ADD={add:.4f}m ADD-S={add_s:.4f}m "
                     f"| t_err={t_err*1000:.1f}mm rot={rot_err:.1f}° "
                     f"| CMD_dist={dist_for_cmd*1000:.1f}mm"
                 )
