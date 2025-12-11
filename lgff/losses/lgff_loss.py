@@ -36,7 +36,7 @@ class LGFFLoss(nn.Module):
         self.lambda_t       = getattr(cfg, "lambda_t", 0.5)        # 平移权重
         self.lambda_add     = getattr(cfg, "lambda_add", 1.0)      # ROI 几何权重
         self.lambda_conf    = getattr(cfg, "lambda_conf", 0.1)     # conf 显式正则权重
-        self.lambda_add_cad = getattr(cfg, "lambda_add_cad", 0.0)  # CAD 级 ADD/ADD-S loss 权重
+        self.lambda_add_cad = getattr(cfg, "lambda_add_cad", 0.2)  # CAD 级 ADD/ADD-S loss 权重
         # [NEW] 关键点 offset 辅助 loss 权重（FFB6D 风格）
         self.lambda_kp_of   = getattr(cfg, "lambda_kp_of", 0.6)
 
