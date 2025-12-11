@@ -7,10 +7,29 @@ import torch.nn.functional as F
 import numpy as np
 
 
+def _resolve_use_best_point(cfg, stage: str) -> bool:
+    """Resolve whether to use best-point or confidence fusion for a stage."""
+    # stage-aware override, e.g., train_use_best_point / eval_use_best_point / viz_use_best_point
+    stage_flag = getattr(cfg, f"{stage}_use_best_point", None)
+    if stage_flag is not None:
+        return bool(stage_flag)
+    # backward compatibility
+    return getattr(cfg, "eval_use_best_point", True)
+
+
+def _resolve_topk(cfg, N: int) -> int:
+    """Resolve Top-K used for weighted fusion (meters, camera frame)."""
+    topk_cfg = getattr(cfg, "pose_fusion_topk", None)
+    if topk_cfg is not None and topk_cfg > 0:
+        return min(int(topk_cfg), N)
+    return min(max(32, N // 4), N)
+
+
 def fuse_pose_from_outputs(
     outputs: Dict[str, torch.Tensor],
     geometry,
     cfg,
+    stage: str = "eval",
 ) -> torch.Tensor:
     """
     从网络输出的 dense 点级结果中，得到每个样本的 [R|t] 姿态矩阵 [B,3,4]。
@@ -23,7 +42,7 @@ def fuse_pose_from_outputs(
     B, N, _ = pred_q.shape
     conf = pred_c.squeeze(-1)  # [B, N]
 
-    use_best_point = getattr(cfg, "eval_use_best_point", True)
+    use_best_point = _resolve_use_best_point(cfg, stage)
 
     if use_best_point:
         idx = torch.argmax(conf, dim=1)  # [B]
@@ -39,7 +58,7 @@ def fuse_pose_from_outputs(
         return pred_rt
 
     # -------- Top-K + 置信度加权融合 --------
-    k = min(max(32, N // 4), N)
+    k = _resolve_topk(cfg, N)
     conf_topk, idx = torch.topk(conf, k=k, dim=1)
     conf_topk = conf_topk.clamp(min=1e-4)
 
@@ -69,9 +88,9 @@ def fuse_pose_from_outputs(
 
 
 def compute_batch_pose_metrics(
-    pred_rt: torch.Tensor,         # [B,3,4]
-    gt_rt: torch.Tensor,           # [B,3,4]
-    model_points: torch.Tensor,    # [B,M,3]
+    pred_rt: torch.Tensor,  # [B,3,4]
+    gt_rt: torch.Tensor,  # [B,3,4]
+    model_points: torch.Tensor,  # [B,M,3]
     cls_ids: Optional[torch.Tensor],
     geometry,
     cfg,
@@ -97,27 +116,25 @@ def compute_batch_pose_metrics(
     # ADD
     add_dist = torch.norm(points_pred - points_gt, dim=2).mean(dim=1)  # [B]
 
-    # ADD-S: 最近邻
+    # ADD-S: 最近邻 (per-sample 以支持多物体扩展)
     adds_list: List[torch.Tensor] = []
     for b in range(points_pred.size(0)):
         dist_mat = torch.cdist(points_pred[b], points_gt[b])  # [M,M]
         adds_list.append(dist_mat.min(dim=1).values.mean())
     adds_dist = torch.stack(adds_list).to(device)  # [B]
 
-    # 是否对称
-    cls_id_scalar: Optional[int] = None
+    # 是否对称（逐样本判断，兼容未来多物体/混合 batch）
+    sym_ids = torch.as_tensor(getattr(cfg, "sym_class_ids", []), device=device)
+    sym_mask = torch.zeros(pred_rt.size(0), dtype=torch.bool, device=device)
     if cls_ids is not None:
         cls_tensor = cls_ids
         if cls_tensor.dim() > 1:
             cls_tensor = cls_tensor.view(-1)
-        if cls_tensor.numel() > 0:
-            cls_id_scalar = int(cls_tensor[0].item())
+        cls_tensor = cls_tensor.to(device)
+        if sym_ids.numel() > 0:
+            sym_mask = (cls_tensor.unsqueeze(1) == sym_ids.view(1, -1)).any(dim=1)
 
-    is_symmetric = (
-        cls_id_scalar in getattr(cfg, "sym_class_ids", [])
-    ) if cls_id_scalar is not None else False
-
-    dist_for_acc = adds_dist if is_symmetric else add_dist
+    dist_for_acc = torch.where(sym_mask, adds_dist, add_dist)
 
     # 2) translation error
     t_diff = pred_t - gt_t  # [B,3]

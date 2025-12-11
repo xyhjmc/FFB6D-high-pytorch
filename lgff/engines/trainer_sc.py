@@ -439,7 +439,9 @@ class TrainerSC:
                 # 2) 统一的姿态指标（和 EvaluatorSC / pose_metrics 一致）
                 #    - 使用 fuse_pose_from_outputs 进行姿态融合
                 #    - 使用 compute_batch_pose_metrics 计算 ADD/ADD-S/t_err/rot_err/cmd_acc
-                pred_rt = fuse_pose_from_outputs(outputs, self.geometry, self.cfg)
+                pred_rt = fuse_pose_from_outputs(
+                    outputs, self.geometry, self.cfg, stage="eval"
+                )
                 gt_rt = batch["pose"]
 
                 model_points = batch["model_points"]  # [B, M, 3]
@@ -591,6 +593,7 @@ class TrainerSC:
     def _save_checkpoint(self, epoch: int, is_best: bool = False) -> None:
         state: Dict[str, Any] = {
             "epoch": epoch,
+            "epoch_idx": epoch + 1,
             "state_dict": self.model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "scheduler": (

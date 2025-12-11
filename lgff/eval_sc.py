@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import sys
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import torch
 from torch.utils.data import DataLoader
@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 sys.path.append(os.getcwd())
 
 from common.ffb6d_utils.model_complexity import ModelComplexityLogger
-from lgff.utils.config import LGFFConfig, load_config
+from lgff.utils.config import LGFFConfig, load_config, merge_cfg_from_checkpoint
 from lgff.utils.logger import setup_logger, get_logger
 
 # 和 train_lgff_sc 一样的导入策略，保证兼容
@@ -70,26 +70,48 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def load_model_weights(model: LGFF_SC, checkpoint_path: str, device: torch.device) -> None:
+def resolve_checkpoint_path(path: str) -> str:
+    """Allow passing a directory; prefer checkpoint_best.pth then checkpoint_last.pth."""
+    if os.path.isdir(path):
+        best = os.path.join(path, "checkpoint_best.pth")
+        last = os.path.join(path, "checkpoint_last.pth")
+        if os.path.exists(best):
+            return best
+        if os.path.exists(last):
+            return last
+        raise FileNotFoundError(
+            f"No checkpoint_best.pth or checkpoint_last.pth under {path}"
+        )
+    return path
+
+
+def load_model_weights(
+    model: LGFF_SC,
+    checkpoint_path: str,
+    device: torch.device,
+    checkpoint: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Load model weights from a TrainerSC checkpoint or a bare state_dict."""
-    if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    if checkpoint is None:
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=device)
 
     logger = logging.getLogger("lgff.eval")
     logger.info(f"Loading checkpoint: {checkpoint_path}")
 
-    ckpt: Dict[str, Any] = torch.load(checkpoint_path, map_location=device)
-
-    state_dict = ckpt.get("state_dict", None)
+    state_dict = checkpoint.get("state_dict", None)
     if state_dict is None:
         # Fallback to assume checkpoint itself is a state_dict
-        state_dict = ckpt
+        state_dict = checkpoint
 
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if missing:
         logger.warning(f"Missing keys when loading checkpoint: {missing}")
     if unexpected:
         logger.warning(f"Unexpected keys when loading checkpoint: {unexpected}")
+
+    return checkpoint
 
 
 def build_dataloader(cfg: LGFFConfig, split: str, batch_size: int, num_workers: int) -> DataLoader:
@@ -109,7 +131,11 @@ def main() -> None:
     args = parse_args()
 
     # Load config via CLI (--config/--opt)
-    cfg: LGFFConfig = load_config()
+    cfg_cli: LGFFConfig = load_config()
+
+    ckpt_path = resolve_checkpoint_path(args.checkpoint)
+    ckpt_state = torch.load(ckpt_path, map_location="cpu")
+    cfg = merge_cfg_from_checkpoint(cfg_cli, ckpt_state.get("config"))
 
     work_dir = args.work_dir or cfg.work_dir or cfg.log_dir
     os.makedirs(work_dir, exist_ok=True)
@@ -118,13 +144,16 @@ def main() -> None:
     setup_logger(log_file, name="lgff.eval")
     logger = get_logger("lgff.eval")
     logger.setLevel(logging.INFO)
+    logger.info(f"Using checkpoint: {ckpt_path}")
 
     # Resolve split / dataloader params
     split = args.split or getattr(cfg, "val_split", "test")
     batch_size = args.batch_size or getattr(cfg, "batch_size", 2)
     num_workers = args.num_workers or getattr(cfg, "num_workers", 4)
 
-    logger.info(f"Evaluating split={split} | batch_size={batch_size} | num_workers={num_workers}")
+    logger.info(
+        f"Evaluating split={split} | batch_size={batch_size} | num_workers={num_workers}"
+    )
 
     geometry = GeometryToolkit()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -135,7 +164,7 @@ def main() -> None:
 
     # Model
     model = LGFF_SC(cfg, geometry)
-    load_model_weights(model, args.checkpoint, device)
+    ckpt_state = load_model_weights(model, ckpt_path, device, checkpoint=ckpt_state)
     model = model.to(device)
     model.eval()
 

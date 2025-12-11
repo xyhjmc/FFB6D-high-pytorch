@@ -53,6 +53,7 @@ class GeometryToolkit:
     def project_points(
         self, points: np.ndarray, depth_scale: float, camera_matrix: Optional[np.ndarray] = None
     ) -> np.ndarray:
+        """Project camera-frame points in **meters** with cam_scale=1.0 (no unit rescale)."""
         K = camera_matrix if camera_matrix is not None else self.camera_matrix
         return self.bs_utils.project_p3d(points, depth_scale, K)
 
