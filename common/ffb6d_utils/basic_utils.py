@@ -649,25 +649,50 @@ class Basic_Utils():
         aps = VOCap(D, acc)
         return aps * 100
 
-    def cal_add_cuda(
-        self, pred_RT, gt_RT, p3ds
-    ):
-        pred_p3ds = torch.mm(p3ds, pred_RT[:, :3].transpose(1, 0)) + pred_RT[:, 3]
-        gt_p3ds = torch.mm(p3ds, gt_RT[:, :3].transpose(1, 0)) + gt_RT[:, 3]
-        dis = torch.norm(pred_p3ds - gt_p3ds, dim=1)
-        return torch.mean(dis)
+    def cal_add_cuda(self, pred_RT, gt_RT, p3ds):
+        """Compute ADD for batched or single poses.
 
-    def cal_adds_cuda(
-        self, pred_RT, gt_RT, p3ds
-    ):
-        N, _ = p3ds.size()
-        pd = torch.mm(p3ds, pred_RT[:, :3].transpose(1, 0)) + pred_RT[:, 3]
-        pd = pd.view(1, N, 3).repeat(N, 1, 1)
-        gt = torch.mm(p3ds, gt_RT[:, :3].transpose(1, 0)) + gt_RT[:, 3]
-        gt = gt.view(N, 1, 3).repeat(1, N, 1)
-        dis = torch.norm(pd - gt, dim=2)
-        mdis = torch.min(dis, dim=1)[0]
-        return torch.mean(mdis)
+        ``torch.mm`` requires 2D inputs and previously assumed unbatched tensors,
+        which caused a runtime error when CAD-level ADD was enabled with batched
+        ``model_points``/poses. We now support both batched and unbatched usage.
+        """
+
+        # Ensure batched shapes: [B, N, 3] for points and [B, 3, 4] for poses.
+        if pred_RT.dim() == 2:
+            pred_RT = pred_RT.unsqueeze(0)
+        if gt_RT.dim() == 2:
+            gt_RT = gt_RT.unsqueeze(0)
+        if p3ds.dim() == 2:
+            p3ds = p3ds.unsqueeze(0)
+
+        rot_pred, t_pred = pred_RT[:, :3, :3], pred_RT[:, :3, 3]
+        rot_gt, t_gt = gt_RT[:, :3, :3], gt_RT[:, :3, 3]
+
+        pred_p3ds = torch.bmm(p3ds, rot_pred.transpose(1, 2)) + t_pred.unsqueeze(1)
+        gt_p3ds = torch.bmm(p3ds, rot_gt.transpose(1, 2)) + t_gt.unsqueeze(1)
+
+        dis = torch.norm(pred_p3ds - gt_p3ds, dim=2)  # [B, N]
+        return dis.mean()
+
+    def cal_adds_cuda(self, pred_RT, gt_RT, p3ds):
+        """Symmetric ADD (closest point) with batch support."""
+
+        if pred_RT.dim() == 2:
+            pred_RT = pred_RT.unsqueeze(0)
+        if gt_RT.dim() == 2:
+            gt_RT = gt_RT.unsqueeze(0)
+        if p3ds.dim() == 2:
+            p3ds = p3ds.unsqueeze(0)
+
+        rot_pred, t_pred = pred_RT[:, :3, :3], pred_RT[:, :3, 3]
+        rot_gt, t_gt = gt_RT[:, :3, :3], gt_RT[:, :3, 3]
+
+        pred = torch.bmm(p3ds, rot_pred.transpose(1, 2)) + t_pred.unsqueeze(1)
+        gt = torch.bmm(p3ds, rot_gt.transpose(1, 2)) + t_gt.unsqueeze(1)
+
+        dis = torch.cdist(pred, gt)  # [B, N, N]
+        mdis = dis.min(dim=2)[0]     # [B, N]
+        return mdis.mean()
 
     def best_fit_transform_torch(self, A, B):
         '''
