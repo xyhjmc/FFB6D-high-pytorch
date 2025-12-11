@@ -18,10 +18,11 @@ Usage examples:
 from __future__ import annotations
 
 import argparse
+import csv
 import logging
 import os
 import sys
-from typing import Tuple
+from typing import Dict, Optional, Tuple
 
 import cv2
 import matplotlib.pyplot as plt
@@ -40,6 +41,7 @@ from lgff.datasets.single_loader import SingleObjectDataset
 from lgff.models.lgff_sc import LGFF_SC
 from lgff.engines.evaluator_sc import EvaluatorSC
 from lgff.eval_sc import load_model_weights, resolve_checkpoint_path
+from lgff.utils.pose_metrics import compute_batch_pose_metrics
 
 
 # ----------------------------------------------------------------------
@@ -94,6 +96,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Whether to display figures interactively while saving",
     )
+    parser.add_argument(
+        "--per-image-csv",
+        type=str,
+        default=None,
+        help="Optional path to per_image_metrics.csv for cross-checking metrics",
+    )
     args, _ = parser.parse_known_args()
     return args
 
@@ -101,6 +109,37 @@ def parse_args() -> argparse.Namespace:
 def ensure_dirs(work_dir: str, save_dir: str) -> None:
     os.makedirs(work_dir, exist_ok=True)
     os.makedirs(save_dir, exist_ok=True)
+
+
+def load_per_image_metrics(path: str) -> Dict[Tuple[int, int], Dict[str, float]]:
+    """Load per-image metrics CSV into a dict keyed by (scene_id, im_id)."""
+    records: Dict[Tuple[int, int], Dict[str, float]] = {}
+    if path is None:
+        return records
+
+    if not os.path.isfile(path):
+        print(f"[viz_sc] per-image CSV not found: {path}")
+        return records
+
+    with open(path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                scene = int(row.get("scene_id", -1))
+                im = int(row.get("im_id", -1))
+            except ValueError:
+                continue
+            key = (scene, im)
+            # 将可解析的字段转成 float，保留原始字符串以防缺失
+            parsed = {}
+            for k, v in row.items():
+                try:
+                    parsed[k] = float(v)
+                except (ValueError, TypeError):
+                    parsed[k] = v
+            records[key] = parsed
+    print(f"[viz_sc] Loaded {len(records)} per-image rows from {path}")
+    return records
 
 
 # ----------------------------------------------------------------------
@@ -330,12 +369,18 @@ def main() -> None:
 
     split = args.split or getattr(cfg, "val_split", "test")
     num_workers = args.num_workers or getattr(cfg, "num_workers", 4)
+    per_image_metrics = load_per_image_metrics(args.per_image_csv)
 
     logger.info(
         f"Visualizing split={split} | batch_size={args.batch_size} | "
         f"num_workers={num_workers} | num_samples={args.num_samples} | "
         f"checkpoint={ckpt_path}"
     )
+
+    if per_image_metrics:
+        logger.info(
+            f"Loaded per-image metrics for cross-checking: {len(per_image_metrics)} rows"
+        )
 
     geometry = GeometryToolkit()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -484,7 +529,6 @@ def main() -> None:
 
                 # Raw ROI depth points (already in camera frame)
                 points_raw_cam = batch["points"][i]  # [N,3]
-
                 # ------- Alignment debug: how far is Raw ROI from CAD@GT? ------- #
                 # 最近邻距离：Raw ROI 点 -> CAD@GT 点
                 dist_raw_to_gt = torch.cdist(
@@ -504,37 +548,84 @@ def main() -> None:
                     f"mean nn(GT->Raw)={dist_gt_to_raw:.4f} m"
                 )
 
-                # ------- 用 CAD 点计算 ADD / ADD-S（与 EvaluatorSC 对齐，但不走 cal_add_cuda） ------- #
-                # ADD: 对应点距离均值
-                diff_pts = points_pred_cam - points_gt_cam        # [M,3]
-                add = diff_pts.norm(dim=1).mean().item()
+                # ------- 指标计算：与 EvaluatorSC 完全一致的路径 ------- #
+                cls_ids_single: Optional[torch.Tensor] = None
+                if "cls_id" in batch:
+                    cls_ids_single = batch["cls_id"][i : i + 1]
 
-                # ADD-S: 最近邻距离均值
-                dist_mat = torch.cdist(
-                    points_pred_cam.unsqueeze(0),  # [1,M,3]
-                    points_gt_cam.unsqueeze(0),    # [1,M,3]
-                )                                  # [1,M,M]
-                add_s = dist_mat.min(dim=2).values.mean().item()
+                batch_metrics = compute_batch_pose_metrics(
+                    pred_rt=pred_rt_i.unsqueeze(0),
+                    gt_rt=gt_rt_i.unsqueeze(0),
+                    model_points=mp_obj.unsqueeze(0),
+                    cls_ids=cls_ids_single,
+                    geometry=geometry,
+                    cfg=cfg,
+                )
 
+                add = float(batch_metrics["add"][0])
+                add_s = float(batch_metrics["add_s"][0])
+                t_err = float(batch_metrics["t_err"][0])
+                rot_err = float(batch_metrics["rot_err"][0])
                 is_sym = cls_id in sym_class_ids
-                dist_for_cmd = add_s if is_sym else add
 
-                # 平移误差和旋转误差
-                t_err_vec = (t_pred - t_gt)
-                t_err = torch.norm(t_err_vec).item()
-                rot_err = geometry.rotation_error_from_mats(
-                    R_pred.unsqueeze(0), R_gt.unsqueeze(0), return_deg=True
-                )[0].item()
+                csv_values = None
+                if per_image_metrics:
+                    key = (scene_id, im_id)
+                    csv_values = per_image_metrics.get(key)
+
+                def _fmt_pair(
+                    name: str,
+                    pred_val: float,
+                    csv_key: str,
+                    unit: str,
+                    scale: float = 1.0,
+                    tol: float = 1e-6,
+                ) -> Tuple[str, bool]:
+                    pred_scaled = pred_val * scale
+                    warn = False
+                    if csv_values is not None and csv_key in csv_values:
+                        csv_val = float(csv_values[csv_key]) * scale
+                        if abs(pred_scaled - csv_val) > tol:
+                            warn = True
+                        return (
+                            f"{name}(pred)={pred_scaled:.4f}{unit} / CSV={csv_val:.4f}{unit}",
+                            warn,
+                        )
+                    return (f"{name}(pred)={pred_scaled:.4f}{unit} / CSV=N/A", warn)
+
+                title_lines = [
+                    f"sample_{saved:03d} | scene={scene_id} im={im_id} cls={cls_id} | sym={is_sym}",
+                ]
+
+                warn_flags = []
+                pair, w = _fmt_pair("ADD", add, "add", unit="m")
+                warn_flags.append(w)
+                title_lines.append(pair)
+
+                pair, w = _fmt_pair("ADD-S", add_s, "add_s", unit="m")
+                warn_flags.append(w)
+                title_lines.append(pair)
+
+                pair, w = _fmt_pair("t_err", t_err, "t_err", unit="mm", scale=1000.0)
+                warn_flags.append(w)
+                title_lines.append(pair)
+
+                pair, w = _fmt_pair("rot", rot_err, "rot_err_deg", unit="deg")
+                warn_flags.append(w)
+                title_lines.append(pair)
+
+                title_lines.append(
+                    f"NN Raw->GT={dist_raw_to_gt:.4f}m | GT->Raw={dist_gt_to_raw:.4f}m"
+                )
+
+                if any(warn_flags):
+                    logger.warning(
+                        f"Metric mismatch over tolerance for scene={scene_id}, im={im_id}"
+                    )
 
                 # ------- Pose matrix for table ------- #
                 pose_matrix = build_pose_matrix(pred_rt_i)
-
-                title = (
-                    f"sample_{saved:03d} | scene={scene_id} im={im_id} cls={cls_id} "
-                    f"| sym={is_sym} | ADD={add:.4f}m ADD-S={add_s:.4f}m "
-                    f"| t_err={t_err*1000:.1f}mm rot={rot_err:.1f}° "
-                    f"| CMD_dist={dist_for_cmd*1000:.1f}mm"
-                )
+                title = "\n".join(title_lines)
                 save_path = os.path.join(save_dir, f"sample_{saved:03d}.png")
 
                 render_sample(

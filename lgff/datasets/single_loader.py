@@ -370,9 +370,14 @@ class SingleObjectDataset(Dataset):
 
         return np.stack([X, Y, Z], axis=-1)  # [H,W,3]
 
-    def _sample_points(self, pts: np.ndarray, mask: np.ndarray, num_points: int) -> np.ndarray:
+    def _sample_points(
+        self, pts: np.ndarray, mask: np.ndarray, num_points: int
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        从点云中根据 mask 采样 num_points 个点。
+        从点云中根据 mask 采样 num_points 个点，并返回对应的有效性标记。
+        返回:
+            sampled_pts: [num_points, 3] 采样到的点，单位米（相机坐标系）。
+            valid_mask:  [num_points]     bool，False 表示当前点是占位的无效零点。
         """
         pts_flat = pts.reshape(-1, 3)
         mask_flat = mask.reshape(-1)
@@ -380,15 +385,19 @@ class SingleObjectDataset(Dataset):
         valid_idxs = np.where(mask_flat)[0]
 
         if valid_idxs.size == 0:
-            # 极端情况：mask 为空，返回全 0 点云
-            return np.zeros((num_points, 3), dtype=np.float32)
+            # 极端情况：mask 为空，返回全 0 点云，并显式标记为无效点
+            sampled = np.zeros((num_points, 3), dtype=np.float32)
+            valid_mask = np.zeros((num_points,), dtype=bool)
+            return sampled, valid_mask
 
         if valid_idxs.size >= num_points:
             choice = np.random.choice(valid_idxs, size=num_points, replace=False)
         else:
             choice = np.random.choice(valid_idxs, size=num_points, replace=True)
 
-        return pts_flat[choice, :].astype(np.float32)
+        sampled_pts = pts_flat[choice, :].astype(np.float32)
+        valid_mask = np.ones((num_points,), dtype=bool)
+        return sampled_pts, valid_mask
 
     # ------------------------------------------------------------------
     # Dataset interface
@@ -423,7 +432,7 @@ class SingleObjectDataset(Dataset):
 
         # 6. 用调整后的 K 进行深度反投影
         pts = self._depth_to_points(depth_m, K)        # [H,W,3]
-        pcld = self._sample_points(pts, mask, self.num_points)  # [N,3]
+        pcld, pcld_valid_mask = self._sample_points(pts, mask, self.num_points)  # [N,3]
 
         # 7. RGB -> tensor + normalize
         rgb_t = self.to_tensor(rgb_np)                # [3,H,W], 0~1
@@ -449,8 +458,8 @@ class SingleObjectDataset(Dataset):
         # [N,1,3] vs [1,K,3] -> [N,K,3]
         kp_targ_ofst = kp_cam.unsqueeze(0) - points_t.unsqueeze(1)
 
-        # labels: 当前实现全部是前景点 -> 全 1
-        labels = torch.ones(N, dtype=torch.long)
+        # labels: 通过 valid_mask 标记前景点，无效点（占位零点）设为 0
+        labels = torch.from_numpy(pcld_valid_mask.astype(np.int64))
 
         return {
             "rgb": rgb_t,
@@ -460,6 +469,8 @@ class SingleObjectDataset(Dataset):
             "cls_id": torch.tensor(0, dtype=torch.long),  # 单类固定 0
             "points": points_t,
             "model_points": self.model_points_torch,
+            "scene_id": torch.tensor(int(rec.get("scene_id", -1)), dtype=torch.long),
+            "im_id": torch.tensor(int(rec.get("im_id", -1)), dtype=torch.long),
 
             # 新版 loss/head 需要的监督
             "kp_targ_ofst": kp_targ_ofst,      # [N,K,3]

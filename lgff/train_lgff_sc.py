@@ -10,6 +10,8 @@ import sys
 import random
 import logging
 
+import numpy as np
+
 import torch
 from torch.utils.data import DataLoader
 
@@ -72,15 +74,17 @@ def parse_args():
 def set_random_seed(seed: int, deterministic: bool = False) -> None:
     """设置随机种子；deterministic=True 更可复现，False 更快。"""
     random.seed(seed)
+    np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
     if deterministic:
-        torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.use_deterministic_algorithms(True)
     else:
-        torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
 
 
 def main():
@@ -113,6 +117,14 @@ def main():
         f"Random Seed   : {seed_value} | deterministic={getattr(cfg, 'deterministic', False)}"
     )
 
+    def _worker_init_fn(worker_id: int) -> None:
+        worker_seed = seed_value + worker_id
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+
+    generator = torch.Generator()
+    generator.manual_seed(seed_value)
+
     # 6. 几何工具
     geometry = GeometryToolkit()
 
@@ -136,6 +148,8 @@ def main():
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
+        worker_init_fn=_worker_init_fn,
+        generator=generator,
     )
 
     val_loader = None
@@ -147,6 +161,8 @@ def main():
             num_workers=num_workers,
             pin_memory=True,
             drop_last=False,
+            worker_init_fn=_worker_init_fn,
+            generator=generator,
         )
     else:
         logger.warning("Validation dataset is empty! Training will proceed without validation.")

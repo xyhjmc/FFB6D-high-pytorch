@@ -3,17 +3,19 @@
 This repository contains a lightweight, high-PyTorch version of the single-object **LGFF** (FFB6D-inspired) 6D pose estimator. It targets BOP/LINEMOD objects (e.g., `ape`) with unified meter units, confidence-aware pose fusion, and visualization utilities.
 
 ## Coordinate & Unit Conventions
-- **Camera frame, meters everywhere.** Depth from `scene_camera.json` is converted with `depth_m = depth_raw * depth_scale_scene / cfg.depth_scale`; CAD meshes are divided by `1000` when loaded.
+- **Camera frame, meters everywhere.** Depth from `scene_camera.json` is converted with `depth_m = depth_raw * depth_scale_scene / cfg.depth_scale`; CAD meshes are divided by `1000` when loaded and `cam_t_m2c` (mm) is divided by `1000` to meters.
 - **Poses** are `[R|t]` with `R` (3×3) in the left block and `t` (meters) in the last column; all transforms map object points into the camera frame.
 - **Points**
   - `points` / ROI depth points: camera frame (m), cropped/resized together with RGB and `K`.
-  - `model_points`: CAD object frame (m), broadcast to batch when needed.
+ - `model_points`: CAD object frame (m), broadcast to batch when needed.
 - **Intrinsics**: if RGB/depth are resized, `K` is scaled accordingly; projection helpers use `cam_scale=1.0` (meters) explicitly.
+- **ADD/ADD-S/t_err/CMD**: all thresholds and intermediate distances are kept in meters internally for evaluator, trainer, and visualizer.
 
 ## Data Preparation
 1. Place BOP-format data under `datasets/bop` (or set `cfg.dataset_root`).
 2. Ensure `scene_camera.json` contains `cam_K` and `depth_scale`; the loader applies per-scene `depth_scale` and resizes RGB/depth/masks consistently.
 3. Optional: provide `keypoints/obj_xxxxxx.npy` for predefined object-frame keypoints; otherwise they are sampled from the CAD points.
+4. A standalone alignment checker is available: `python lgff/check_gt_alignment.py --config ... --split test --num-samples 8 --save-dir output/check_align_xx` overlays CAD projections and depth points while reporting bidirectional nearest-neighbor distances (meters).
 
 ## Training
 ```bash
@@ -24,6 +26,21 @@ Key notes:
 - Checkpoints store the **full config**; gradients use PyTorch AMP + GradScaler + configurable grad clip.
 - Pose fusion during training/validation mirrors evaluation (`train_use_best_point` / `eval_use_best_point` or weighted Top-K via `pose_fusion_topk`).
 - Loss terms include ROI DenseFusion-style geometry, translation, confidence regularization, optional CAD-level ADD/ADD-S, and optional keypoint offset supervision.
+
+### Loss monitoring / lambda tuning
+- The loss forward returns unweighted components: `loss_add`, `loss_t`, `loss_conf`, `loss_add_cad`, `loss_kp_of`.
+- `lgff/engines/trainer_sc.py` records epoch-level means in `loss_components_history.csv` with columns:
+  - raw components, weighted components (`w_add`, `w_t`, `w_conf`, `w_add_cad`, `w_kp_of`), and ratios (`ratio_add`, ...).
+- Training logs print a per-epoch breakdown such as:
+  ```
+  [LossBreakdown] epoch=20 | total=0.123
+    - add:   0.065 (53%)
+    - t:     0.028 (23%)
+    - conf:  0.005 (4%)
+    - cad:   0.010 (8%)
+    - kp_of: 0.015 (12%)
+  ```
+  Use this snapshot CSV to adjust `lambda_*` for better balance.
 
 ## Evaluation
 ```bash
@@ -41,7 +58,8 @@ python lgff/viz_sc.py --checkpoint output/linemod_ape_sc --num-samples 8 --show
 Outputs per-sample images with:
 - RGB overlays (cube + axes projected with `cam_scale=1.0`, meters).
 - 3D scatter of CAD@GT vs CAD@Pred vs raw ROI depth.
-- Title reports ADD/ADD-S, translation/rotation errors, CMD distance, and symmetry flag.
+- Title reports ADD/ADD-S, translation/rotation errors, symmetry flag, and nearest-neighbor distances to raw depth.
+- For numeric cross-checking, pass `--per-image-csv <path>` to compare against `per_image_metrics.csv`; the script reuses `compute_batch_pose_metrics` so values should match EvaluatorSC within numerical tolerance and warnings are raised otherwise.
 
 ## Extending / Switching Backbones
 - Backbones and head widths come from the checkpoint config; change them in YAML/`--opt` **before training**.
@@ -49,7 +67,8 @@ Outputs per-sample images with:
 - Toggle loss branches via `lambda_add`, `lambda_add_cad`, `lambda_kp_of`, `lambda_conf`, `lambda_t`; monitor per-branch magnitudes in `metrics_history.csv`.
 
 ## Reproducibility
-- Default seed is 42; set `--seed` or `cfg.seed` and `cfg.deterministic=True` for stricter CuDNN determinism.
+- Default seed is 42; set `--seed` or `cfg.seed` and `cfg.deterministic=True` for stricter CuDNN determinism (disables benchmarking, enables `torch.use_deterministic_algorithms`).
+- DataLoader workers now receive per-worker seeds (`seed + worker_id`) and share a seeded PyTorch `generator` for shuffle reproducibility.
 - Dataloaders rescale intrinsics with image resizing; no random geometric augmentation is applied in evaluation/visualization paths.
 
 ## Repository Layout
