@@ -1,8 +1,17 @@
 """
-Single-class LGFF model implementation.
-Integrates the robust MobileNetV3 (RGB) and MiniPointNet (Geometry)
-into a dense fusion architecture for 6D pose estimation.
+Single-class LGFF model implementation
+(Decoupled Heads + PC Normalization + Z-bias Init).
+
+- RGB Branch: MobileNetV3 / ResNet
+- Geometry Branch: MiniPointNet over normalized point cloud
+- Fusion: feature-level gating between RGB & Geometry
+- Heads:
+    * Rotation Head: uses fused features (RGB+Geo)
+    * Translation Head: uses fused features + raw points
+    * Confidence Head: uses fused features + raw points
+    * [New] Keypoint Offset Head: uses fused features + raw points
 """
+
 from __future__ import annotations
 
 from typing import Dict, Any
@@ -19,83 +28,81 @@ from lgff.models.lgff_base import LGFFBase
 from lgff.models.backbone.mobilenet import MobileNetV3Extractor
 from lgff.models.pointnet.mini_pointnet import MiniPointNet
 
+# 尝试导入 ResNet
+try:
+    from lgff.models.backbone.resnet import ResNetExtractor
+except ImportError:
+    ResNetExtractor = None
+
 
 class LGFF_SC(LGFFBase):
-    """
-    LGFF_SC: 单类轻量 6D 位姿网络
-
-    架构:
-        1. RGB 分支: MobileNetV3 (可配置 arch / OS / 冻结 BN 等)
-        2. 点云分支: MiniPointNet (Shared MLP + 可选 SE 注意力)
-        3. 融合模块: 像素-点云对齐采样 + 门控注意力融合 (Gated Fusion)
-        4. 预测头: 逐点密集预测 [R, t, conf]
-    """
-
     def __init__(self, cfg: LGFFConfig, geometry: GeometryToolkit) -> None:
         super().__init__(geometry)
         self.cfg = cfg
 
-        # --------------------------------------------------------------
-        # 1. RGB Branch: MobileNetV3 Backbone
-        # --------------------------------------------------------------
-        backbone_arch = getattr(cfg, "backbone_arch", "small")           # 'small' / 'large'
-        backbone_os = getattr(cfg, "backbone_output_stride", 8)          # 8 / 16 / 32
-        backbone_pretrained = getattr(cfg, "backbone_pretrained", True)
-        backbone_freeze_bn = getattr(cfg, "backbone_freeze_bn", True)
-        backbone_return_inter = getattr(cfg, "backbone_return_intermediate", False)
-        backbone_low_level_idx = getattr(cfg, "backbone_low_level_index", 2)
-
-        self.rgb_backbone = MobileNetV3Extractor(
-            arch=backbone_arch,
-            output_stride=backbone_os,
-            pretrained=backbone_pretrained,
-            freeze_bn=backbone_freeze_bn,
-            return_intermediate=backbone_return_inter,
-            low_level_index=backbone_low_level_idx,
+        # ==================================================================
+        # 0. 一些基础配置
+        # ==================================================================
+        # 关键点个数：优先使用 cfg.num_keypoints，其次兼容 cfg.n_keypoints
+        self.num_keypoints: int = int(
+            getattr(cfg, "num_keypoints", getattr(cfg, "n_keypoints", 9))
         )
 
-        # 动态获取输出通道数 (例如 small: 576)
+        # ==================================================================
+        # 1. RGB Branch
+        # ==================================================================
+        backbone_name = getattr(cfg, "backbone_name", "mobilenet_v3_large")
+        backbone_os = getattr(cfg, "backbone_output_stride", 8)
+        pretrained = getattr(cfg, "backbone_pretrained", True)
+        freeze_bn = getattr(cfg, "backbone_freeze_bn", True)
+        mobilenet_arch = getattr(cfg, "backbone_arch", "large")
+
+        if "resnet" in backbone_name and ResNetExtractor is not None:
+            self.rgb_backbone = ResNetExtractor(
+                arch=backbone_name,
+                output_stride=backbone_os,
+                pretrained=pretrained,
+                freeze_bn=freeze_bn,
+            )
+        else:
+            self.rgb_backbone = MobileNetV3Extractor(
+                arch=mobilenet_arch,
+                output_stride=backbone_os,
+                pretrained=pretrained,
+                freeze_bn=freeze_bn,
+                return_intermediate=False,
+            )
+
         last_channels = self.rgb_backbone.out_channels
         rgb_feat_dim = getattr(cfg, "rgb_feat_dim", 128)
+        self.rgb_reduce = nn.Conv2d(last_channels, rgb_feat_dim, 1, bias=False)
 
-        # 1x1 Conv 降维: C_last -> rgb_feat_dim
-        # 这是我们新增的模块之一（需要自定义初始化）
-        self.rgb_reduce = nn.Conv2d(last_channels, rgb_feat_dim, kernel_size=1, bias=False)
-
-        # --------------------------------------------------------------
-        # 2. Geometry Branch: MiniPointNet
-        # --------------------------------------------------------------
+        # ==================================================================
+        # 2. Geometry Branch (PointNet over normalized PC)
+        # ==================================================================
         geo_feat_dim = getattr(cfg, "geo_feat_dim", 128)
-
-        # 融合要求 RGB / Geo 特征维度一致
-        assert rgb_feat_dim == geo_feat_dim, (
-            f"Fusion requires rgb_dim ({rgb_feat_dim}) == geo_dim ({geo_feat_dim})"
-        )
+        assert (
+            rgb_feat_dim == geo_feat_dim
+        ), "RGB feat dim and Geo feat dim must match for fusion."
 
         point_input_dim = getattr(cfg, "point_input_dim", 3)
         point_hidden_dims = getattr(cfg, "point_hidden_dims", (64, 128))
-        point_norm = getattr(cfg, "point_norm", "bn")
-        point_use_se = getattr(cfg, "point_use_se", True)
-        point_dropout = getattr(cfg, "point_dropout", 0.0)
 
-        # MiniPointNet 本身内部也有自己的初始化；我们在 _init_weights 里会再次
-        # 用 Kaiming 刷一遍，不影响稳定性
         self.point_encoder = MiniPointNet(
             input_dim=point_input_dim,
             feat_dim=geo_feat_dim,
             hidden_dims=point_hidden_dims,
-            norm=point_norm,
-            use_se=point_use_se,
-            dropout=point_dropout,
-            return_global=False,        # 目前只用逐点特征
-            global_pool_method="max",
+            norm=getattr(cfg, "point_norm", "bn"),
+            use_se=getattr(cfg, "point_use_se", True),
+            dropout=getattr(cfg, "point_dropout", 0.0),
+            concat_global=True,
+            return_global=False,
         )
 
-        # --------------------------------------------------------------
-        # 3. Fusion Gate (Cross-Modality Gating)
-        # --------------------------------------------------------------
-        fusion_in_dim = rgb_feat_dim + geo_feat_dim  # 128 + 128 = 256
-
+        # ==================================================================
+        # 3. Fusion Module
+        # ==================================================================
+        fusion_in_dim = rgb_feat_dim + geo_feat_dim  # [rgb_emb, geo_emb]
         self.fusion_gate = nn.Sequential(
             nn.Conv1d(fusion_in_dim, 128, 1, bias=False),
             nn.ReLU(inplace=True),
@@ -103,179 +110,214 @@ class LGFF_SC(LGFFBase):
             nn.Sigmoid(),
         )
 
-        # --------------------------------------------------------------
-        # 4. Dense Heads (Per-Point Prediction)
-        # --------------------------------------------------------------
-        head_in_dim = rgb_feat_dim + geo_feat_dim     # 256
-        head_hidden_dim = getattr(cfg, "head_hidden_dim", 128)
-        head_feat_dim = getattr(cfg, "head_feat_dim", 64)
+        # ==================================================================
+        # 4. Decoupled Heads
+        # ==================================================================
+        head_hidden = getattr(cfg, "head_hidden_dim", 128)
         head_dropout = getattr(cfg, "head_dropout", 0.0)
 
-        # 这里你改成 bias=True 是合理的：没有 Norm，保留 bias 有帮助
-        self.head_shared = nn.Sequential(
-            nn.Conv1d(head_in_dim, head_hidden_dim, 1, bias=True),
+        # [关键] 解耦输入：
+        #   Rot Head:  feat_fused (C_fused = rgb_feat_dim)
+        #   Trans Head: [feat_fused, points_t]   (C_fused + 3)
+        #   Conf Head:  [feat_fused, points_t]   (C_fused + 3)
+        #   KpOf Head:  [feat_fused, points_t]   (C_fused + 3)
+        rot_in_dim = rgb_feat_dim
+        trans_in_dim = rgb_feat_dim + 3
+        conf_in_dim = rgb_feat_dim + 3
+        kpof_in_dim = rgb_feat_dim + 3  # 和 trans/conf 共享输入
+
+        # --- Rotation Head ---
+        self.rot_head = nn.Sequential(
+            nn.Conv1d(rot_in_dim, head_hidden, 1, bias=True),
             nn.ReLU(inplace=True),
-            nn.Conv1d(head_hidden_dim, head_feat_dim, 1, bias=True),
+            nn.Dropout(p=head_dropout),
+            nn.Conv1d(head_hidden, head_hidden, 1, bias=True),
             nn.ReLU(inplace=True),
+            nn.Conv1d(head_hidden, 4, 1),  # Quaternion
         )
 
-        self.head_dropout = (
-            nn.Dropout(p=head_dropout) if head_dropout > 0.0 else nn.Identity()
+        # --- Translation Head (per-point translation, later 聚合) ---
+        self.trans_head = nn.Sequential(
+            nn.Conv1d(trans_in_dim, head_hidden, 1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=head_dropout),
+            nn.Conv1d(head_hidden, head_hidden, 1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(head_hidden, 3, 1),  # Translation (Direct Regression)
         )
 
-        # 输出头（保持偏置默认 True）
-        self.pose_r = nn.Conv1d(head_feat_dim, 4, 1)  # Quaternion: 4
-        self.pose_t = nn.Conv1d(head_feat_dim, 3, 1)  # Translation: 3
-        self.pose_c = nn.Conv1d(head_feat_dim, 1, 1)  # Confidence: 1
+        # --- Confidence Head ---
+        self.conf_head = nn.Sequential(
+            nn.Conv1d(conf_in_dim, head_hidden, 1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=head_dropout),
+            nn.Conv1d(head_hidden, 1, 1),  # Logits
+        )
 
-        # --------------------------------------------------------------
-        # 5. Weight Init (只初始化“新模块”，不动预训练 backbone)
-        # --------------------------------------------------------------
+        # --- [New] Keypoint Offset Head ---
+        # 目标：输出 pred_kp_ofs: [B, n_kpts, N, 3]
+        # 实现：conv 输出通道数 = 3 * n_kpts，然后 reshape。
+        self.kp_of_head = nn.Sequential(
+            nn.Conv1d(kpof_in_dim, head_hidden, 1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=head_dropout),
+            nn.Conv1d(head_hidden, head_hidden, 1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(head_hidden, 3 * self.num_keypoints, 1),  # 3D offset for each keypoint
+        )
+
+        # Z 轴初始化偏置（物体平均距离，可在 cfg 里改）
+        self.init_z_bias = float(getattr(cfg, "init_z_bias", 0.7))
+
         self._init_weights()
 
-    # ------------------------------------------------------------------
-    # internal helpers
-    # ------------------------------------------------------------------
+    # ======================================================================
+    # 初始化
+    # ======================================================================
     def _init_weights(self) -> None:
-        """
-        对新增模块做一个干净的初始化：
-        - 不触碰 self.rgb_backbone 里的预训练权重
-        """
-        # 1) RGB 降维层
-        for m in [self.rgb_reduce]:
+        modules = [
+            self.rgb_reduce,
+            self.point_encoder,
+            self.fusion_gate,
+            self.rot_head,
+            self.trans_head,
+            self.conf_head,
+            self.kp_of_head,  # [New]
+        ]
+        for m in modules:
             for mod in m.modules():
                 if isinstance(mod, (nn.Conv2d, nn.Conv1d)):
-                    nn.init.kaiming_normal_(mod.weight, mode="fan_out", nonlinearity="relu")
+                    nn.init.kaiming_normal_(
+                        mod.weight, mode="fan_out", nonlinearity="relu"
+                    )
                     if mod.bias is not None:
                         nn.init.constant_(mod.bias, 0.0)
-                elif isinstance(mod, (nn.BatchNorm1d, nn.BatchNorm2d, nn.GroupNorm)):
+                elif isinstance(mod, (nn.BatchNorm1d, nn.BatchNorm2d)):
                     nn.init.constant_(mod.weight, 1.0)
                     nn.init.constant_(mod.bias, 0.0)
 
-        # 2) 点云编码器（额外刷一遍没问题）
-        for mod in self.point_encoder.modules():
-            if isinstance(mod, (nn.Conv1d, nn.Conv2d)):
-                nn.init.kaiming_normal_(mod.weight, mode="fan_out", nonlinearity="relu")
-                if mod.bias is not None:
-                    nn.init.constant_(mod.bias, 0.0)
-            elif isinstance(mod, (nn.BatchNorm1d, nn.BatchNorm2d, nn.GroupNorm)):
-                nn.init.constant_(mod.weight, 1.0)
-                nn.init.constant_(mod.bias, 0.0)
+        # Rot Head: 最后一层正常小随机 + 0 bias
+        nn.init.normal_(self.rot_head[-1].weight, mean=0, std=0.01)
+        nn.init.constant_(self.rot_head[-1].bias, 0.0)
 
-        # 3) Fusion Gate
-        for mod in self.fusion_gate.modules():
-            if isinstance(mod, (nn.Conv1d, nn.Conv2d)):
-                nn.init.kaiming_normal_(mod.weight, mode="fan_out", nonlinearity="relu")
-                if mod.bias is not None:
-                    nn.init.constant_(mod.bias, 0.0)
-            elif isinstance(mod, (nn.BatchNorm1d, nn.BatchNorm2d, nn.GroupNorm)):
-                nn.init.constant_(mod.weight, 1.0)
-                nn.init.constant_(mod.bias, 0.0)
+        # Trans Head: Direct Regression + Z-bias 先验
+        nn.init.normal_(self.trans_head[-1].weight, mean=0, std=0.001)
+        nn.init.constant_(self.trans_head[-1].bias, 0.0)
+        # [重要] 为 Z 轴注入初始深度先验（单位与数据一致）
+        with torch.no_grad():
+            # bias shape: [3] -> [x, y, z]
+            self.trans_head[-1].bias.data[2] = self.init_z_bias
 
-        # 4) Head Shared
-        for mod in self.head_shared.modules():
-            if isinstance(mod, (nn.Conv1d, nn.Conv2d)):
-                nn.init.kaiming_normal_(mod.weight, mode="fan_out", nonlinearity="relu")
-                if mod.bias is not None:
-                    nn.init.constant_(mod.bias, 0.0)
-            elif isinstance(mod, (nn.BatchNorm1d, nn.BatchNorm2d, nn.GroupNorm)):
-                nn.init.constant_(mod.weight, 1.0)
-                nn.init.constant_(mod.bias, 0.0)
+        # Conf Head
+        nn.init.normal_(self.conf_head[-1].weight, mean=0, std=0.01)
+        nn.init.constant_(self.conf_head[-1].bias, 0.0)
 
-        # 5) 输出头
-        for head in [self.pose_r, self.pose_t, self.pose_c]:
-            nn.init.kaiming_normal_(head.weight, mode="fan_out", nonlinearity="relu")
-            if head.bias is not None:
-                nn.init.constant_(head.bias, 0.0)
+        # [New] KpOf Head
+        nn.init.normal_(self.kp_of_head[-1].weight, mean=0, std=0.01)
+        nn.init.constant_(self.kp_of_head[-1].bias, 0.0)
 
-    # ------------------------------------------------------------------
-    # forward
-    # ------------------------------------------------------------------
+    # ======================================================================
+    # 前向
+    # ======================================================================
     def forward(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-        """
-        Args:
-            batch:
-                - rgb:         [B, 3, H, W]
-                - point_cloud: [B, N, 3]
-                - intrinsic:   [B, 3, 3]
+        rgb = batch["rgb"]               # [B, 3, H, W]
+        points = batch["point_cloud"]    # [B, N, 3]  原始相机坐标
+        intrinsic = batch["intrinsic"]   # [B, 3, 3]
+        B, _, H, W = rgb.shape
+        N = points.shape[1]
 
-        Returns:
-            dict:
-                - pred_quat:  [B, N, 4]
-                - pred_trans: [B, N, 3]
-                - pred_conf:  [B, N, 1]
-                - points:     [B, N, 3]
-        """
-        rgb: torch.Tensor = batch["rgb"]
-        points: torch.Tensor = batch["point_cloud"]
-        intrinsic: torch.Tensor = batch["intrinsic"]
+        # ------------------------------------------------------------------
+        # 0. 点云预处理：居中 + 半径归一化 (只对几何编码用)
+        # ------------------------------------------------------------------
+        pc_centering = getattr(self.cfg, "pc_centering", True)
+        pc_scale_norm = getattr(self.cfg, "pc_scale_norm", True)
 
-        B, _, H_in, W_in = rgb.shape
-        _, N, _ = points.shape
+        if pc_centering:
+            pc_center = points.mean(dim=1, keepdim=True)      # [B, 1, 3]
+        else:
+            pc_center = torch.zeros_like(points[:, :1, :])
 
-        # ----------------------------------------------------------
-        # A. RGB Feature Extraction
-        # ----------------------------------------------------------
+        pc_centered = points - pc_center                      # [B, N, 3]
+
+        if pc_scale_norm:
+            dist = torch.norm(pc_centered, dim=-1, keepdim=True)  # [B, N, 1]
+            pc_radius = dist.max(dim=1, keepdim=True)[0].clamp(min=1e-6)  # [B, 1, 1]
+            pc_normed = pc_centered / pc_radius               # [B, N, 3]
+        else:
+            pc_normed = pc_centered
+
+        # ------------------------------------------------------------------
+        # 1. RGB Feature
+        # ------------------------------------------------------------------
         feat_map = self.rgb_backbone(rgb)
-        # 兼容 return_intermediate=True 的情况
         if isinstance(feat_map, (tuple, list)):
-            feat_map, _ = feat_map  # 暂时忽略浅层特征，后续可拓展
+            feat_map = feat_map[0]
+        feat_map = self.rgb_reduce(feat_map)                  # [B, C_rgb, H', W']
 
-        # [B, C_back, H/OS, W/OS] -> [B, rgb_feat_dim, ...]
-        feat_map = self.rgb_reduce(feat_map)
+        # ------------------------------------------------------------------
+        # 2. Geometry Feature (用归一化点云)
+        # ------------------------------------------------------------------
+        points_norm_t = pc_normed.transpose(1, 2)             # [B, 3, N]
+        geo_emb = self.point_encoder(points_norm_t)           # [B, C_geo, N]
 
-        # ----------------------------------------------------------
-        # B. Geometry Feature Extraction
-        # ----------------------------------------------------------
-        # [B, N, 3] -> [B, 3, N]
-        points_t = points.transpose(1, 2)
-        # [B, C_geo, N]
-        geo_emb = self.point_encoder(points_t)
-
-        # ----------------------------------------------------------
-        # C. Projection & Sampling (Pixel-Point Alignment)
-        # ----------------------------------------------------------
-        # 调用 LGFFBase 中的通用对齐采样：将 RGB 特征和点云特征对齐到 N 个点上
-        # fused_raw: [B, C_rgb+C_geo, N]
-        # rgb_emb:   [B, C_rgb,       N]
+        # ------------------------------------------------------------------
+        # 3. Fusion (投影 & 对齐使用原始 points)
+        # ------------------------------------------------------------------
+        # extract_and_fuse: 通常会根据 points 投影到特征图上取 RGB features
         fused_raw, rgb_emb = self.extract_and_fuse(
-            feat_map, geo_emb, points, intrinsic, (H_in, W_in)
-        )
+            feat_map, geo_emb, points, intrinsic, (H, W)
+        )   # fused_raw: [B, C_rgb+C_geo, N], rgb_emb: [B, C_rgb, N]
 
-        # ----------------------------------------------------------
-        # D. Gated Fusion
-        # ----------------------------------------------------------
-        # 计算门控权重 [B,1,N]
-        gate = self.fusion_gate(fused_raw)
+        gate = self.fusion_gate(fused_raw)                   # [B, 1, N]
+        feat_fused = rgb_emb * gate + geo_emb * (1.0 - gate) # [B, C_fused, N]
 
-        # 残差式加权融合：RGB vs Geo
-        feat_fused = rgb_emb * gate + geo_emb * (1.0 - gate)
+        # ------------------------------------------------------------------
+        # 4. 构造 Head 输入
+        # ------------------------------------------------------------------
+        points_t = points.transpose(1, 2)                     # [B, 3, N]
 
-        # 保留原始 Geo，再次 concat
-        feat_ready = torch.cat([feat_fused, geo_emb], dim=1)  # [B, C_fused+C_geo, N]
+        # Rot Head 输入：feat_fused
+        rot_input = feat_fused                                # [B, C_fused, N]
 
-        # ----------------------------------------------------------
-        # E. Dense Head Prediction
-        # ----------------------------------------------------------
-        feat_shared = self.head_shared(feat_ready)   # [B, head_feat_dim, N]
-        feat_shared = self.head_dropout(feat_shared)
+        # Trans / Conf / KpOf Head 输入：feat_fused + points
+        trans_conf_kp_input = torch.cat(
+            [feat_fused, points_t], dim=1
+        )  # [B, C_fused+3, N]
 
-        pred_q = self.pose_r(feat_shared)           # [B,4,N]
-        pred_t = self.pose_t(feat_shared)           # [B,3,N]
-        pred_c = self.pose_c(feat_shared)           # [B,1,N]
+        # ------------------------------------------------------------------
+        # 5. 解耦预测
+        # ------------------------------------------------------------------
 
-        # 调整维度到 [B,N,C]
-        pred_q = pred_q.permute(0, 2, 1).contiguous()
-        pred_t = pred_t.permute(0, 2, 1).contiguous()
-        pred_c = pred_c.permute(0, 2, 1).contiguous()
-
-        # 归一化四元数 & 置信度激活
+        # A. Rotation
+        pred_q = self.rot_head(rot_input)                     # [B, 4, N]
+        pred_q = pred_q.permute(0, 2, 1).contiguous()         # [B, N, 4]
         pred_q = F.normalize(pred_q, dim=-1)
+
+        # B. Translation (per-point, direct regression)
+        pred_t = self.trans_head(trans_conf_kp_input)         # [B, 3, N]
+        pred_t = pred_t.permute(0, 2, 1).contiguous()         # [B, N, 3]
+
+        # C. Confidence
+        pred_c = self.conf_head(trans_conf_kp_input)          # [B, 1, N]
+        pred_c = pred_c.permute(0, 2, 1).contiguous()         # [B, N, 1]
         pred_c = torch.sigmoid(pred_c)
 
+        # D. [New] Keypoint Offsets
+        # kp_of_raw: [B, 3*K, N]
+        kp_of_raw = self.kp_of_head(trans_conf_kp_input)
+        # 先 reshape 成 [B, K, 3, N] 再转成 [B, K, N, 3]，方便直接给 OFLoss 用
+        kp_of_raw = kp_of_raw.view(
+            B, self.num_keypoints, 3, N
+        )  # [B, K, 3, N]
+        pred_kp_ofs = kp_of_raw.permute(0, 1, 3, 2).contiguous()  # [B, K, N, 3]
+
         return {
-            "pred_quat": pred_q,    # [B, N, 4]
-            "pred_trans": pred_t,   # [B, N, 3]
-            "pred_conf": pred_c,    # [B, N, 1]
-            "points": points,       # [B, N, 3]
+            "pred_quat": pred_q,
+            "pred_trans": pred_t,
+            "pred_conf": pred_c,
+            "pred_kp_ofs": pred_kp_ofs,   # [B, K, N, 3] for OFLoss
+            "points": points,             # 方便 Loss / Eval 使用
         }
+
+
+__all__ = ["LGFF_SC"]

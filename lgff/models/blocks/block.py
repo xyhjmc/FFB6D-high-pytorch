@@ -1,3 +1,4 @@
+#lgff/models/blocks.py
 """External blocks and attention modules."""
 
 import math

@@ -225,14 +225,14 @@ def main():
     parser.add_argument(
         "--dst",
         required=False,
-        default="/home/xyh/PycharmProjects/FFB6D-high-pytorch/lgff/data/linemod_ape_crop128",
+        default="/home/xyh/PycharmProjects/FFB6D-high-pytorch/lgff/data/linemod_benchvice_crop256_all",
         help="Output root for cropped dataset",
     )
     parser.add_argument(
-        "--obj_id", type=int, required=False, default=1, help="Object ID to crop"
+        "--obj_id", type=int, required=False, default=2, help="Object ID to crop"
     )
     parser.add_argument(
-        "--size", type=int, default=128, help="Target resize size (e.g. 128)"
+        "--size", type=int, default=256, help="Target resize size (e.g. 128)"
     )
     parser.add_argument(
         "--pad", type=float, default=0.2, help="Padding ratio (e.g. 0.15)"

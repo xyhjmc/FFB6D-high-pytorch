@@ -9,21 +9,29 @@ setting. It focuses on:
 2) CAD-based ADD / ADD-S metrics using canonical model points (BOP
    meshes), consistent with the official FFB6D evaluation.
 3) Reporting a simple <2cm accuracy metric for quick sanity checks.
+4) [Extended] Rich metrics: accuracy vs. thresholds, percentiles, and
+   per-image CSV logging for detailed analysis.
 """
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional
+import csv
+from pathlib import Path
+from typing import Dict, List, Optional, Any
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from lgff.utils.config import LGFFConfig
 from lgff.utils.geometry import GeometryToolkit
 from lgff.models.lgff_sc import LGFF_SC
+from lgff.utils.pose_metrics import (
+    fuse_pose_from_outputs,
+    compute_batch_pose_metrics,
+    summarize_pose_metrics,
+)
 
 
 class EvaluatorSC:
@@ -33,6 +41,7 @@ class EvaluatorSC:
         test_loader: DataLoader,
         cfg: LGFFConfig,
         geometry: GeometryToolkit,
+        save_dir: Optional[str] = None,
     ) -> None:
         self.cfg = cfg
         self.logger = logging.getLogger("lgff.evaluator")
@@ -42,13 +51,65 @@ class EvaluatorSC:
         self.model = model.to(self.device)
         self.test_loader = test_loader
 
-        # 评估指标统计容器
-        self.metrics_meter = {
-            "add_s": [],   # 存储每个样本的 ADD-S 误差
-            "add": [],     # 存储每个样本的 ADD 误差
-            "cmd_acc": []  # < 2cm 准确率
+        # 结果保存路径（用于 per-image CSV）
+        if save_dir is not None:
+            self.save_dir = Path(save_dir)
+        else:
+            # 如果 cfg 里有 output_dir / log_dir 可以优先用
+            out = getattr(cfg, "output_dir", None) or getattr(cfg, "log_dir", ".")
+            self.save_dir = Path(out)
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+
+        # 评估指标统计容器（逐样本）
+        # 注意：键名要和 summarize_pose_metrics 预期的一致
+        self.metrics_meter: Dict[str, List[float]] = {
+            "add_s": [],
+            "add": [],
+            "t_err": [],      # ||t_pred - t_gt|| 的 L2
+            "t_err_x": [],
+            "t_err_y": [],
+            "t_err_z": [],
+            "rot_err": [],    # 旋转角误差 (deg)
+            "cmd_acc": [],    # <2cm 成功标记（逐样本）
         }
 
+        # BOP 风格：物体直径（优先从 cfg 读取，没有就后面从 CAD 点云算一次）
+        # 统一使用单位：米 (m)
+        self.obj_diameter: Optional[float] = getattr(cfg, "obj_diameter_m", None)
+        if self.obj_diameter is None:
+            # 向后兼容：如果旧 cfg 用的是 obj_diameter，也尝试读一下
+            self.obj_diameter = getattr(cfg, "obj_diameter", None)
+
+        # Accuracy vs threshold 设置
+        # 绝对阈值（单位 m），例如 5mm/10mm/15mm/20mm/30mm
+        self.acc_abs_adds_thresholds: List[float] = getattr(
+            cfg,
+            "eval_abs_adds_thresholds",
+            [0.005, 0.01, 0.015, 0.02, 0.03],
+        )
+        # 相对直径阈值（BOP 风格），例如 0.02d / 0.05d / 0.10d
+        self.acc_rel_adds_thresholds: List[float] = getattr(
+            cfg,
+            "eval_rel_adds_thresholds",
+            [0.02, 0.05, 0.10],
+        )
+
+        # CMD accuracy 使用的阈值（默认 2cm）
+        # 统一和 pose_metrics 中的 compute_batch_pose_metrics 使用同一个字段：
+        # cfg.cmd_threshold_m，如未配置则回退 eval_cmd_threshold_m -> 0.02
+        self.cmd_acc_threshold_m: float = getattr(
+            cfg,
+            "cmd_threshold_m",
+            getattr(cfg, "eval_cmd_threshold_m", 0.02),
+        )
+
+        # 每张图的记录容器
+        self.per_image_records: List[Dict[str, Any]] = []
+        self.sample_counter: int = 0
+
+    # ------------------------------------------------------------------ #
+    # 主评估入口
+    # ------------------------------------------------------------------ #
     def run(self) -> Dict[str, float]:
         """
         主评估循环：遍历测试集 -> 推理 -> 后处理 -> 计算指标。
@@ -59,6 +120,8 @@ class EvaluatorSC:
         # 重置统计
         for k in self.metrics_meter:
             self.metrics_meter[k] = []
+        self.per_image_records = []
+        self.sample_counter = 0
 
         with torch.no_grad():
             for _, batch in enumerate(tqdm(self.test_loader, desc="Evaluating")):
@@ -71,149 +134,235 @@ class EvaluatorSC:
                 # 2. 模型推理
                 outputs = self.model(batch)
 
-                # 3. 后处理: 置信度加权融合姿态 (FFB6D 风格)
+                # 3. 后处理: 置信度加权融合姿态（统一用 fuse_pose_from_outputs）
                 pred_rt = self._process_predictions(outputs)
                 gt_rt = self._process_gt(batch)
 
-                # 4. 指标计算
+                # 4. 指标计算 + 每张图记录
                 self._compute_metrics_external(pred_rt, gt_rt, batch)
 
-        # 5. 汇总结果
+        # 5. 汇总结果（所有 mean / percentile / acc 曲线）
         summary = self._summarize_metrics()
+
+        # 6. 写出 per-image CSV
+        self._dump_per_image_csv()
+
         return summary
 
+    # ------------------------------------------------------------------ #
+    # 姿态后处理
+    # ------------------------------------------------------------------ #
     def _process_predictions(self, outputs: Dict[str, torch.Tensor]) -> torch.Tensor:
-        pred_q = outputs["pred_quat"]  # [B, N, 4]
-        pred_t = outputs["pred_trans"]  # [B, N, 3]
-        pred_c = outputs["pred_conf"]  # [B, N, 1]
+        """
+        使用公共工具函数 fuse_pose_from_outputs 得到 [B,3,4] 的 [R|t]。
+        配置项 eval_use_best_point / TopK 加权融合逻辑都在该函数内部处理。
+        """
+        return fuse_pose_from_outputs(outputs, self.geometry, self.cfg)
 
-        B, N, _ = pred_q.shape
-        conf = pred_c.squeeze(-1)  # [B, N]
-
-        use_best_point = getattr(self.cfg, "eval_use_best_point", True)
-
-        if use_best_point:
-            # -------- 简单 baseline：取置信度最高的那一个点 --------
-            idx = torch.argmax(conf, dim=1)  # [B]
-            idx_expand_q = idx.view(B, 1, 1).expand(-1, 1, 4)
-            idx_expand_t = idx.view(B, 1, 1).expand(-1, 1, 3)
-
-            best_q = torch.gather(pred_q, 1, idx_expand_q).squeeze(1)  # [B, 4]
-            best_t = torch.gather(pred_t, 1, idx_expand_t).squeeze(1)  # [B, 3]
-
-            best_q = F.normalize(best_q, dim=-1)
-            rot = self.geometry.quat_to_rot(best_q)  # [B, 3, 3]
-            pred_rt = torch.cat([rot, best_t.unsqueeze(-1)], dim=2)  # [B, 3, 4]
-            return pred_rt
-
-        # -------- 原来的 Top-K + 置信度加权融合分支 --------
-        k = min(max(32, N // 4), N)
-        conf_topk, idx = torch.topk(conf, k=k, dim=1)
-        conf_topk = conf_topk.clamp(min=1e-4)
-
-        def _gather(t: torch.Tensor) -> torch.Tensor:
-            expand_shape = idx.unsqueeze(-1).expand(-1, -1, t.size(-1))
-            return torch.gather(t, dim=1, index=expand_shape)
-
-        top_q = _gather(pred_q)  # [B, K, 4]
-        top_t = _gather(pred_t)  # [B, K, 3]
-
-        # ✅ 这里换成修过的对齐逻辑
-        top_q = F.normalize(top_q, dim=-1)
-        ref_q = top_q[:, :1, :]
-        dot = torch.sum(ref_q * top_q, dim=-1, keepdim=True)
-        sign = torch.where(dot >= 0,
-                           torch.ones_like(dot),
-                           -torch.ones_like(dot))
-        top_q = top_q * sign
-
-        weights = conf_topk / conf_topk.sum(dim=1, keepdim=True).clamp(min=1e-6)
-        quat_cov = torch.einsum("bki,bkj->bij", weights.unsqueeze(-1) * top_q, top_q)
-        eigvals, eigvecs = torch.linalg.eigh(quat_cov)
-        fused_q = eigvecs[..., -1]
-
-        fused_t = torch.sum(top_t * weights.unsqueeze(-1), dim=1)
-
-        rot = self.geometry.quat_to_rot(fused_q)
-        pred_rt = torch.cat([rot, fused_t.unsqueeze(-1)], dim=2)
-        return pred_rt
-
+    # ------------------------------------------------------------------ #
+    # GT 预处理
+    # ------------------------------------------------------------------ #
     def _process_gt(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
         将 GT Pose 转为当前设备上的 tensor，保持形状 [B, 3, 4]。
         """
         return batch["pose"].to(self.device)
 
+    # ------------------------------------------------------------------ #
+    # 指标计算 + per-image 记录
+    # ------------------------------------------------------------------ #
     def _compute_metrics_external(
         self,
         pred_rt: torch.Tensor,
         gt_rt: torch.Tensor,
-        batch: Dict[str, torch.Tensor]
+        batch: Dict[str, torch.Tensor],
     ) -> None:
         """
-        使用 CAD 模型点作为参考，计算 ADD / ADD-S。
+        使用 CAD 模型点作为参考，计算 ADD / ADD-S，并记录每张图的全部指标。
+        正式的 ADD / ADD-S / t_err / rot_err / cmd_acc 计算委托给
+        compute_batch_pose_metrics，确保和训练阶段复用同一套定义。
         """
-        # ====== DEBUG: 用 GT 代替预测姿态，检查 metric 流程是否正确 ======
-        #pred_rt = gt_rt.clone()
-
-
         model_points = batch["model_points"].to(self.device)  # [B, M, 3]
+        B, M, _ = model_points.shape
 
-        gt_r = gt_rt[:, :3, :3]   # [B, 3, 3]
-        gt_t = gt_rt[:, :3, 3]    # [B, 3]
+        # 若未显式提供直径，则用第一批的 CAD 点云估算一次（单位 m）
+        if self.obj_diameter is None and M > 1:
+            with torch.no_grad():
+                mp0 = model_points[0]  # [M, 3]
+                # 这里是 O(M^2)，单类 + 适量点数情况下是可以接受的
+                dist_mat = torch.cdist(mp0.unsqueeze(0), mp0.unsqueeze(0)).squeeze(0)
+                self.obj_diameter = float(dist_mat.max().item())
+                self.logger.info(
+                    f"[EvaluatorSC] Estimated obj_diameter from CAD: "
+                    f"{self.obj_diameter:.6f} m"
+                )
 
-        pred_r = pred_rt[:, :3, :3]  # [B, 3, 3]
-        pred_t = pred_rt[:, :3, 3]   # [B, 3]
+        # 调用公共 batch 级指标计算函数
+        cls_ids = batch.get("cls_id", None)
+        batch_metrics = compute_batch_pose_metrics(
+            pred_rt=pred_rt,
+            gt_rt=gt_rt,
+            model_points=model_points,
+            cls_ids=cls_ids,
+            geometry=self.geometry,
+            cfg=self.cfg,
+        )
 
-        # CAD 点云分别投影到预测/GT 姿态
-        points_gt   = torch.bmm(model_points, gt_r.transpose(1, 2))   + gt_t.unsqueeze(1)
-        points_pred = torch.bmm(model_points, pred_r.transpose(1, 2)) + pred_t.unsqueeze(1)
+        # ---------------- 逐样本累加全局统计 ---------------- #
+        # batch_metrics: key -> 1D tensor on CPU
+        for name, tensor_1d in batch_metrics.items():
+            if name not in self.metrics_meter:
+                self.metrics_meter[name] = []
+            self.metrics_meter[name].extend(tensor_1d.numpy().tolist())
 
-        # ADD: 对应点距离的均值
-        add_dist = torch.norm(points_pred - points_gt, dim=2).mean(dim=1)  # [B]
+        # ---------------- per-image 记录到内存 ---------------- #
+        # 尽量带上 scene_id / im_id 等 dataset 信息（如果存在）
+        scene_ids = None
+        im_ids = None
+        if "scene_id" in batch:
+            scene_ids = batch["scene_id"].detach().cpu().numpy()
+        if "im_id" in batch:
+            im_ids = batch["im_id"].detach().cpu().numpy()
 
-        # ADD-S: 最近邻距离 (逐 batch 处理以避免显存过大)
-        adds_list: List[torch.Tensor] = []
-        for b in range(points_pred.size(0)):
-            dist_mat = torch.cdist(points_pred[b], points_gt[b])  # [M, M]
-            adds_list.append(dist_mat.min(dim=1).values.mean())
-        adds_dist = torch.stack(adds_list)  # [B]
+        # 取出 numpy 数组
+        add_np   = batch_metrics["add"].numpy()
+        adds_np  = batch_metrics["add_s"].numpy()
+        t_err_np = batch_metrics["t_err"].numpy()
+        tdx_np   = batch_metrics["t_err_x"].numpy()
+        tdy_np   = batch_metrics["t_err_y"].numpy()
+        tdz_np   = batch_metrics["t_err_z"].numpy()
+        rot_np   = batch_metrics["rot_err"].numpy()
+        succ_cmd_np = batch_metrics["cmd_acc"].numpy()  # 0 / 1
 
-        # 对称性判断（单类场景，直接读取 batch 中的 cls_id）
-        cls_id: Optional[int] = None
-        if "cls_id" in batch:
-            cls_tensor = batch["cls_id"]
-            if cls_tensor.dim() > 1:
-                cls_tensor = cls_tensor.view(-1)
-            if cls_tensor.numel() > 0:
-                cls_id = int(cls_tensor[0].item())
+        # 再计算一次「用于 CMD 的距离」dist_for_cmd（与 compute_batch_pose_metrics 一致）
+        cls_id_scalar: Optional[int] = None
+        if isinstance(cls_ids, torch.Tensor):
+            cid = cls_ids
+            if cid.dim() > 1:
+                cid = cid.view(-1)
+            if cid.numel() > 0:
+                cls_id_scalar = int(cid[0].item())
 
         is_symmetric = (
-            cls_id in getattr(self.cfg, "sym_class_ids", [])
-        ) if cls_id is not None else False
+            cls_id_scalar in getattr(self.cfg, "sym_class_ids", [])
+        ) if cls_id_scalar is not None else False
 
-        # 选择用于 <2cm 精度统计的距离（对称物体使用 ADD-S）
-        dist_for_acc = adds_dist if is_symmetric else add_dist
+        dist_for_cmd_np = adds_np if is_symmetric else add_np  # [B]
 
-        self.metrics_meter["add"].extend(add_dist.detach().cpu().numpy().tolist())
-        self.metrics_meter["add_s"].extend(adds_dist.detach().cpu().numpy().tolist())
+        # GT / Pred t 也一起记录下来（方便分析偏差）
+        gt_r = gt_rt[:, :3, :3]
+        gt_t = gt_rt[:, :3, 3]
+        pred_r = pred_rt[:, :3, :3]
+        pred_t = pred_rt[:, :3, 3]
 
-        cmd_acc = (dist_for_acc < 0.02).float().mean().item()
-        self.metrics_meter["cmd_acc"].append(cmd_acc)
+        gt_t_np   = gt_t.detach().cpu().numpy()
+        pred_t_np = pred_t.detach().cpu().numpy()
 
+        # 阈值下的成功标记 (ADD-S 为主)
+        adds_arr = adds_np
+        abs_th_success: Dict[str, List[bool]] = {}
+        for th in self.acc_abs_adds_thresholds:
+            key = f"succ_adds_{int(th * 1000)}mm"  # e.g., succ_adds_10mm
+            abs_th_success[key] = (adds_arr < th).tolist()
+
+        rel_th_success: Dict[str, List[bool]] = {}
+        if self.obj_diameter is not None and self.obj_diameter > 0:
+            for alpha in self.acc_rel_adds_thresholds:
+                th = alpha * self.obj_diameter
+                key = f"succ_adds_{alpha:.3f}d"
+                rel_th_success[key] = (adds_arr < th).tolist()
+
+        # 逐样本写入 per_image_records
+        for i in range(B):
+            record: Dict[str, Any] = {
+                "index": int(self.sample_counter),
+                "scene_id": int(scene_ids[i]) if scene_ids is not None else -1,
+                "im_id": int(im_ids[i]) if im_ids is not None else -1,
+                "cls_id": int(cls_id_scalar) if cls_id_scalar is not None else -1,
+                "is_symmetric": bool(is_symmetric),
+                "add": float(add_np[i]),
+                "add_s": float(adds_np[i]),
+                "t_err": float(t_err_np[i]),
+                "t_err_x": float(tdx_np[i]),
+                "t_err_y": float(tdy_np[i]),
+                "t_err_z": float(tdz_np[i]),
+                "rot_err_deg": float(rot_np[i]),
+                "dist_for_cmd": float(dist_for_cmd_np[i]),
+                "cmd_success": bool(succ_cmd_np[i]),
+                "gt_tx": float(gt_t_np[i, 0]),
+                "gt_ty": float(gt_t_np[i, 1]),
+                "gt_tz": float(gt_t_np[i, 2]),
+                "pred_tx": float(pred_t_np[i, 0]),
+                "pred_ty": float(pred_t_np[i, 1]),
+                "pred_tz": float(pred_t_np[i, 2]),
+            }
+
+            # 加上各个阈值下的成功标记
+            for key, arr in abs_th_success.items():
+                record[key] = bool(arr[i])
+            for key, arr in rel_th_success.items():
+                record[key] = bool(arr[i])
+
+            self.per_image_records.append(record)
+            self.sample_counter += 1
+
+        # ---------------- 首批 debug 输出 ---------------- #
+        if not hasattr(self, "_debug_printed"):
+            self._debug_printed = True
+            print(">>> debug units")
+            print("model_points norm (mean over batch):",
+                  model_points.norm(dim=2).mean().item())
+            print("gt_t norm (mean over batch):", gt_t.norm(dim=1).mean().item())
+        if not hasattr(self, "_debug_printed_samples"):
+            self._debug_printed_samples = True
+            for i in range(min(5, pred_r.shape[0])):
+                print(
+                    f"[Sample {i}] add={add_np[i]:.4f}, "
+                    f"adds={adds_np[i]:.4f}, "
+                    f"t_err={t_err_np[i]:.4f}, "
+                    f"rot_err={rot_np[i]:.2f}"
+                )
+
+    # ------------------------------------------------------------------ #
+    # 指标汇总：均值 + percentile + accuracy 曲线
+    # ------------------------------------------------------------------ #
     def _summarize_metrics(self) -> Dict[str, float]:
         """
-        汇总所有样本的平均指标
+        汇总所有样本的指标。
+        这里直接调用 summarize_pose_metrics，保证和 Trainer 里（如果也调用它）
+        完全一致的计算逻辑和字段名称。
         """
-        summary = {}
-        for k, v_list in self.metrics_meter.items():
-            if len(v_list) > 0:
-                summary[f"mean_{k}"] = float(np.mean(v_list))
-            else:
-                summary[f"mean_{k}"] = 0.0
+        obj_diam = self.obj_diameter if self.obj_diameter is not None else 0.0
+
+        summary = summarize_pose_metrics(
+            meter=self.metrics_meter,
+            obj_diameter=obj_diam,
+            cmd_threshold_m=self.cmd_acc_threshold_m,
+        )
 
         self.logger.info(f"Evaluation Summary: {summary}")
         return summary
+
+    # ------------------------------------------------------------------ #
+    # per-image CSV 输出
+    # ------------------------------------------------------------------ #
+    def _dump_per_image_csv(self) -> None:
+        """
+        将每张图的所有指标和关键信息写入 CSV。
+        """
+        if not self.per_image_records:
+            self.logger.warning("[EvaluatorSC] No per-image records to dump.")
+            return
+
+        csv_path = self.save_dir / "per_image_metrics.csv"
+        fieldnames = list(self.per_image_records[0].keys())
+
+        with csv_path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(self.per_image_records)
+
+        self.logger.info(f"[EvaluatorSC] Per-image metrics saved to: {csv_path}")
 
 
 __all__ = ["EvaluatorSC"]

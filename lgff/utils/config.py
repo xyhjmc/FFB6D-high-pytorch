@@ -17,18 +17,31 @@ def _read_yaml(path: str) -> Dict[str, Any]:
 
 
 def _parse_value(value: str) -> Any:
+    """
+    Enhanced value parser for --opt key=value
+    """
     v = value.strip()
-    if v.lower() == "true": return True
-    if v.lower() == "false": return False
+
+    # 1. Boolean
+    if v.lower() == "true":
+        return True
+    if v.lower() == "false":
+        return False
+
+    # 2. Try parsing as Python literal (covers int, float, list, dict, tuple)
     try:
         return ast.literal_eval(v)
     except (ValueError, SyntaxError):
         pass
+
+    # 3. Handle comma-separated lists without brackets (e.g., "1,2,3")
     if "," in v:
         try:
             return [ast.literal_eval(i.strip()) for i in v.split(",")]
         except (ValueError, SyntaxError):
             pass
+
+    # 4. Fallback to string
     return v
 
 
@@ -38,18 +51,23 @@ class LGFFConfig:
     Central Configuration for LGFF.
     """
 
-    # ----------------- Dataset -----------------
+    # ----------------- Dataset / BOP -----------------
     dataset_name: str = "bop-single"
     dataset_root: str = "datasets/bop"
+    annotation_file: Optional[str] = None
+
     obj_id: int = 1
     resize_h: int = 480
     resize_w: int = 640
     depth_scale: float = 1000.0
+
     num_workers: int = 4
     batch_size: int = 8
     num_classes: int = 1
     num_points: int = 1024
+    num_keypoints: int = 8
     val_split: str = "test"
+
     camera_intrinsic: List[List[float]] = field(
         default_factory=lambda: [
             [1066.778, 0.0, 312.9869],
@@ -64,20 +82,23 @@ class LGFFConfig:
     weight_decay: float = 1e-4
     use_amp: bool = True
     log_interval: int = 10
-    max_grad_norm: float = 2.0  # 新增：梯度裁剪上限（<=0 视为关闭）
 
-    # [新增] 调度器配置
-    # 选项: 'plateau', 'cosine', 'step', 'none'
+    # 梯度裁剪阈值
+    max_grad_norm: float = 2.0
+
+    # 调度器配置
     scheduler: str = "plateau"
-
-    # 调度器参数 (根据 scheduler 类型选用)
-    lr_patience: int = 5         # for plateau
-    lr_factor: float = 0.5       # for plateau / step
-    lr_step_size: int = 20       # for step
-    lr_min: float = 1e-6         # 最小学习率
+    lr_patience: int = 5
+    lr_factor: float = 0.5
+    lr_step_size: int = 20
+    lr_min: float = 1e-6
 
     # ----------------- Model / Loss Hyper-params -----------------
-    backbone_arch: str = "small"
+
+    # [新增] 骨干网络名称，用于切换 ResNet / MobileNet
+    backbone_name: str = "mobilenet_v3_large"
+
+    backbone_arch: str = "small"  # 仅 MobileNet 使用
     backbone_output_stride: int = 8
     backbone_pretrained: bool = True
     backbone_freeze_bn: bool = True
@@ -109,6 +130,7 @@ class LGFFConfig:
             if hasattr(self, key):
                 setattr(self, key, value)
             else:
+                # 这里的警告就是你刚才看到的
                 print(f"[Config] Warning: Unknown config key: {key} (ignored)")
 
     def save(self, path: str) -> None:
@@ -161,5 +183,6 @@ def load_config() -> LGFFConfig:
     print(f"[Config] Final config saved to {save_path}")
 
     return cfg
+
 
 __all__ = ["LGFFConfig", "load_config"]

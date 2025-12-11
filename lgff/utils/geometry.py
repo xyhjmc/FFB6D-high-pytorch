@@ -12,6 +12,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from common.ffb6d_utils.basic_utils import (
     Basic_Utils,
@@ -85,6 +86,63 @@ class GeometryToolkit:
     def best_fit_transform(src: np.ndarray, dst: np.ndarray):
         return best_fit_transform(src, dst)
 
+ # ---------- 新增：旋转误差（输入旋转矩阵） ----------
+    @staticmethod
+    def rotation_error_from_mats(
+        R_pred: torch.Tensor,
+        R_gt: torch.Tensor,
+        return_deg: bool = True,
+        eps: float = 1e-7,
+    ) -> torch.Tensor:
+        """
+        计算旋转矩阵之间的角度误差（批量）。
+        Args:
+            R_pred: [..., 3, 3]
+            R_gt:   [..., 3, 3]
+        Returns:
+            rot_err: [...], 单位为度(默认)或弧度
+        """
+        # 相对旋转 R_rel = R_gt^T * R_pred
+        R_rel = torch.matmul(R_gt.transpose(-1, -2), R_pred)  # [..., 3, 3]
+        # trace = 1 + 2 cos(theta)
+        trace = R_rel[..., 0, 0] + R_rel[..., 1, 1] + R_rel[..., 2, 2]
+        # 数值稳定：裁剪到 [-1, 3] 的对应 cos 范围
+        cos_theta = (trace - 1.0) / 2.0
+        cos_theta = torch.clamp(cos_theta, -1.0 + eps, 1.0 - eps)
+        theta = torch.acos(cos_theta)  # 弧度
+        if return_deg:
+            theta = theta * (180.0 / np.pi)
+        return theta
+
+    # ---------- 新增：旋转误差（输入四元数） ----------
+    @staticmethod
+    def rotation_error_from_quat(
+        q_pred: torch.Tensor,
+        q_gt: torch.Tensor,
+        return_deg: bool = True,
+        eps: float = 1e-7,
+    ) -> torch.Tensor:
+        """
+        计算四元数之间的角度误差（批量）。
+        Args:
+            q_pred: [..., 4] (w, x, y, z 或 x, y, z, w 均可，只要一致)
+            q_gt:   [..., 4]
+        Returns:
+            rot_err: [...], 单位为度(默认)或弧度
+        """
+        # 规范化
+        q_pred = F.normalize(q_pred, dim=-1)
+        q_gt = F.normalize(q_gt, dim=-1)
+
+        # 点积对应 cos(theta/2)，注意要取绝对值处理 q 和 -q 等价
+        dot = torch.sum(q_pred * q_gt, dim=-1).abs()  # [...]
+        dot = torch.clamp(dot, -1.0 + eps, 1.0 - eps)
+
+        # 相对旋转角: theta = 2 * arccos(dot)
+        theta = 2.0 * torch.acos(dot)  # 弧度
+        if return_deg:
+            theta = theta * (180.0 / np.pi)
+        return theta
 
 def build_geometry(camera_intrinsic: Optional[np.ndarray] = None) -> GeometryToolkit:
     return GeometryToolkit(camera_intrinsic)
@@ -123,7 +181,22 @@ def quaternion_to_matrix(toolkit: GeometryToolkit, quat: torch.Tensor) -> torch.
 def best_fit_transform(src: np.ndarray, dst: np.ndarray):
     return GeometryToolkit.best_fit_transform(src, dst)
 
+def rotation_error_from_mats(
+    toolkit: GeometryToolkit,
+    R_pred: torch.Tensor,
+    R_gt: torch.Tensor,
+    return_deg: bool = True,
+) -> torch.Tensor:
+    return toolkit.rotation_error_from_mats(R_pred, R_gt, return_deg=return_deg)
 
+
+def rotation_error_from_quat(
+    toolkit: GeometryToolkit,
+    q_pred: torch.Tensor,
+    q_gt: torch.Tensor,
+    return_deg: bool = True,
+) -> torch.Tensor:
+    return toolkit.rotation_error_from_quat(q_pred, q_gt, return_deg=return_deg)
 __all__ = [
     "GeometryToolkit",
     "add_metric",
