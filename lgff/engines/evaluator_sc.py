@@ -24,22 +24,20 @@ from tqdm import tqdm
 from lgff.utils.config import LGFFConfig
 from lgff.utils.geometry import GeometryToolkit
 from lgff.models.lgff_sc import LGFF_SC
+from lgff.utils.eval_utils import (
+    compute_add_and_adds,
+    ensure_obj_diameter,
+    filter_obs_points,
+    kabsch_umeyama,
+    run_icp_once,
+    safe_mean,
+    safe_percentile,
+    sym_mask_from_cls_ids,
+)
 from lgff.utils.pose_metrics import (
     fuse_pose_from_outputs,
     compute_batch_pose_metrics,
 )
-
-
-def _np_percentile(x: np.ndarray, q: float) -> float:
-    if x.size == 0:
-        return 0.0
-    return float(np.percentile(x, q))
-
-
-def _safe_mean(x: np.ndarray) -> float:
-    if x.size == 0:
-        return 0.0
-    return float(x.mean())
 
 
 class EvaluatorSC:
@@ -204,29 +202,6 @@ class EvaluatorSC:
             getattr(cfg, "sym_class_ids", []),
         )
 
-    def _ensure_obj_diameter(self, model_points: torch.Tensor) -> None:
-        if self.obj_diameter is not None:
-            return
-        B, M, _ = model_points.shape
-        if M <= 1:
-            self.obj_diameter = 0.0
-            return
-        mp0 = model_points[0]
-        dist_mat = torch.cdist(mp0.unsqueeze(0), mp0.unsqueeze(0)).squeeze(0)
-        self.obj_diameter = float(dist_mat.max().item())
-        self.logger.info(f"[EvaluatorSC] Estimated obj_diameter from CAD: {self.obj_diameter:.6f} m")
-
-    def _sym_mask_from_cls_ids(self, cls_ids: Optional[torch.Tensor], B: int, device: torch.device) -> torch.Tensor:
-        sym_ids = torch.as_tensor(getattr(self.cfg, "sym_class_ids", []), device=device)
-        sym_mask = torch.zeros(B, dtype=torch.bool, device=device)
-        if isinstance(cls_ids, torch.Tensor) and sym_ids.numel() > 0:
-            cid = cls_ids
-            if cid.dim() > 1:
-                cid = cid.view(-1)
-            cid = cid.to(device)
-            sym_mask = (cid.unsqueeze(1) == sym_ids.view(1, -1)).any(dim=1)
-        return sym_mask
-
     def _get_bad_threshold_m(self) -> float:
         # priority: abs_th_m > rel_th_d > cmd_threshold_m
         if self.icp_bad_abs_th_m is not None:
@@ -238,33 +213,12 @@ class EvaluatorSC:
         return float(self.cmd_acc_threshold_m)
 
     def _filter_obs_points(self, pts: torch.Tensor) -> torch.Tensor:
-        # pts: [N,3] in camera frame
-        if pts.numel() == 0:
-            return pts
-
-        valid = torch.isfinite(pts).all(dim=1) & (pts.abs().sum(dim=1) > 1e-9)
-        pts = pts[valid]
-        if pts.shape[0] == 0:
-            return pts
-
-        # Z-range filter
-        if self.icp_z_min is not None:
-            pts = pts[pts[:, 2] >= float(self.icp_z_min)]
-        if self.icp_z_max is not None:
-            pts = pts[pts[:, 2] <= float(self.icp_z_max)]
-        if pts.shape[0] == 0:
-            return pts
-
-        # MAD outlier removal (very light & effective for ROI point clouds)
-        if self.icp_obs_mad_k and self.icp_obs_mad_k > 0:
-            center = pts.median(dim=0).values
-            r = torch.norm(pts - center.unsqueeze(0), dim=1)  # [N]
-            med = r.median()
-            mad = (r - med).abs().median().clamp_min(1e-6)
-            keep = (r - med).abs() <= (self.icp_obs_mad_k * mad)
-            pts = pts[keep]
-
-        return pts
+        return filter_obs_points(
+            pts=pts,
+            z_min=self.icp_z_min,
+            z_max=self.icp_z_max,
+            mad_k=self.icp_obs_mad_k,
+        )
 
     # ------------------------------------------------------------------ #
     # ADD / ADD-S fallback (GeometryToolkit)
@@ -275,108 +229,7 @@ class EvaluatorSC:
         gt_rt: torch.Tensor,
         model_points: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        add = self.geometry.compute_add(pred_rt, gt_rt, model_points)     # [B]
-        adds = self.geometry.compute_adds(pred_rt, gt_rt, model_points)   # [B]
-        return add, adds
-
-    # ------------------------------------------------------------------ #
-    # ICP core: Kabsch/Umeyama
-    # ------------------------------------------------------------------ #
-    @staticmethod
-    def _kabsch_umeyama(P: torch.Tensor, Q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        assert P.ndim == 2 and Q.ndim == 2 and P.shape == Q.shape and P.shape[1] == 3
-
-        mu_P = P.mean(dim=0)
-        mu_Q = Q.mean(dim=0)
-        X = P - mu_P
-        Y = Q - mu_Q
-
-        H = X.t() @ Y
-        U, S, Vt = torch.linalg.svd(H, full_matrices=False)
-        V = Vt.transpose(0, 1)
-
-        R = V @ U.transpose(0, 1)
-        if torch.det(R) < 0:
-            V[:, -1] *= -1
-            R = V @ U.transpose(0, 1)
-
-        t = mu_Q - (R @ mu_P)
-        return R, t
-
-    def _run_icp_one(
-        self,
-        rt_init: torch.Tensor,          # [3,4] model->cam
-        obs_points: torch.Tensor,       # [N,3] cam
-        model_points: torch.Tensor,     # [M,3] model
-        iters: int,
-        max_corr_dist: float,
-        trim_ratio: float,
-        sample_model: int,
-        sample_obs: int,
-        min_corr: int,
-    ) -> torch.Tensor:
-        device = rt_init.device
-        dtype = rt_init.dtype
-
-        if obs_points is None or model_points is None:
-            return rt_init
-        if obs_points.ndim != 2 or obs_points.shape[1] != 3:
-            return rt_init
-        if model_points.ndim != 2 or model_points.shape[1] != 3:
-            return rt_init
-
-        obs = obs_points.to(device=device, dtype=dtype)
-        mp = model_points.to(device=device, dtype=dtype)
-
-        if obs.shape[0] < min_corr or mp.shape[0] < 3:
-            return rt_init
-
-        if obs.shape[0] > sample_obs:
-            idx = torch.randperm(obs.shape[0], device=device)[:sample_obs]
-            obs = obs[idx]
-
-        if mp.shape[0] > sample_model:
-            idx = torch.randperm(mp.shape[0], device=device)[:sample_model]
-            mp = mp[idx]
-
-        R = rt_init[:, :3].clone()
-        t = rt_init[:, 3].clone()
-
-        prev_mean = None
-
-        for _ in range(int(iters)):
-            P = mp @ R.transpose(0, 1) + t.unsqueeze(0)  # [m,3]
-
-            D = torch.cdist(P.unsqueeze(0), obs.unsqueeze(0), p=2).squeeze(0)  # [m,n]
-            nn_dist, nn_idx = torch.min(D, dim=1)
-            Q = obs[nn_idx]
-
-            mask = nn_dist < float(max_corr_dist)
-            if mask.sum().item() < min_corr:
-                break
-
-            P_sel = P[mask]
-            Q_sel = Q[mask]
-            d_sel = nn_dist[mask]
-
-            if 0.0 < trim_ratio < 1.0 and P_sel.shape[0] > min_corr:
-                k = max(min_corr, int(P_sel.shape[0] * trim_ratio))
-                topk = torch.topk(d_sel, k=k, largest=False).indices
-                P_sel = P_sel[topk]
-                Q_sel = Q_sel[topk]
-                d_sel = d_sel[topk]
-
-            mean_d = float(d_sel.mean().item())
-            if prev_mean is not None and abs(prev_mean - mean_d) < 1e-5:
-                # converged
-                pass
-            prev_mean = mean_d
-
-            dR, dt = self._kabsch_umeyama(P_sel, Q_sel)
-            R = dR @ R
-            t = dR @ t + dt
-
-        return torch.cat([R, t.view(3, 1)], dim=1)
+        return compute_add_and_adds(self.geometry, pred_rt, gt_rt, model_points)
 
     # ------------------------------------------------------------------ #
     # ICP refinement batch with "refine only bad" gating (BAD metric = ADD by default)
@@ -435,7 +288,11 @@ class EvaluatorSC:
         model_points_b = model_points_b.to(device)
 
         # ensure diameter for rel threshold (used by downstream summaries)
-        self._ensure_obj_diameter(model_points_b)
+        self.obj_diameter = ensure_obj_diameter(
+            model_points=model_points_b,
+            current=self.obj_diameter,
+            logger=self.logger,
+        )
 
         if self.icp_only_when_bad and not self._icp_gating_warned:
             self.logger.warning(
@@ -475,7 +332,7 @@ class EvaluatorSC:
                 if use_schedule:
                     rt_ref = rt_i
                     for corr_d, it_n in zip(corr_schedule, iters_schedule):
-                        rt_ref = self._run_icp_one(
+                        rt_ref = run_icp_once(
                             rt_init=rt_ref,
                             obs_points=pts_i,
                             model_points=mp_i,
@@ -488,7 +345,7 @@ class EvaluatorSC:
                         )
                     refined_list.append(rt_ref)
                 else:
-                    rt_ref = self._run_icp_one(
+                    rt_ref = run_icp_once(
                         rt_init=rt_i,
                         obs_points=pts_i,
                         model_points=mp_i,
@@ -521,7 +378,11 @@ class EvaluatorSC:
         if model_points.dim() == 2:
             model_points = model_points.unsqueeze(0).expand(pred_rt.shape[0], -1, -1)
 
-        self._ensure_obj_diameter(model_points)
+        self.obj_diameter = ensure_obj_diameter(
+            model_points=model_points,
+            current=self.obj_diameter,
+            logger=self.logger,
+        )
         if self.metric_num_points is None:
             self.metric_num_points = int(model_points.shape[1])
 
@@ -590,7 +451,12 @@ class EvaluatorSC:
         rot_np = batch_metrics["rot_err_deg"].detach().cpu().numpy()
         cmd_np = batch_metrics["cmd_acc"].detach().cpu().numpy()
 
-        sym_mask = self._sym_mask_from_cls_ids(cls_ids, B=B, device=pred_rt.device).detach().cpu().numpy().astype(bool)
+        sym_mask = sym_mask_from_cls_ids(
+            cls_ids=cls_ids,
+            sym_class_ids=getattr(self.cfg, "sym_class_ids", []),
+            batch_size=B,
+            device=pred_rt.device,
+        ).detach().cpu().numpy().astype(bool)
         dist_for_cmd_np = np.where(sym_mask, adds_np, add_np)
 
         gt_t = gt_rt[:, :3, 3].detach().cpu().numpy()
@@ -666,35 +532,35 @@ class EvaluatorSC:
 
         summary: Dict[str, float] = {}
 
-        summary["mean_add_s"] = _safe_mean(add_s)
-        summary["mean_add"] = _safe_mean(add)
-        summary["mean_t_err"] = _safe_mean(t_err)
-        summary["mean_t_err_x"] = _safe_mean(tdx)
-        summary["mean_t_err_y"] = _safe_mean(tdy)
-        summary["mean_t_err_z"] = _safe_mean(tdz)
-        summary["mean_rot_err_deg"] = _safe_mean(rot)
+        summary["mean_add_s"] = safe_mean(add_s)
+        summary["mean_add"] = safe_mean(add)
+        summary["mean_t_err"] = safe_mean(t_err)
+        summary["mean_t_err_x"] = safe_mean(tdx)
+        summary["mean_t_err_y"] = safe_mean(tdy)
+        summary["mean_t_err_z"] = safe_mean(tdz)
+        summary["mean_rot_err_deg"] = safe_mean(rot)
         summary["mean_rot_err"] = summary["mean_rot_err_deg"]  # backward compat (deg)
-        summary["mean_cmd_acc"] = _safe_mean(cmd)
+        summary["mean_cmd_acc"] = safe_mean(cmd)
 
-        summary["add_s_p50"] = _np_percentile(add_s, 50)
-        summary["add_s_p75"] = _np_percentile(add_s, 75)
-        summary["add_s_p90"] = _np_percentile(add_s, 90)
-        summary["add_s_p95"] = _np_percentile(add_s, 95)
+        summary["add_s_p50"] = safe_percentile(add_s, 50)
+        summary["add_s_p75"] = safe_percentile(add_s, 75)
+        summary["add_s_p90"] = safe_percentile(add_s, 90)
+        summary["add_s_p95"] = safe_percentile(add_s, 95)
 
-        summary["add_p50"] = _np_percentile(add, 50)
-        summary["add_p75"] = _np_percentile(add, 75)
-        summary["add_p90"] = _np_percentile(add, 90)
-        summary["add_p95"] = _np_percentile(add, 95)
+        summary["add_p50"] = safe_percentile(add, 50)
+        summary["add_p75"] = safe_percentile(add, 75)
+        summary["add_p90"] = safe_percentile(add, 90)
+        summary["add_p95"] = safe_percentile(add, 95)
 
-        summary["t_err_p50"] = _np_percentile(t_err, 50)
-        summary["t_err_p75"] = _np_percentile(t_err, 75)
-        summary["t_err_p90"] = _np_percentile(t_err, 90)
-        summary["t_err_p95"] = _np_percentile(t_err, 95)
+        summary["t_err_p50"] = safe_percentile(t_err, 50)
+        summary["t_err_p75"] = safe_percentile(t_err, 75)
+        summary["t_err_p90"] = safe_percentile(t_err, 90)
+        summary["t_err_p95"] = safe_percentile(t_err, 95)
 
-        summary["rot_err_deg_p50"] = _np_percentile(rot, 50)
-        summary["rot_err_deg_p75"] = _np_percentile(rot, 75)
-        summary["rot_err_deg_p90"] = _np_percentile(rot, 90)
-        summary["rot_err_deg_p95"] = _np_percentile(rot, 95)
+        summary["rot_err_deg_p50"] = safe_percentile(rot, 50)
+        summary["rot_err_deg_p75"] = safe_percentile(rot, 75)
+        summary["rot_err_deg_p90"] = safe_percentile(rot, 90)
+        summary["rot_err_deg_p95"] = safe_percentile(rot, 95)
 
         for th in self.acc_abs_thresholds_m:
             mm = int(round(th * 1000))
