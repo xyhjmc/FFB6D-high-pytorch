@@ -56,11 +56,16 @@ class LGFFConfig:
     resize_h: int = 480
     resize_w: int = 640
     depth_scale: float = 1000.0
+    depth_z_min_m: float = 0.10
+    depth_z_max_m: float = 5.00
+    mask_erosion: int = 1
+    depth_edge_thresh_m: float = 0.0
 
     num_workers: int = 4
     batch_size: int = 8
     num_classes: int = 1
     num_points: int = 1024
+    num_model_points: int = 1024
     num_keypoints: int = 8
     val_split: str = "test"
     # mask handling
@@ -116,6 +121,18 @@ class LGFFConfig:
     point_norm: str = "bn"
     point_use_se: bool = True
     point_dropout: float = 0.0
+    pc_centering: bool = True
+    pc_scale_norm: bool = True
+
+    gate_mode: str = "channel"
+    gate_hidden: int = 128
+    split_fusion_heads: bool = False
+    gate_hidden_rot: int = 128
+    gate_hidden_tc: int = 128
+
+    conf_detach_trunk: bool = False
+    kp_of_detach_trunk: bool = False
+    init_z_bias: float = 0.7
 
     head_hidden_dim: int = 128
     head_feat_dim: int = 64
@@ -140,6 +157,9 @@ class LGFFConfig:
     # [NEW] 可选：专门抑制 z 轴 bias 的附加分支（你做消融时用）
     # - 默认 0.0：完全不启用，不影响旧实验复现
     lambda_t_bias_z: float = 0.0
+    t_bias_z_mode: str = "batch_mean"
+    t_bias_beta: float = 0.005
+    rot_geodesic_eps: float = 1e-6
 
     # [NEW] z-bias 的形式开关：True -> 用 |bias_z|；False -> 用 bias_z（带符号）
     # - 建议默认 True（数值更稳定、方向不敏感），但你可做消融
