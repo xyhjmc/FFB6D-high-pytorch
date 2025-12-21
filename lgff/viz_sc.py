@@ -649,7 +649,7 @@ def main() -> None:
                 add = float(batch_metrics["add"][0])
                 add_s = float(batch_metrics["add_s"][0])
                 t_err = float(batch_metrics["t_err"][0])
-                rot_err = float(batch_metrics["rot_err"][0])
+                rot_err = float(batch_metrics.get("rot_err_deg", batch_metrics.get("rot_err", [0]))[0])
                 is_sym = cls_id in sym_class_ids
 
                 csv_values = None

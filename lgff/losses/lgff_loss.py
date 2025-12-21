@@ -382,6 +382,8 @@ class LGFFLoss(nn.Module):
                 "loss_t_bias_z": float(loss_t_bias_z.item()),
                 "lambda_t_bias_z": float(lambda_t_bias_z),
                 "t_bias_z_batch": float(diff_t[:, 2].mean().item()),
+                "num_sym_in_batch": float(sym_mask.sum().item()),
+                "rot_sym_ignored_count": float(sym_mask.sum().item()) if self.lambda_rot > 0 else 0.0,
 
             }
 

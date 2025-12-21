@@ -246,6 +246,7 @@ class TrainerSC:
     # ------------------------------------------------------------------
     def fit(self) -> None:
         self.logger.info(f"Start training on device: {self.device}")
+        self._log_resolved_policies()
 
         epochs = getattr(self.cfg, "epochs", 50)
 
@@ -341,12 +342,12 @@ class TrainerSC:
 
             # 顺带把统一指标中的 mean_add_s / mean_rot_err 打印一下（如果存在）
             mean_add_s_val = val_metrics.get("mean_add_s", float("nan"))
-            mean_rot_err_val = val_metrics.get("mean_rot_err", float("nan"))
+            mean_rot_err_val = val_metrics.get("mean_rot_err_deg", val_metrics.get("mean_rot_err", float("nan")))
             extra_pose_val = ""
             if math.isfinite(float(mean_add_s_val)) and math.isfinite(float(mean_rot_err_val)):
                 extra_pose_val = (
                     f" | Val mean_add_s={mean_add_s_val:.4f}, "
-                    f"mean_rot_err={mean_rot_err_val:.2f}"
+                    f"mean_rot_err_deg={mean_rot_err_val:.2f}"
                 )
 
             self.logger.info(
@@ -499,7 +500,7 @@ class TrainerSC:
             "t_err_x": [],
             "t_err_y": [],
             "t_err_z": [],
-            "rot_err": [],
+            "rot_err_deg": [],
             "cmd_acc": [],
         }
 
@@ -867,6 +868,27 @@ class TrainerSC:
             f"Resumed from epoch {self.start_epoch}, "
             f"best_val_loss={self.best_val_loss:.6f}, "
             f"global_step={self.global_step}"
+        )
+
+    # ------------------------------------------------------------------
+    def _log_resolved_policies(self) -> None:
+        self.logger.info(
+            "[TrainerSC][Policy] mask_invalid_policy=%s | allow_mask_fallback=%s",
+            getattr(self.cfg, "mask_invalid_policy", "skip"),
+            getattr(self.cfg, "allow_mask_fallback", False),
+        )
+        self.logger.info(
+            "[TrainerSC][Policy] fusion_train_use_best_point=%s | train_topk=%s | pose_fusion_topk=%s | eval_use_best_point=%s",
+            getattr(self.cfg, "train_use_best_point", None),
+            getattr(self.cfg, "train_topk", None),
+            getattr(self.cfg, "pose_fusion_topk", None),
+            getattr(self.cfg, "eval_use_best_point", True),
+        )
+        self.logger.info(
+            "[TrainerSC][Policy] sym_class_ids(BOP obj_id)=%s | icp_num_points=%s | icp_use_full_depth=%s",
+            getattr(self.cfg, "sym_class_ids", []),
+            getattr(self.cfg, "icp_num_points", None),
+            getattr(self.cfg, "icp_use_full_depth", None),
         )
 
 
