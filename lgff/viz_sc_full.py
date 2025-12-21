@@ -417,7 +417,7 @@ def _compute_metrics_safe(
             m["add_s"] = adds_fb.detach().cpu()
 
     # Ensure common keys exist to avoid KeyError in visualization
-    for k in ["t_err", "rot_err_deg"]:
+    for k in ["t_err", "rot_err"]:
         if k not in m:
             m[k] = torch.zeros((1,), dtype=torch.float32)
     return m
@@ -666,7 +666,7 @@ def main() -> None:
                 add = float(metrics_ref["add"][0])
                 add_s = float(metrics_ref["add_s"][0])
                 t_err = float(metrics_ref["t_err"][0])
-                rot_err = float(metrics_ref.get("rot_err_deg", metrics_ref.get("rot_err", [0]))[0])
+                rot_err = float(metrics_ref["rot_err"][0])
 
                 # optional coarse metrics for debug
                 add0 = add_s0 = t_err0 = rot0 = None
@@ -683,7 +683,7 @@ def main() -> None:
                     add0 = float(metrics_coarse["add"][0])
                     add_s0 = float(metrics_coarse["add_s"][0])
                     t_err0 = float(metrics_coarse["t_err"][0])
-                    rot0 = float(metrics_coarse.get("rot_err_deg", metrics_coarse.get("rot_err", [0]))[0])
+                    rot0 = float(metrics_coarse["rot_err"][0])
 
                 # csv compare
                 csv_values = None

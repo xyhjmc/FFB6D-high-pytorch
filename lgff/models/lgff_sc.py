@@ -384,9 +384,6 @@ class LGFF_SC(LGFFBase):
             kp_of_raw = self.kp_of_head(kp_in)  # [B, 3K, N]
             kp_of_raw = kp_of_raw.view(B, self.num_keypoints, 3, N)
             pred_kp_ofs = kp_of_raw.permute(0, 1, 3, 2).contiguous()  # [B, K, N, 3]
-        else:
-            # 保持输出键存在，便于下游调试/可视化的健壮性
-            pred_kp_ofs = points.new_zeros((B, self.num_keypoints, N, 3))
 
         # # 先 reshape 成 [B, K, 3, N] 再转成 [B, K, N, 3]，方便直接给 OFLoss 用
         # kp_of_raw = kp_of_raw.view(
@@ -399,7 +396,6 @@ class LGFF_SC(LGFFBase):
             "pred_trans": pred_t,
             "pred_conf": pred_c,
             "pred_kp_ofs": pred_kp_ofs,   # [B, K, N, 3] for OFLoss
-            "kp_of_enabled": lambda_kp_of > 0.0,
             "points": points,             # 方便 Loss / Eval 使用
         }
 

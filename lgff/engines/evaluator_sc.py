@@ -6,7 +6,7 @@ Key additions in this version:
 - Provide accuracy-vs-threshold curves for BOTH add and add_s.
 - Per-image CSV includes succ_add_* flags analogous to succ_adds_*.
 - Robust fallback if compute_batch_pose_metrics misses 'add'/'add_s'.
- - [ICP] Configurable; GT-driven gating removed to avoid leakage. Uses dedicated ICP point clouds if provided.
+- [ICP] Configurable, robust, "refine only bad" by default, bad-metric can be ADD.
 """
 
 from __future__ import annotations
@@ -24,21 +24,22 @@ from tqdm import tqdm
 from lgff.utils.config import LGFFConfig
 from lgff.utils.geometry import GeometryToolkit
 from lgff.models.lgff_sc import LGFF_SC
-from lgff.utils.eval_utils import (
-    compute_add_and_adds,
-    ensure_obj_diameter,
-    filter_obs_points,
-    kabsch_umeyama,
-    run_icp_once,
-    safe_mean,
-    safe_percentile,
-    sym_mask_from_cls_ids,
-)
 from lgff.utils.pose_metrics import (
     fuse_pose_from_outputs,
     compute_batch_pose_metrics,
-    describe_fusion_policy,
 )
+
+
+def _np_percentile(x: np.ndarray, q: float) -> float:
+    if x.size == 0:
+        return 0.0
+    return float(np.percentile(x, q))
+
+
+def _safe_mean(x: np.ndarray) -> float:
+    if x.size == 0:
+        return 0.0
+    return float(x.mean())
 
 
 class EvaluatorSC:
@@ -74,9 +75,8 @@ class EvaluatorSC:
             "t_err_x": [],
             "t_err_y": [],
             "t_err_z": [],
-            "rot_err_deg": [],
+            "rot_err": [],
             "cmd_acc": [],
-            "rot_err_deg_valid": [],
         }
 
         # obj diameter (m)
@@ -101,7 +101,6 @@ class EvaluatorSC:
         # per-image
         self.per_image_records: List[Dict[str, Any]] = []
         self.sample_counter: int = 0
-        self._icp_gating_warned: bool = False
 
         # ===== ICP config (all via cfg) =====
         self.icp_enable: bool = bool(getattr(cfg, "icp_enable", False))
@@ -121,14 +120,6 @@ class EvaluatorSC:
         self.icp_sample_model: int = int(getattr(cfg, "icp_sample_model", 512))
         self.icp_sample_obs: int = int(getattr(cfg, "icp_sample_obs", 2048))
         self.icp_min_corr: int = int(getattr(cfg, "icp_min_corr", 50))
-        self.icp_point_source_resolved: Optional[str] = getattr(cfg, "icp_point_source", None)
-        self.icp_num_points_effective: Optional[int] = None
-        self.metric_num_points: Optional[int] = None
-        self.icp_policy: str = "always_run" if self.icp_enable else "disabled"
-        self._icp_deprecated_warned: bool = False
-        if bool(getattr(cfg, "icp_only_when_bad", False)) or getattr(cfg, "icp_bad_abs_th_m", None) is not None or getattr(cfg, "icp_bad_rel_th_d", None) is not None or str(getattr(cfg, "icp_bad_metric", "add")).lower() != "add":
-            self._icp_deprecated_warned = True
-            self.logger.warning("[EvaluatorSC][ICP] icp_only_when_bad / icp_bad_* are deprecated and ignored (policy=always_run).")
 
         # Optional point filtering
         self.icp_z_min: Optional[float] = getattr(cfg, "icp_z_min", None)  # e.g. 0.1
@@ -144,7 +135,6 @@ class EvaluatorSC:
     def run(self) -> Dict[str, float]:
         self.model.eval()
         self.logger.info(f"Start Evaluation on {len(self.test_loader)} batches...")
-        self._log_resolved_policies()
 
         for k in self.metrics_meter:
             self.metrics_meter[k] = []
@@ -181,29 +171,28 @@ class EvaluatorSC:
     # ------------------------------------------------------------------ #
     # Utilities
     # ------------------------------------------------------------------ #
-    def _log_resolved_policies(self) -> None:
-        cfg = self.cfg
-        fusion_policy = describe_fusion_policy(cfg, "eval", num_points=getattr(cfg, "num_points", None))
-        self.logger.info(
-            "[EvaluatorSC][Policy] icp_policy=%s | icp_enable=%s | icp_num_points=%s | icp_point_source=%s",
-            self.icp_policy,
-            self.icp_enable,
-            getattr(cfg, "icp_num_points", None),
-            self.icp_point_source_resolved or ("points_icp" if getattr(cfg, "icp_use_full_depth", True) else "points"),
-        )
-        self.logger.info(
-            "[EvaluatorSC][Policy] fusion_mode=%s | use_best_point=%s | effective_topk=%s | topk_ignored=%s",
-            fusion_policy.get("fusion_mode"),
-            fusion_policy.get("use_best_point"),
-            fusion_policy.get("effective_topk"),
-            fusion_policy.get("topk_ignored"),
-        )
-        self.logger.info(
-            "[EvaluatorSC][Policy] mask_invalid_policy=%s | allow_mask_fallback=%s | sym_class_ids(BOP obj_id)=%s",
-            getattr(cfg, "mask_invalid_policy", "skip"),
-            getattr(cfg, "allow_mask_fallback", False),
-            getattr(cfg, "sym_class_ids", []),
-        )
+    def _ensure_obj_diameter(self, model_points: torch.Tensor) -> None:
+        if self.obj_diameter is not None:
+            return
+        B, M, _ = model_points.shape
+        if M <= 1:
+            self.obj_diameter = 0.0
+            return
+        mp0 = model_points[0]
+        dist_mat = torch.cdist(mp0.unsqueeze(0), mp0.unsqueeze(0)).squeeze(0)
+        self.obj_diameter = float(dist_mat.max().item())
+        self.logger.info(f"[EvaluatorSC] Estimated obj_diameter from CAD: {self.obj_diameter:.6f} m")
+
+    def _sym_mask_from_cls_ids(self, cls_ids: Optional[torch.Tensor], B: int, device: torch.device) -> torch.Tensor:
+        sym_ids = torch.as_tensor(getattr(self.cfg, "sym_class_ids", []), device=device)
+        sym_mask = torch.zeros(B, dtype=torch.bool, device=device)
+        if isinstance(cls_ids, torch.Tensor) and sym_ids.numel() > 0:
+            cid = cls_ids
+            if cid.dim() > 1:
+                cid = cid.view(-1)
+            cid = cid.to(device)
+            sym_mask = (cid.unsqueeze(1) == sym_ids.view(1, -1)).any(dim=1)
+        return sym_mask
 
     def _get_bad_threshold_m(self) -> float:
         # priority: abs_th_m > rel_th_d > cmd_threshold_m
@@ -216,12 +205,33 @@ class EvaluatorSC:
         return float(self.cmd_acc_threshold_m)
 
     def _filter_obs_points(self, pts: torch.Tensor) -> torch.Tensor:
-        return filter_obs_points(
-            pts=pts,
-            z_min=self.icp_z_min,
-            z_max=self.icp_z_max,
-            mad_k=self.icp_obs_mad_k,
-        )
+        # pts: [N,3] in camera frame
+        if pts.numel() == 0:
+            return pts
+
+        valid = torch.isfinite(pts).all(dim=1) & (pts.abs().sum(dim=1) > 1e-9)
+        pts = pts[valid]
+        if pts.shape[0] == 0:
+            return pts
+
+        # Z-range filter
+        if self.icp_z_min is not None:
+            pts = pts[pts[:, 2] >= float(self.icp_z_min)]
+        if self.icp_z_max is not None:
+            pts = pts[pts[:, 2] <= float(self.icp_z_max)]
+        if pts.shape[0] == 0:
+            return pts
+
+        # MAD outlier removal (very light & effective for ROI point clouds)
+        if self.icp_obs_mad_k and self.icp_obs_mad_k > 0:
+            center = pts.median(dim=0).values
+            r = torch.norm(pts - center.unsqueeze(0), dim=1)  # [N]
+            med = r.median()
+            mad = (r - med).abs().median().clamp_min(1e-6)
+            keep = (r - med).abs() <= (self.icp_obs_mad_k * mad)
+            pts = pts[keep]
+
+        return pts
 
     # ------------------------------------------------------------------ #
     # ADD / ADD-S fallback (GeometryToolkit)
@@ -232,7 +242,108 @@ class EvaluatorSC:
         gt_rt: torch.Tensor,
         model_points: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return compute_add_and_adds(self.geometry, pred_rt, gt_rt, model_points)
+        add = self.geometry.compute_add(pred_rt, gt_rt, model_points)     # [B]
+        adds = self.geometry.compute_adds(pred_rt, gt_rt, model_points)   # [B]
+        return add, adds
+
+    # ------------------------------------------------------------------ #
+    # ICP core: Kabsch/Umeyama
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _kabsch_umeyama(P: torch.Tensor, Q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        assert P.ndim == 2 and Q.ndim == 2 and P.shape == Q.shape and P.shape[1] == 3
+
+        mu_P = P.mean(dim=0)
+        mu_Q = Q.mean(dim=0)
+        X = P - mu_P
+        Y = Q - mu_Q
+
+        H = X.t() @ Y
+        U, S, Vt = torch.linalg.svd(H, full_matrices=False)
+        V = Vt.transpose(0, 1)
+
+        R = V @ U.transpose(0, 1)
+        if torch.det(R) < 0:
+            V[:, -1] *= -1
+            R = V @ U.transpose(0, 1)
+
+        t = mu_Q - (R @ mu_P)
+        return R, t
+
+    def _run_icp_one(
+        self,
+        rt_init: torch.Tensor,          # [3,4] model->cam
+        obs_points: torch.Tensor,       # [N,3] cam
+        model_points: torch.Tensor,     # [M,3] model
+        iters: int,
+        max_corr_dist: float,
+        trim_ratio: float,
+        sample_model: int,
+        sample_obs: int,
+        min_corr: int,
+    ) -> torch.Tensor:
+        device = rt_init.device
+        dtype = rt_init.dtype
+
+        if obs_points is None or model_points is None:
+            return rt_init
+        if obs_points.ndim != 2 or obs_points.shape[1] != 3:
+            return rt_init
+        if model_points.ndim != 2 or model_points.shape[1] != 3:
+            return rt_init
+
+        obs = obs_points.to(device=device, dtype=dtype)
+        mp = model_points.to(device=device, dtype=dtype)
+
+        if obs.shape[0] < min_corr or mp.shape[0] < 3:
+            return rt_init
+
+        if obs.shape[0] > sample_obs:
+            idx = torch.randperm(obs.shape[0], device=device)[:sample_obs]
+            obs = obs[idx]
+
+        if mp.shape[0] > sample_model:
+            idx = torch.randperm(mp.shape[0], device=device)[:sample_model]
+            mp = mp[idx]
+
+        R = rt_init[:, :3].clone()
+        t = rt_init[:, 3].clone()
+
+        prev_mean = None
+
+        for _ in range(int(iters)):
+            P = mp @ R.transpose(0, 1) + t.unsqueeze(0)  # [m,3]
+
+            D = torch.cdist(P.unsqueeze(0), obs.unsqueeze(0), p=2).squeeze(0)  # [m,n]
+            nn_dist, nn_idx = torch.min(D, dim=1)
+            Q = obs[nn_idx]
+
+            mask = nn_dist < float(max_corr_dist)
+            if mask.sum().item() < min_corr:
+                break
+
+            P_sel = P[mask]
+            Q_sel = Q[mask]
+            d_sel = nn_dist[mask]
+
+            if 0.0 < trim_ratio < 1.0 and P_sel.shape[0] > min_corr:
+                k = max(min_corr, int(P_sel.shape[0] * trim_ratio))
+                topk = torch.topk(d_sel, k=k, largest=False).indices
+                P_sel = P_sel[topk]
+                Q_sel = Q_sel[topk]
+                d_sel = d_sel[topk]
+
+            mean_d = float(d_sel.mean().item())
+            if prev_mean is not None and abs(prev_mean - mean_d) < 1e-5:
+                # converged
+                pass
+            prev_mean = mean_d
+
+            dR, dt = self._kabsch_umeyama(P_sel, Q_sel)
+            R = dR @ R
+            t = dR @ t + dt
+
+        return torch.cat([R, t.view(3, 1)], dim=1)
 
     # ------------------------------------------------------------------ #
     # ICP refinement batch with "refine only bad" gating (BAD metric = ADD by default)
@@ -244,10 +355,8 @@ class EvaluatorSC:
         device = pred_rt.device
         B = pred_rt.shape[0]
 
-        # obs points (prefer dedicated ICP sampling)
-        obs_points = batch.get("points_icp", None)
-        if obs_points is None:
-            obs_points = batch.get("points", None)
+        # obs points
+        obs_points = batch.get("points", None)
         if obs_points is None:
             obs_points = batch.get("point_cloud", None)
         if obs_points is None or not isinstance(obs_points, torch.Tensor):
@@ -261,13 +370,6 @@ class EvaluatorSC:
             self.logger.warning(f"[EvaluatorSC][ICP] obs_points dim={obs_points.dim()} invalid, skip ICP.")
             return pred_rt
         obs_points = obs_points.to(device)
-        if self.icp_num_points_effective is None:
-            self.icp_num_points_effective = int(obs_points.shape[1])
-        if self.icp_point_source_resolved is None:
-            if "points_icp" in batch:
-                self.icp_point_source_resolved = "points_icp_full_depth" if bool(getattr(self.cfg, "icp_use_full_depth", True)) else "points_icp_roi"
-            else:
-                self.icp_point_source_resolved = "points"
 
         # optional labels (foreground mask)
         labels = batch.get("labels", None)
@@ -290,19 +392,35 @@ class EvaluatorSC:
             model_points_b = model_points_b.unsqueeze(0).expand(B, -1, -1)
         model_points_b = model_points_b.to(device)
 
-        # ensure diameter for rel threshold (used by downstream summaries)
-        self.obj_diameter = ensure_obj_diameter(
-            model_points=model_points_b,
-            current=self.obj_diameter,
-            logger=self.logger,
-        )
+        # ensure diameter for rel threshold
+        self._ensure_obj_diameter(model_points_b)
 
-        if self.icp_only_when_bad and not self._icp_gating_warned:
-            self.logger.warning(
-                "[EvaluatorSC][ICP] icp_only_when_bad enabled, but GT-based gating removed; "
-                "running ICP on all samples."
-            )
-            self._icp_gating_warned = True
+        # compute coarse add/adds for gating (fast, pure geometry)
+        gt_rt = batch.get("pose", None)
+        if not isinstance(gt_rt, torch.Tensor):
+            # if no GT available, cannot gate by error -> fallback: no ICP (safer)
+            self.logger.warning("[EvaluatorSC][ICP] No GT pose in batch, skip ICP gating -> skip ICP.")
+            return pred_rt
+        gt_rt = gt_rt.to(device)
+
+        add_coarse = self.geometry.compute_add(pred_rt, gt_rt, model_points_b)    # [B]
+        adds_coarse = self.geometry.compute_adds(pred_rt, gt_rt, model_points_b) # [B]
+
+        cls_ids = batch.get("cls_id", None)
+        sym_mask = self._sym_mask_from_cls_ids(cls_ids, B=B, device=device)  # [B]
+
+        dist_for_cmd = torch.where(sym_mask, adds_coarse, add_coarse)  # [B]
+
+        # choose gating metric
+        if self.icp_bad_metric == "adds":
+            metric = adds_coarse
+        elif self.icp_bad_metric == "dist_for_cmd":
+            metric = dist_for_cmd
+        else:
+            metric = add_coarse  # default 'add'
+
+        bad_th = self._get_bad_threshold_m()
+
         # ICP schedule
         corr_schedule = self.icp_corr_schedule_m
         iters_schedule = self.icp_iters_schedule
@@ -315,6 +433,16 @@ class EvaluatorSC:
 
         for i in range(B):
             rt_i = pred_rt[i]
+
+            # gating
+            if self.icp_only_when_bad:
+                if metric.dim() == 0:
+                    m_i = float(metric.detach().cpu().item())
+                else:
+                    m_i = float(metric[i].detach().cpu().item())
+                if m_i <= bad_th:
+                    refined_list.append(rt_i)
+                    continue
 
             pts_i = obs_points[i]  # [N,3]
             if labels is not None:
@@ -335,7 +463,7 @@ class EvaluatorSC:
                 if use_schedule:
                     rt_ref = rt_i
                     for corr_d, it_n in zip(corr_schedule, iters_schedule):
-                        rt_ref = run_icp_once(
+                        rt_ref = self._run_icp_one(
                             rt_init=rt_ref,
                             obs_points=pts_i,
                             model_points=mp_i,
@@ -348,7 +476,7 @@ class EvaluatorSC:
                         )
                     refined_list.append(rt_ref)
                 else:
-                    rt_ref = run_icp_once(
+                    rt_ref = self._run_icp_one(
                         rt_init=rt_i,
                         obs_points=pts_i,
                         model_points=mp_i,
@@ -381,13 +509,7 @@ class EvaluatorSC:
         if model_points.dim() == 2:
             model_points = model_points.unsqueeze(0).expand(pred_rt.shape[0], -1, -1)
 
-        self.obj_diameter = ensure_obj_diameter(
-            model_points=model_points,
-            current=self.obj_diameter,
-            logger=self.logger,
-        )
-        if self.metric_num_points is None:
-            self.metric_num_points = int(model_points.shape[1])
+        self._ensure_obj_diameter(model_points)
 
         cls_ids = batch.get("cls_id", None)
         batch_metrics = compute_batch_pose_metrics(
@@ -410,18 +532,13 @@ class EvaluatorSC:
                 batch_metrics["add_s"] = adds_fb
 
         # ensure other keys exist
-        for k in ["t_err", "t_err_x", "t_err_y", "t_err_z", "rot_err_deg", "cmd_acc", "rot_err", "rot_err_deg_valid"]:
+        for k in ["t_err", "t_err_x", "t_err_y", "t_err_z", "rot_err", "cmd_acc"]:
             if k not in batch_metrics:
                 batch_metrics[k] = torch.zeros((pred_rt.shape[0],), dtype=torch.float32, device=pred_rt.device)
 
         # ---------------- global meter (SAFE: to cpu) ----------------
         for name, tensor_1d in batch_metrics.items():
             if not isinstance(tensor_1d, torch.Tensor):
-                continue
-            if name == "rot_err":
-                if not getattr(self, "_rot_legacy_warned", False):
-                    self.logger.warning("[EvaluatorSC] 'rot_err' is deprecated; values are degrees and mirrored in 'rot_err_deg'.")
-                    self._rot_legacy_warned = True
                 continue
             arr = tensor_1d.detach().cpu().numpy()
             if name not in self.metrics_meter:
@@ -432,9 +549,6 @@ class EvaluatorSC:
         B = pred_rt.shape[0]
         scene_ids = batch["scene_id"].detach().cpu().numpy() if "scene_id" in batch else None
         im_ids = batch["im_id"].detach().cpu().numpy() if "im_id" in batch else None
-        mask_status_batch = batch.get("mask_status", None)
-        if isinstance(mask_status_batch, torch.Tensor):
-            mask_status_batch = mask_status_batch.cpu().tolist()
 
         cls_id_arr = None
         if isinstance(cls_ids, torch.Tensor):
@@ -451,15 +565,10 @@ class EvaluatorSC:
         tdx_np = batch_metrics["t_err_x"].detach().cpu().numpy()
         tdy_np = batch_metrics["t_err_y"].detach().cpu().numpy()
         tdz_np = batch_metrics["t_err_z"].detach().cpu().numpy()
-        rot_np = batch_metrics["rot_err_deg"].detach().cpu().numpy()
+        rot_np = batch_metrics["rot_err"].detach().cpu().numpy()
         cmd_np = batch_metrics["cmd_acc"].detach().cpu().numpy()
 
-        sym_mask = sym_mask_from_cls_ids(
-            cls_ids=cls_ids,
-            sym_class_ids=getattr(self.cfg, "sym_class_ids", []),
-            batch_size=B,
-            device=pred_rt.device,
-        ).detach().cpu().numpy().astype(bool)
+        sym_mask = self._sym_mask_from_cls_ids(cls_ids, B=B, device=pred_rt.device).detach().cpu().numpy().astype(bool)
         dist_for_cmd_np = np.where(sym_mask, adds_np, add_np)
 
         gt_t = gt_rt[:, :3, 3].detach().cpu().numpy()
@@ -507,7 +616,6 @@ class EvaluatorSC:
                 "pred_tx": float(pred_t[i, 0]),
                 "pred_ty": float(pred_t[i, 1]),
                 "pred_tz": float(pred_t[i, 2]),
-                "mask_status": str(mask_status_batch[i] if mask_status_batch is not None else "unknown"),
             }
 
             for k, arr in abs_flags_add.items():
@@ -530,40 +638,39 @@ class EvaluatorSC:
         tdx = np.asarray(self.metrics_meter.get("t_err_x", []), dtype=np.float64)
         tdy = np.asarray(self.metrics_meter.get("t_err_y", []), dtype=np.float64)
         tdz = np.asarray(self.metrics_meter.get("t_err_z", []), dtype=np.float64)
-        rot = np.asarray(self.metrics_meter.get("rot_err_deg", []), dtype=np.float64)
+        rot = np.asarray(self.metrics_meter.get("rot_err", []), dtype=np.float64)
         cmd = np.asarray(self.metrics_meter.get("cmd_acc", []), dtype=np.float64)
 
         summary: Dict[str, float] = {}
 
-        summary["mean_add_s"] = safe_mean(add_s)
-        summary["mean_add"] = safe_mean(add)
-        summary["mean_t_err"] = safe_mean(t_err)
-        summary["mean_t_err_x"] = safe_mean(tdx)
-        summary["mean_t_err_y"] = safe_mean(tdy)
-        summary["mean_t_err_z"] = safe_mean(tdz)
-        summary["mean_rot_err_deg"] = safe_mean(rot)
-        summary["mean_rot_err"] = summary["mean_rot_err_deg"]  # backward compat (deg)
-        summary["mean_cmd_acc"] = safe_mean(cmd)
+        summary["mean_add_s"] = _safe_mean(add_s)
+        summary["mean_add"] = _safe_mean(add)
+        summary["mean_t_err"] = _safe_mean(t_err)
+        summary["mean_t_err_x"] = _safe_mean(tdx)
+        summary["mean_t_err_y"] = _safe_mean(tdy)
+        summary["mean_t_err_z"] = _safe_mean(tdz)
+        summary["mean_rot_err"] = _safe_mean(rot)
+        summary["mean_cmd_acc"] = _safe_mean(cmd)
 
-        summary["add_s_p50"] = safe_percentile(add_s, 50)
-        summary["add_s_p75"] = safe_percentile(add_s, 75)
-        summary["add_s_p90"] = safe_percentile(add_s, 90)
-        summary["add_s_p95"] = safe_percentile(add_s, 95)
+        summary["add_s_p50"] = _np_percentile(add_s, 50)
+        summary["add_s_p75"] = _np_percentile(add_s, 75)
+        summary["add_s_p90"] = _np_percentile(add_s, 90)
+        summary["add_s_p95"] = _np_percentile(add_s, 95)
 
-        summary["add_p50"] = safe_percentile(add, 50)
-        summary["add_p75"] = safe_percentile(add, 75)
-        summary["add_p90"] = safe_percentile(add, 90)
-        summary["add_p95"] = safe_percentile(add, 95)
+        summary["add_p50"] = _np_percentile(add, 50)
+        summary["add_p75"] = _np_percentile(add, 75)
+        summary["add_p90"] = _np_percentile(add, 90)
+        summary["add_p95"] = _np_percentile(add, 95)
 
-        summary["t_err_p50"] = safe_percentile(t_err, 50)
-        summary["t_err_p75"] = safe_percentile(t_err, 75)
-        summary["t_err_p90"] = safe_percentile(t_err, 90)
-        summary["t_err_p95"] = safe_percentile(t_err, 95)
+        summary["t_err_p50"] = _np_percentile(t_err, 50)
+        summary["t_err_p75"] = _np_percentile(t_err, 75)
+        summary["t_err_p90"] = _np_percentile(t_err, 90)
+        summary["t_err_p95"] = _np_percentile(t_err, 95)
 
-        summary["rot_err_deg_p50"] = safe_percentile(rot, 50)
-        summary["rot_err_deg_p75"] = safe_percentile(rot, 75)
-        summary["rot_err_deg_p90"] = safe_percentile(rot, 90)
-        summary["rot_err_deg_p95"] = safe_percentile(rot, 95)
+        summary["rot_err_deg_p50"] = _np_percentile(rot, 50)
+        summary["rot_err_deg_p75"] = _np_percentile(rot, 75)
+        summary["rot_err_deg_p90"] = _np_percentile(rot, 90)
+        summary["rot_err_deg_p95"] = _np_percentile(rot, 95)
 
         for th in self.acc_abs_thresholds_m:
             mm = int(round(th * 1000))
@@ -573,12 +680,6 @@ class EvaluatorSC:
         obj_d = float(self.obj_diameter) if self.obj_diameter is not None else 0.0
         summary["obj_diameter"] = obj_d
         summary["cmd_threshold_m"] = float(self.cmd_acc_threshold_m)
-        summary["fusion_eval_use_best_point"] = bool(getattr(self.cfg, "eval_use_best_point", True))
-        summary["eval_topk"] = getattr(self.cfg, "eval_topk", None)
-        summary["pose_fusion_topk"] = getattr(self.cfg, "pose_fusion_topk", None)
-        summary["mask_invalid_policy"] = getattr(self.cfg, "mask_invalid_policy", "skip")
-        summary["allow_mask_fallback"] = bool(getattr(self.cfg, "allow_mask_fallback", False))
-        summary["sym_class_ids"] = getattr(self.cfg, "sym_class_ids", [])
 
         if obj_d > 0:
             for alpha in self.acc_rel_thresholds_d:
@@ -590,11 +691,6 @@ class EvaluatorSC:
                 summary["acc_add_0.1d"] = summary.get("acc_add<0.100d", 0.0)
                 summary["acc_adds_0.1d"] = summary.get("acc_adds<0.100d", 0.0)
 
-        summary["icp_policy"] = self.icp_policy
-        summary["icp_num_points"] = self.icp_num_points_effective or getattr(self.cfg, "icp_num_points", None)
-        summary["icp_point_source"] = self.icp_point_source_resolved or ("points_icp" if getattr(self.cfg, "icp_use_full_depth", True) else "points")
-        summary["icp_use_full_depth"] = bool(getattr(self.cfg, "icp_use_full_depth", True))
-        summary["metric_num_points"] = self.metric_num_points
         self.logger.info(f"Evaluation Summary: {summary}")
         return summary
 

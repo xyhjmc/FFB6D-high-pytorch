@@ -12,7 +12,6 @@ dataset_root: "/home/xyh/PycharmProjects/FFB6D-high-pytorch/lgff/data/linemod_ap
 
 obj_id: 1
 num_points: 1024
-num_model_points: 1024
 num_keypoints: 8
 val_split: "test"               # 与裁剪脚本输出的 split 对齐
 
@@ -22,16 +21,6 @@ resize_w: 128
 
 # 深度缩放（BOP 默认毫米 -> 米）
 depth_scale: 1000.0
-depth_z_min_m: 0.10
-depth_z_max_m: 5.00
-mask_erosion: 1
-depth_edge_thresh_m: 0.0
-
-# mask / 质量控制
-mask_invalid_policy: "skip"   # "skip" | "raise"
-allow_mask_fallback: false
-forbid_scene_overlap: false
-scene_overlap_policy: "warn"  # "warn" | "raise"
 
 # ---------- Dataloader ----------
 batch_size: 32
@@ -72,25 +61,11 @@ point_hidden_dims: [64, 128]
 point_norm: "bn"
 point_use_se: true
 point_dropout: 0.0
-pc_centering: true
-pc_scale_norm: true
 
 # ---------- Head ----------
 head_hidden_dim: 128
 head_feat_dim: 64
 head_dropout: 0.0
-
-# ---------- Fusion Gate ----------
-gate_mode: "channel"    # "channel" | "point"
-gate_hidden: 128
-split_fusion_heads: false
-gate_hidden_rot: 128
-gate_hidden_tc: 128
-
-# ---------- Head Aux Controls ----------
-conf_detach_trunk: false
-kp_of_detach_trunk: false
-init_z_bias: 0.7
 
 # ======================================================
 # Loss & Symmetry（新：Dense + Rot + CAD + KP 混合）
@@ -106,11 +81,6 @@ lambda_rot: 0.05
 lambda_conf: 0.05
 lambda_add_cad: 0.20
 lambda_kp_of: 0.3 # 先给 0.2，观察 loss_kp_of 曲线与占比
-
-lambda_t_bias_z: 0.0
-t_bias_z_mode: "batch_mean"
-t_bias_beta: 0.005
-rot_geodesic_eps: 1.0e-6
 
 
 t_z_weight: 2.0

@@ -92,9 +92,6 @@ class SingleObjectDataset(Dataset):
         pcld_valid_mask: [N]    bool (extra debug/robustness hook)
     """
 
-    # global registry for overlap checking
-    _split_scene_registry: Dict[str, set] = {}
-
     def __init__(self, cfg: LGFFConfig, split: str = "train") -> None:
         super().__init__()
         self.cfg = cfg
@@ -115,15 +112,6 @@ class SingleObjectDataset(Dataset):
         self.depth_z_max_m = float(getattr(cfg, "depth_z_max_m", 5.00))
         self.mask_erosion = int(getattr(cfg, "mask_erosion", 1))          # 0 to disable
         self.depth_edge_thresh_m = float(getattr(cfg, "depth_edge_thresh_m", 0.0))  # <=0 to disable
-
-        self.mask_invalid_policy = str(getattr(cfg, "mask_invalid_policy", "skip")).lower()
-        self.allow_mask_fallback = bool(getattr(cfg, "allow_mask_fallback", False))
-        self.scene_overlap_policy = str(getattr(cfg, "scene_overlap_policy", "warn")).lower()
-        self.forbid_scene_overlap = bool(getattr(cfg, "forbid_scene_overlap", False))
-
-        # ICP point cloud controls
-        self.icp_num_points = int(getattr(cfg, "icp_num_points", 8192))
-        self.icp_use_full_depth = bool(getattr(cfg, "icp_use_full_depth", True))
 
         # CAD points
         self.num_model_points = int(getattr(cfg, "num_model_points", self.num_points))
@@ -150,15 +138,7 @@ class SingleObjectDataset(Dataset):
         )
 
         self.samples: List[Dict[str, Any]] = []
-        self._total_candidates = 0
-        self._missing_mask = 0
-        self._invalid_mask = 0
-        self._fallback_mask = 0
-        self._mask_fallback_used_count = 0
-        self._fallback_warned = False
-        self.min_mask_nonzero_ratio = float(getattr(cfg, "min_mask_nonzero_ratio", 0.001))
         self._build_index()
-        self._effective_samples = len(self.samples)
 
         if len(self.samples) == 0:
             if self.split == "train":
@@ -176,45 +156,8 @@ class SingleObjectDataset(Dataset):
                 f"[SingleObjectDataset] split={split}, obj_id={self.obj_id}, "
                 f"num_samples={len(self.samples)} | "
                 f"z_range=[{self.depth_z_min_m},{self.depth_z_max_m}]m | "
-                f"erosion={self.mask_erosion} | edge_th={self.depth_edge_thresh_m} | "
-                f"min_mask_nonzero_ratio={self.min_mask_nonzero_ratio}"
+                f"erosion={self.mask_erosion} | edge_th={self.depth_edge_thresh_m}"
             )
-            if self._missing_mask > 0:
-                print(f"[SingleObjectDataset] skipped {self._missing_mask} samples due to missing masks.")
-            if self._invalid_mask > 0:
-                print(f"[SingleObjectDataset] skipped {self._invalid_mask} samples due to invalid masks.")
-            if self._fallback_mask > 0:
-                print(f"[SingleObjectDataset] fallback-to-depth for {self._fallback_mask} samples (allow_mask_fallback=True).")
-
-            # dataset-level stats for mask skip and effectiveness
-            eff_ratio = self._effective_samples / max(1, self._total_candidates)
-            print(
-                f"[SingleObjectDataset][MaskStats] total_targets={self._total_candidates} | "
-                f"effective_samples={self._effective_samples} | "
-                f"missing_mask_skip_count={self._missing_mask} | "
-                f"invalid_mask_skip_count={self._invalid_mask} | "
-                f"fallback_mask_count={self._fallback_mask} | "
-                f"effective_ratio={eff_ratio:.4f}"
-            )
-
-        # optional scene overlap guard
-        if self.forbid_scene_overlap:
-            reg = SingleObjectDataset._split_scene_registry.setdefault(self.split, set())
-            current_scenes = {s["scene_id"] for s in self.samples}
-            reg.update(current_scenes)
-            for other_split, scenes in SingleObjectDataset._split_scene_registry.items():
-                if other_split == self.split:
-                    continue
-                overlap = current_scenes & scenes
-                if overlap:
-                    msg = (
-                        f"[SingleObjectDataset][SceneOverlap] overlap scenes {sorted(overlap)} "
-                        f"between splits '{self.split}' and '{other_split}'"
-                    )
-                    if self.scene_overlap_policy == "raise":
-                        raise RuntimeError(msg)
-                    else:
-                        print(msg)
 
     # ------------------------------------------------------------------
     # Index building
@@ -263,7 +206,6 @@ class SingleObjectDataset(Dataset):
                     if int(gt["obj_id"]) != self.obj_id:
                         continue
 
-                    self._total_candidates += 1
                     R = np.array(gt["cam_R_m2c"], dtype=np.float32).reshape(3, 3)
                     t = np.array(gt["cam_t_m2c"], dtype=np.float32).reshape(3, 1) / 1000.0  # mm->m
                     pose = np.concatenate([R, t], axis=1)  # [3,4]
@@ -283,70 +225,21 @@ class SingleObjectDataset(Dataset):
                     elif mask_full.exists():
                         mask_path = mask_full
 
-                    mask_status = "ok"
+                    if mask_path is None and self.split == "train":
+                        continue
                     if not rgb_path.exists() or not depth_path.exists():
                         continue
-
-                    if mask_path is None:
-                        self._missing_mask += 1
-                        if self.allow_mask_fallback:
-                            mask_status = "fallback_depth"
-                            self._fallback_mask += 1
-                        elif self.mask_invalid_policy == "raise":
-                            raise RuntimeError(
-                                f"[SingleObjectDataset] Mask missing for scene={scene_dir.name}, im_id={im_id}, gt_idx={gt_idx}"
-                            )
-                        else:
-                            print(
-                                f"[SingleObjectDataset][Warning] missing mask for scene={scene_dir.name} "
-                                f"im_id={im_id} gt_idx={gt_idx}, sample skipped."
-                            )
-                            continue
-                    else:
-                        try:
-                            m_img = Image.open(mask_path)
-                            m_arr = np.array(m_img)
-                            if m_arr.ndim == 3:
-                                m_arr = m_arr[..., 0]
-                            nonzero = np.count_nonzero(m_arr)
-                            d_img = Image.open(depth_path)
-                            dw, dh = d_img.size
-                            if m_arr.shape[0] != dh or m_arr.shape[1] != dw:
-                                raise ValueError("mask shape mismatch depth")
-                            ratio = nonzero / float(max(1, m_arr.size))
-                            if ratio < self.min_mask_nonzero_ratio:
-                                raise ValueError(f"mask nonzero ratio too small ({ratio:.6f})")
-                        except Exception as e:
-                            self._invalid_mask += 1
-                            if self.allow_mask_fallback:
-                                mask_status = "fallback_depth"
-                                self._fallback_mask += 1
-                                print(
-                                    f"[SingleObjectDataset][Warning] invalid mask ({e}) for scene={scene_dir.name} "
-                                    f"im_id={im_id} gt_idx={gt_idx}, using depth fallback."
-                                )
-                            elif self.mask_invalid_policy == "raise":
-                                raise RuntimeError(
-                                    f"[SingleObjectDataset] Invalid mask for scene={scene_dir.name}, im_id={im_id}, gt_idx={gt_idx}: {e}"
-                                )
-                            else:
-                                print(
-                                    f"[SingleObjectDataset][Warning] invalid mask for scene={scene_dir.name} "
-                                    f"im_id={im_id} gt_idx={gt_idx}, sample skipped. err={e}"
-                                )
-                                continue
 
                     self.samples.append(
                         {
                             "rgb_path": rgb_path,
                             "depth_path": depth_path,
-                            "mask_path": mask_path if mask_status == "ok" else None,
+                            "mask_path": mask_path,
                             "K": K,
                             "depth_scale": depth_scale_scene,
                             "pose": pose,
                             "scene_id": int(scene_dir.name),
                             "im_id": im_id,
-                            "mask_status": mask_status,
                         }
                     )
 
@@ -441,10 +334,8 @@ class SingleObjectDataset(Dataset):
 
         return depth_m.astype(np.float32), orig_h, orig_w
 
-    def _load_mask(self, path: Optional[Path], depth_m: np.ndarray) -> Optional[np.ndarray]:
-        if path is None:
-            return None
-        try:
+    def _load_mask(self, path: Optional[Path], depth_m: np.ndarray) -> np.ndarray:
+        if path is not None and path.exists():
             m_img = Image.open(path)
             if self.resize_h and self.resize_w:
                 m_img = m_img.resize((self.resize_w, self.resize_h), resample=Image.Resampling.NEAREST)
@@ -452,9 +343,11 @@ class SingleObjectDataset(Dataset):
             if m.ndim == 3:
                 m = m[..., 0]
             mask = (m > 0)
-            return mask.astype(bool)
-        except Exception:
-            return None
+        else:
+            # val/test fallback: depth>0 as "some foreground"
+            mask = (depth_m > 1e-8)
+
+        return mask.astype(bool)
 
     # ------------------------------------------------------------------
     # Robust valid mask (B-1)
@@ -482,47 +375,6 @@ class SingleObjectDataset(Dataset):
             valid = _binary_erosion(valid, radius=self.mask_erosion)
 
         return valid.astype(bool)
-
-    @staticmethod
-    def compute_roi_intrinsic(
-        K: np.ndarray,
-        roi_xywh: Optional[Tuple[int, int, int, int]],
-        out_size: Tuple[int, int],
-        pad_xy: Tuple[int, int] = (0, 0),
-    ) -> np.ndarray:
-        """
-        Apply ROI crop (x0,y0,w,h), optional padding, then resize to out_size.
-        roi_xywh=None is treated as full image (x0=y0=0, w/h derived from K center and scale assumptions).
-        """
-        K_scaled = K.astype(np.float32).copy()
-        x0, y0, w_roi, h_roi = (0, 0, None, None)
-        if roi_xywh is not None:
-            x0, y0, w_roi, h_roi = roi_xywh
-
-        pad_x, pad_y = pad_xy
-        resize_w, resize_h = out_size
-
-        if w_roi is None or h_roi is None:
-            # if roi not provided, assume original size equals target to only apply resize factors
-            w_roi = resize_w
-            h_roi = resize_h
-
-        scale_x = resize_w / float(max(1, w_roi))
-        scale_y = resize_h / float(max(1, h_roi))
-
-        K_scaled[0, 0] *= scale_x
-        K_scaled[1, 1] *= scale_y
-        K_scaled[0, 2] = (K_scaled[0, 2] - float(x0)) * scale_x + float(pad_x)
-        K_scaled[1, 2] = (K_scaled[1, 2] - float(y0)) * scale_y + float(pad_y)
-        return K_scaled
-
-    def compute_resized_intrinsic(self, K: np.ndarray, orig_h: int, orig_w: int) -> np.ndarray:
-        """
-        Legacy helper: only applies resize scaling, assumes no ROI offset/padding.
-        """
-        if self.resize_h and self.resize_w and (orig_h != self.resize_h or orig_w != self.resize_w):
-            return self.compute_roi_intrinsic(K, (0, 0, orig_w, orig_h), (self.resize_w, self.resize_h))
-        return K.astype(np.float32).copy()
 
     def _depth_to_points(self, depth_m: np.ndarray, K: np.ndarray) -> np.ndarray:
         H, W = depth_m.shape
@@ -563,20 +415,6 @@ class SingleObjectDataset(Dataset):
         valid_mask = np.ones((num_points,), dtype=bool)
         return sampled_pts, valid_mask
 
-    def _is_mask_valid(self, mask: np.ndarray) -> bool:
-        ratio = float(np.count_nonzero(mask)) / float(max(1, mask.size))
-        return ratio >= self.min_mask_nonzero_ratio
-
-    def get_mask_stats(self) -> Dict[str, int]:
-        return {
-            "total_samples": self._total_candidates,
-            "effective_samples": self._effective_samples,
-            "missing_mask_skip_count": self._missing_mask,
-            "invalid_mask_skip_count": self._invalid_mask,
-            "fallback_mask_count": self._fallback_mask,
-            "runtime_fallback_used_count": self._mask_fallback_used_count,
-        }
-
     # ------------------------------------------------------------------
     # Dataset interface
     # ------------------------------------------------------------------
@@ -589,36 +427,17 @@ class SingleObjectDataset(Dataset):
         depth_scale_scene = float(rec.get("depth_scale", 1.0))
         depth_m, orig_h, orig_w = self._load_depth(rec["depth_path"], depth_scale_scene)
 
-        K = self.compute_resized_intrinsic(rec["K"], orig_h, orig_w)
+        K = rec["K"].astype(np.float32).copy()
+        if self.resize_h and self.resize_w and (orig_h != self.resize_h or orig_w != self.resize_w):
+            scale_x = self.resize_w / float(orig_w)
+            scale_y = self.resize_h / float(orig_h)
+            K[0, 0] *= scale_x
+            K[0, 2] *= scale_x
+            K[1, 1] *= scale_y
+            K[1, 2] *= scale_y
 
         rgb_np = self._load_rgb(rec["rgb_path"])
-        raw_mask = self._load_mask(rec.get("mask_path"), depth_m)
-        mask_status = rec.get("mask_status", "ok")
-
-        # runtime mask validation
-        mask_invalid = (
-            raw_mask is None
-            or raw_mask.shape != depth_m.shape
-            or raw_mask.dtype != np.bool_
-            or not self._is_mask_valid(raw_mask)
-        )
-
-        if mask_invalid:
-            if self.allow_mask_fallback:
-                raw_mask = (depth_m > 1e-8)
-                mask_status = "fallback_depth"
-                self._mask_fallback_used_count += 1
-                if not self._fallback_warned:
-                    print("[SingleObjectDataset][Warning] using depth>0 fallback for invalid mask; enable allow_mask_fallback=False to block.")
-                    self._fallback_warned = True
-            elif self.mask_invalid_policy == "raise":
-                raise RuntimeError(
-                    f"[SingleObjectDataset] invalid mask encountered at runtime for idx={idx} (status={mask_status})"
-                )
-            else:
-                raise RuntimeError(
-                    f"[SingleObjectDataset] invalid mask encountered (skip policy) for idx={idx}"
-                )
+        raw_mask = self._load_mask(rec["mask_path"], depth_m)
 
         # B-1: build robust valid pixel mask
         valid_pix = self._build_valid_pixel_mask(raw_mask, depth_m)
@@ -626,22 +445,8 @@ class SingleObjectDataset(Dataset):
         pts_img = self._depth_to_points(depth_m, K)  # [H,W,3]
         pcld, pcld_valid_mask = self._sample_points(pts_img, valid_pix, self.num_points)  # [N,3]
 
-        # ICP point cloud (independent density / source)
-        icp_source = pts_img[valid_pix] if self.icp_use_full_depth else pcld
-        if icp_source.shape[0] == 0:
-            icp_sampled = np.zeros((self.icp_num_points, 3), dtype=np.float32)
-        else:
-            replace_icp = icp_source.shape[0] < self.icp_num_points
-            choice_icp = np.random.choice(
-                icp_source.shape[0],
-                size=self.icp_num_points,
-                replace=replace_icp,
-            )
-            icp_sampled = icp_source[choice_icp].astype(np.float32)
-
         rgb_t = self.normalize(self.to_tensor(rgb_np))
         points_t = torch.from_numpy(pcld.astype(np.float32))
-        points_icp_t = torch.from_numpy(icp_sampled.astype(np.float32))
         pose_t = torch.from_numpy(rec["pose"].astype(np.float32))
         K_t = torch.from_numpy(K.astype(np.float32))
 
@@ -660,15 +465,13 @@ class SingleObjectDataset(Dataset):
             "rgb": rgb_t,
             "point_cloud": points_t,
             "points": points_t,  # alias for loss/eval
-            "points_icp": points_icp_t,
             "pose": pose_t,
             "intrinsic": K_t,
-            "cls_id": torch.tensor(self.obj_id, dtype=torch.long),
+            "cls_id": torch.tensor(0, dtype=torch.long),
 
             "model_points": self.model_points_torch,  # [M,3]
             "scene_id": torch.tensor(int(rec.get("scene_id", -1)), dtype=torch.long),
             "im_id": torch.tensor(int(rec.get("im_id", -1)), dtype=torch.long),
-            "mask_status": mask_status,
 
             # kp supervision
             "kp_targ_ofst": kp_targ_ofst,           # [N,K,3]
