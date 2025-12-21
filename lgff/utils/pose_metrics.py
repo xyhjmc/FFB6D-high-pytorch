@@ -17,8 +17,12 @@ def _resolve_use_best_point(cfg, stage: str) -> bool:
     return getattr(cfg, "eval_use_best_point", True)
 
 
-def _resolve_topk(cfg, N: int) -> int:
+def _resolve_topk(cfg, N: int, stage: str) -> int:
     """Resolve Top-K used for weighted fusion (meters, camera frame)."""
+    stage_topk = getattr(cfg, f"{stage}_topk", None)
+    if stage_topk is not None and stage_topk > 0:
+        return min(int(stage_topk), N)
+
     topk_cfg = getattr(cfg, "pose_fusion_topk", None)
     if topk_cfg is not None and topk_cfg > 0:
         return min(int(topk_cfg), N)
@@ -58,7 +62,7 @@ def fuse_pose_from_outputs(
         return pred_rt
 
     # -------- Top-K + 置信度加权融合 --------
-    k = _resolve_topk(cfg, N)
+    k = _resolve_topk(cfg, N, stage)
     conf_topk, idx = torch.topk(conf, k=k, dim=1)
     conf_topk = conf_topk.clamp(min=1e-4)
 
@@ -141,9 +145,12 @@ def compute_batch_pose_metrics(
     t_err = torch.norm(t_diff, dim=1)  # [B]
 
     # 3) rotation error (deg)
-    rot_err = geometry.rotation_error_from_mats(
+    rot_err_deg = geometry.rotation_error_from_mats(
         pred_r, gt_r, return_deg=True
     )  # [B]
+    # sym objects: ignore rotation by zeroing and tracking count
+    rot_sym_ignored = sym_mask.detach().cpu()
+    rot_err_deg = torch.where(sym_mask, torch.zeros_like(rot_err_deg), rot_err_deg)
 
     # 4) CMD / <2cm 准确率（按 BOP 常用）
     cmd_threshold_m = getattr(cfg, "cmd_threshold_m", 0.02)
@@ -157,9 +164,13 @@ def compute_batch_pose_metrics(
         "t_err_x": t_diff[:, 0].detach().cpu(),
         "t_err_y": t_diff[:, 1].detach().cpu(),
         "t_err_z": t_diff[:, 2].detach().cpu(),
-        "rot_err": rot_err.detach().cpu(),
+        "rot_err_deg": rot_err_deg.detach().cpu(),
+        # backward compatibility (deg)
+        "rot_err": rot_err_deg.detach().cpu(),
         "cmd_acc": cmd_acc.detach().cpu(),
+        "sym_rot_ignored_mask": rot_sym_ignored,
     }
+    out["rot_err_deg_valid"] = rot_err_deg[~sym_mask].detach().cpu()
     return out
 
 
@@ -182,10 +193,10 @@ def summarize_pose_metrics(
             summary[f"mean_{k}"] = float(np.mean(values))
 
     # 分位数 / 阈值准确率，示意：
-    for name in ["add_s", "add", "t_err", "rot_err"]:
+    for name in ["add_s", "add", "t_err", "rot_err_deg", "rot_err", "rot_err_deg_valid"]:
         if name in meter and len(meter[name]) > 0:
             arr = np.array(meter[name], dtype=np.float32)
-            if name != "rot_err":
+            if name not in ["rot_err", "rot_err_deg", "rot_err_deg_valid"]:
                 summary[f"{name}_p50"] = float(np.percentile(arr, 50))
                 summary[f"{name}_p75"] = float(np.percentile(arr, 75))
                 summary[f"{name}_p90"] = float(np.percentile(arr, 90))

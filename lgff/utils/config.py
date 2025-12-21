@@ -63,6 +63,9 @@ class LGFFConfig:
     num_points: int = 1024
     num_keypoints: int = 8
     val_split: str = "test"
+    # mask handling
+    mask_invalid_policy: str = "skip"  # "skip" | "raise"
+    allow_mask_fallback: bool = False
 
     camera_intrinsic: List[List[float]] = field(
         default_factory=lambda: [
@@ -187,9 +190,17 @@ class LGFFConfig:
     # 物体直径（单位 m），如果不在 config 中写死，Trainer 会在 val 期间估算一次
     obj_diameter_m: Optional[float] = None
 
+    # ICP 独立配置
+    icp_num_points: int = 8192
+    icp_use_full_depth: bool = True
+    icp_point_source: Optional[str] = None  # optional override for logging clarity
+
     # ----------------- Logging / Output -----------------
     log_dir: str = "output/debug"
     work_dir: Optional[str] = None
+    # Optional scene overlap guard
+    forbid_scene_overlap: bool = False
+    scene_overlap_policy: str = "warn"  # "warn" | "raise"
 
     def update(self, data: Dict[str, Any]) -> None:
         for key, value in data.items():
@@ -234,6 +245,10 @@ class LGFFConfig:
                 continue
             if not isinstance(kval, int) or kval <= 0:
                 raise ValueError(f"{kname} must be a positive int or None, got {kval}")
+        if self.mask_invalid_policy not in ("skip", "raise"):
+            raise ValueError(f"mask_invalid_policy must be 'skip' or 'raise', got {self.mask_invalid_policy}")
+        if self.scene_overlap_policy not in ("warn", "raise"):
+            raise ValueError(f"scene_overlap_policy must be 'warn' or 'raise', got {self.scene_overlap_policy}")
 
     def resolve_paths(self) -> None:
         self.dataset_root = os.path.expanduser(self.dataset_root)
