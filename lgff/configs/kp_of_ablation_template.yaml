@@ -1,0 +1,27 @@
+# Minimal ablation template for kp_offset branch
+# Update lambda_kp_of ∈ {0.1, 0.2, 0.3} and kp_of_detach_trunk ∈ {true, false}
+# while keeping best-point fusion fixed (no Top-K).
+
+dataset_root: /path/to/dataset
+obj_id: 1
+work_dir: output/kp_of_ablation
+
+resize_h: 480
+resize_w: 640
+num_points: 8000
+num_model_points: 8000
+num_keypoints: 8
+
+# Fusion is hard-routed to best-point for both train/eval.
+train_use_best_point: true
+eval_use_best_point: true
+
+# Ablation knobs (edit per run)
+lambda_kp_of: 0.1
+kp_of_detach_trunk: true
+
+# Core training defaults (inherit the rest from code defaults)
+batch_size: 8
+epochs: 50
+lr: 0.0001
+weight_decay: 0.0001

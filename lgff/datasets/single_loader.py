@@ -150,12 +150,15 @@ class SingleObjectDataset(Dataset):
         )
 
         self.samples: List[Dict[str, Any]] = []
+        self._total_candidates = 0
         self._missing_mask = 0
         self._invalid_mask = 0
         self._fallback_mask = 0
         self._mask_fallback_used_count = 0
         self._fallback_warned = False
+        self.min_mask_nonzero_ratio = float(getattr(cfg, "min_mask_nonzero_ratio", 0.001))
         self._build_index()
+        self._effective_samples = len(self.samples)
 
         if len(self.samples) == 0:
             if self.split == "train":
@@ -173,7 +176,8 @@ class SingleObjectDataset(Dataset):
                 f"[SingleObjectDataset] split={split}, obj_id={self.obj_id}, "
                 f"num_samples={len(self.samples)} | "
                 f"z_range=[{self.depth_z_min_m},{self.depth_z_max_m}]m | "
-                f"erosion={self.mask_erosion} | edge_th={self.depth_edge_thresh_m}"
+                f"erosion={self.mask_erosion} | edge_th={self.depth_edge_thresh_m} | "
+                f"min_mask_nonzero_ratio={self.min_mask_nonzero_ratio}"
             )
             if self._missing_mask > 0:
                 print(f"[SingleObjectDataset] skipped {self._missing_mask} samples due to missing masks.")
@@ -181,6 +185,17 @@ class SingleObjectDataset(Dataset):
                 print(f"[SingleObjectDataset] skipped {self._invalid_mask} samples due to invalid masks.")
             if self._fallback_mask > 0:
                 print(f"[SingleObjectDataset] fallback-to-depth for {self._fallback_mask} samples (allow_mask_fallback=True).")
+
+            # dataset-level stats for mask skip and effectiveness
+            eff_ratio = self._effective_samples / max(1, self._total_candidates)
+            print(
+                f"[SingleObjectDataset][MaskStats] total_targets={self._total_candidates} | "
+                f"effective_samples={self._effective_samples} | "
+                f"missing_mask_skip_count={self._missing_mask} | "
+                f"invalid_mask_skip_count={self._invalid_mask} | "
+                f"fallback_mask_count={self._fallback_mask} | "
+                f"effective_ratio={eff_ratio:.4f}"
+            )
 
         # optional scene overlap guard
         if self.forbid_scene_overlap:
@@ -248,6 +263,7 @@ class SingleObjectDataset(Dataset):
                     if int(gt["obj_id"]) != self.obj_id:
                         continue
 
+                    self._total_candidates += 1
                     R = np.array(gt["cam_R_m2c"], dtype=np.float32).reshape(3, 3)
                     t = np.array(gt["cam_t_m2c"], dtype=np.float32).reshape(3, 1) / 1000.0  # mm->m
                     pose = np.concatenate([R, t], axis=1)  # [3,4]
@@ -297,8 +313,9 @@ class SingleObjectDataset(Dataset):
                             dw, dh = d_img.size
                             if m_arr.shape[0] != dh or m_arr.shape[1] != dw:
                                 raise ValueError("mask shape mismatch depth")
-                            if nonzero == 0:
-                                raise ValueError("mask all zero")
+                            ratio = nonzero / float(max(1, m_arr.size))
+                            if ratio < self.min_mask_nonzero_ratio:
+                                raise ValueError(f"mask nonzero ratio too small ({ratio:.6f})")
                         except Exception as e:
                             self._invalid_mask += 1
                             if self.allow_mask_fallback:
@@ -466,6 +483,47 @@ class SingleObjectDataset(Dataset):
 
         return valid.astype(bool)
 
+    @staticmethod
+    def compute_roi_intrinsic(
+        K: np.ndarray,
+        roi_xywh: Optional[Tuple[int, int, int, int]],
+        out_size: Tuple[int, int],
+        pad_xy: Tuple[int, int] = (0, 0),
+    ) -> np.ndarray:
+        """
+        Apply ROI crop (x0,y0,w,h), optional padding, then resize to out_size.
+        roi_xywh=None is treated as full image (x0=y0=0, w/h derived from K center and scale assumptions).
+        """
+        K_scaled = K.astype(np.float32).copy()
+        x0, y0, w_roi, h_roi = (0, 0, None, None)
+        if roi_xywh is not None:
+            x0, y0, w_roi, h_roi = roi_xywh
+
+        pad_x, pad_y = pad_xy
+        resize_w, resize_h = out_size
+
+        if w_roi is None or h_roi is None:
+            # if roi not provided, assume original size equals target to only apply resize factors
+            w_roi = resize_w
+            h_roi = resize_h
+
+        scale_x = resize_w / float(max(1, w_roi))
+        scale_y = resize_h / float(max(1, h_roi))
+
+        K_scaled[0, 0] *= scale_x
+        K_scaled[1, 1] *= scale_y
+        K_scaled[0, 2] = (K_scaled[0, 2] - float(x0)) * scale_x + float(pad_x)
+        K_scaled[1, 2] = (K_scaled[1, 2] - float(y0)) * scale_y + float(pad_y)
+        return K_scaled
+
+    def compute_resized_intrinsic(self, K: np.ndarray, orig_h: int, orig_w: int) -> np.ndarray:
+        """
+        Legacy helper: only applies resize scaling, assumes no ROI offset/padding.
+        """
+        if self.resize_h and self.resize_w and (orig_h != self.resize_h or orig_w != self.resize_w):
+            return self.compute_roi_intrinsic(K, (0, 0, orig_w, orig_h), (self.resize_w, self.resize_h))
+        return K.astype(np.float32).copy()
+
     def _depth_to_points(self, depth_m: np.ndarray, K: np.ndarray) -> np.ndarray:
         H, W = depth_m.shape
         ys, xs = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
@@ -505,6 +563,20 @@ class SingleObjectDataset(Dataset):
         valid_mask = np.ones((num_points,), dtype=bool)
         return sampled_pts, valid_mask
 
+    def _is_mask_valid(self, mask: np.ndarray) -> bool:
+        ratio = float(np.count_nonzero(mask)) / float(max(1, mask.size))
+        return ratio >= self.min_mask_nonzero_ratio
+
+    def get_mask_stats(self) -> Dict[str, int]:
+        return {
+            "total_samples": self._total_candidates,
+            "effective_samples": self._effective_samples,
+            "missing_mask_skip_count": self._missing_mask,
+            "invalid_mask_skip_count": self._invalid_mask,
+            "fallback_mask_count": self._fallback_mask,
+            "runtime_fallback_used_count": self._mask_fallback_used_count,
+        }
+
     # ------------------------------------------------------------------
     # Dataset interface
     # ------------------------------------------------------------------
@@ -517,14 +589,7 @@ class SingleObjectDataset(Dataset):
         depth_scale_scene = float(rec.get("depth_scale", 1.0))
         depth_m, orig_h, orig_w = self._load_depth(rec["depth_path"], depth_scale_scene)
 
-        K = rec["K"].astype(np.float32).copy()
-        if self.resize_h and self.resize_w and (orig_h != self.resize_h or orig_w != self.resize_w):
-            scale_x = self.resize_w / float(orig_w)
-            scale_y = self.resize_h / float(orig_h)
-            K[0, 0] *= scale_x
-            K[0, 2] *= scale_x
-            K[1, 1] *= scale_y
-            K[1, 2] *= scale_y
+        K = self.compute_resized_intrinsic(rec["K"], orig_h, orig_w)
 
         rgb_np = self._load_rgb(rec["rgb_path"])
         raw_mask = self._load_mask(rec.get("mask_path"), depth_m)
@@ -535,7 +600,7 @@ class SingleObjectDataset(Dataset):
             raw_mask is None
             or raw_mask.shape != depth_m.shape
             or raw_mask.dtype != np.bool_
-            or np.count_nonzero(raw_mask) == 0
+            or not self._is_mask_valid(raw_mask)
         )
 
         if mask_invalid:

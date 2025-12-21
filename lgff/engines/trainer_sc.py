@@ -26,6 +26,7 @@ from lgff.utils.pose_metrics import (
     fuse_pose_from_outputs,
     compute_batch_pose_metrics,
     summarize_pose_metrics,
+    describe_fusion_policy,
 )
 
 
@@ -370,6 +371,22 @@ class TrainerSC:
     def _train_one_epoch(self, epoch: int) -> Dict[str, float]:
         self.model.train()
         meters: Dict[str, AverageMeter] = {}
+
+        ds = getattr(self.train_loader, "dataset", None)
+        if hasattr(ds, "get_mask_stats"):
+            stats = ds.get_mask_stats()
+            eff_ratio = stats["effective_samples"] / max(1, stats["total_samples"])
+            self.logger.info(
+                "[Train] Epoch %d DatasetStats total_samples=%d effective_samples=%d missing_mask_skip_count=%d invalid_mask_skip_count=%d fallback_used=%d runtime_fallback_used=%d effective_ratio=%.4f",
+                epoch + 1,
+                stats["total_samples"],
+                stats["effective_samples"],
+                stats["missing_mask_skip_count"],
+                stats["invalid_mask_skip_count"],
+                stats["fallback_mask_count"],
+                stats["runtime_fallback_used_count"],
+                eff_ratio,
+            )
 
         if len(self.train_loader) == 0:
             raise RuntimeError(
@@ -877,12 +894,31 @@ class TrainerSC:
             getattr(self.cfg, "mask_invalid_policy", "skip"),
             getattr(self.cfg, "allow_mask_fallback", False),
         )
+
+        fusion_policy_train = describe_fusion_policy(self.cfg, "train", num_points=getattr(self.cfg, "num_points", None))
+        fusion_policy_eval = describe_fusion_policy(self.cfg, "eval", num_points=getattr(self.cfg, "num_points", None))
         self.logger.info(
-            "[TrainerSC][Policy] fusion_train_use_best_point=%s | train_topk=%s | pose_fusion_topk=%s | eval_use_best_point=%s",
-            getattr(self.cfg, "train_use_best_point", None),
-            getattr(self.cfg, "train_topk", None),
-            getattr(self.cfg, "pose_fusion_topk", None),
-            getattr(self.cfg, "eval_use_best_point", True),
+            "[TrainerSC][Policy] fusion(train) mode=%s use_best_point=%s effective_topk=%s topk_ignored=%s",
+            fusion_policy_train.get("fusion_mode"),
+            fusion_policy_train.get("use_best_point"),
+            fusion_policy_train.get("effective_topk"),
+            fusion_policy_train.get("topk_ignored"),
+        )
+        self.logger.info(
+            "[TrainerSC][Policy] fusion(eval) mode=%s use_best_point=%s effective_topk=%s topk_ignored=%s",
+            fusion_policy_eval.get("fusion_mode"),
+            fusion_policy_eval.get("use_best_point"),
+            fusion_policy_eval.get("effective_topk"),
+            fusion_policy_eval.get("topk_ignored"),
+        )
+
+        lambda_kp_of = float(getattr(self.cfg, "lambda_kp_of", 0.0))
+        kp_detach = bool(getattr(self.cfg, "kp_of_detach_trunk", False))
+        self.logger.info(
+            "[TrainerSC][Policy] kp_offset lambda_kp_of=%.3f | kp_of_detach_trunk=%s | branch_enabled=%s",
+            lambda_kp_of,
+            kp_detach,
+            lambda_kp_of > 0.0,
         )
         self.logger.info(
             "[TrainerSC][Policy] sym_class_ids(BOP obj_id)=%s | icp_num_points=%s | icp_use_full_depth=%s",

@@ -328,8 +328,13 @@ class LGFFLoss(nn.Module):
         # ======================================================
         loss_kp_of = points_cam.new_tensor(0.0)
         lambda_kp_of = float(getattr(self.cfg, "lambda_kp_of", 0.0))
-
+        kp_of_enabled_flag = bool(outputs.get("kp_of_enabled", False))
+        kp_of_detach_trunk = bool(getattr(self.cfg, "kp_of_detach_trunk", False))
         if lambda_kp_of > 0.0:
+            if not kp_of_enabled_flag:
+                raise RuntimeError(
+                    "[LGFFLoss] lambda_kp_of>0 but kp_offset branch is disabled in outputs."
+                )
             if ("pred_kp_ofs" in outputs) and ("kp_targ_ofst" in batch) and ("labels" in batch):
                 loss_kp_of = self._compute_kp_offset_loss(
                     pred_kp_ofs=outputs["pred_kp_ofs"],
@@ -338,8 +343,9 @@ class LGFFLoss(nn.Module):
                 )
                 loss_kp_of = torch.nan_to_num(loss_kp_of, nan=0.0, posinf=1e4, neginf=1e4)
             else:
-                # missing keys -> treat as disabled (avoid crashes / side effects)
-                loss_kp_of = points_cam.new_tensor(0.0)
+                raise RuntimeError(
+                    "[LGFFLoss] lambda_kp_of>0 requires pred_kp_ofs, kp_targ_ofst and labels."
+                )
 
         # ======================================================
         # Final Loss
@@ -372,6 +378,8 @@ class LGFFLoss(nn.Module):
                 "loss_kp_of": float(loss_kp_of.item()),
 
                 "lambda_kp_of": float(lambda_kp_of),
+                "kp_of_enabled": float(kp_of_enabled_flag and lambda_kp_of > 0.0),
+                "kp_of_detach_trunk": float(kp_of_detach_trunk),
 
                 "dist_mean": float(loss_dist.mean().item()),
                 "conf_mean": float(conf.mean().item()),

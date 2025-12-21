@@ -37,6 +37,7 @@ from lgff.utils.eval_utils import (
 from lgff.utils.pose_metrics import (
     fuse_pose_from_outputs,
     compute_batch_pose_metrics,
+    describe_fusion_policy,
 )
 
 
@@ -182,6 +183,7 @@ class EvaluatorSC:
     # ------------------------------------------------------------------ #
     def _log_resolved_policies(self) -> None:
         cfg = self.cfg
+        fusion_policy = describe_fusion_policy(cfg, "eval", num_points=getattr(cfg, "num_points", None))
         self.logger.info(
             "[EvaluatorSC][Policy] icp_policy=%s | icp_enable=%s | icp_num_points=%s | icp_point_source=%s",
             self.icp_policy,
@@ -190,10 +192,11 @@ class EvaluatorSC:
             self.icp_point_source_resolved or ("points_icp" if getattr(cfg, "icp_use_full_depth", True) else "points"),
         )
         self.logger.info(
-            "[EvaluatorSC][Policy] fusion_eval_use_best_point=%s | eval_topk=%s | pose_fusion_topk=%s",
-            getattr(cfg, "eval_use_best_point", True),
-            getattr(cfg, "eval_topk", None),
-            getattr(cfg, "pose_fusion_topk", None),
+            "[EvaluatorSC][Policy] fusion_mode=%s | use_best_point=%s | effective_topk=%s | topk_ignored=%s",
+            fusion_policy.get("fusion_mode"),
+            fusion_policy.get("use_best_point"),
+            fusion_policy.get("effective_topk"),
+            fusion_policy.get("topk_ignored"),
         )
         self.logger.info(
             "[EvaluatorSC][Policy] mask_invalid_policy=%s | allow_mask_fallback=%s | sym_class_ids(BOP obj_id)=%s",
