@@ -103,12 +103,45 @@ class LGFF_SC(LGFFBase):
         # 3. Fusion Module
         # ==================================================================
         fusion_in_dim = rgb_feat_dim + geo_feat_dim  # [rgb_emb, geo_emb]
-        self.fusion_gate = nn.Sequential(
-            nn.Conv1d(fusion_in_dim, 128, 1, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(128, 1, 1, bias=True),
-            nn.Sigmoid(),
-        )
+        #yuanban
+        # self.fusion_gate = nn.Sequential(
+        #     nn.Conv1d(fusion_in_dim, 128, 1, bias=False),
+        #     nn.ReLU(inplace=True),
+        #     nn.Conv1d(128, 1, 1, bias=True),
+        #     nn.Sigmoid(),
+        # )
+        gate_mode = getattr(cfg, "gate_mode", "channel")
+        gate_hidden = int(getattr(cfg, "gate_hidden", 128))
+        gate_out_ch = 1 if gate_mode == "point" else rgb_feat_dim  # C_fused
+        #实验D
+        self.split_fusion_heads = bool(getattr(cfg, "split_fusion_heads", False))
+
+        if not self.split_fusion_heads:
+            # 旧：一套 gate
+            # 实验C
+            self.fusion_gate = nn.Sequential(
+                nn.Conv1d(fusion_in_dim, gate_hidden, 1, bias=False),
+                nn.ReLU(inplace=True),
+                nn.Conv1d(gate_hidden, gate_out_ch, 1, bias=True),
+                nn.Sigmoid(),
+            )
+        else:
+            # 新：两套 gate
+            gate_hidden_rot = int(getattr(cfg, "gate_hidden_rot", gate_hidden))
+            gate_hidden_tc = int(getattr(cfg, "gate_hidden_tc", gate_hidden))
+
+            self.fusion_gate_rot = nn.Sequential(
+                nn.Conv1d(fusion_in_dim, gate_hidden_rot, 1, bias=False),
+                nn.ReLU(inplace=True),
+                nn.Conv1d(gate_hidden_rot, gate_out_ch, 1, bias=True),
+                nn.Sigmoid(),
+            )
+            self.fusion_gate_tc = nn.Sequential(
+                nn.Conv1d(fusion_in_dim, gate_hidden_tc, 1, bias=False),
+                nn.ReLU(inplace=True),
+                nn.Conv1d(gate_hidden_tc, gate_out_ch, 1, bias=True),
+                nn.Sigmoid(),
+            )
 
         # ==================================================================
         # 4. Decoupled Heads
@@ -178,12 +211,24 @@ class LGFF_SC(LGFFBase):
         modules = [
             self.rgb_reduce,
             self.point_encoder,
-            self.fusion_gate,
+            # self.fusion_gate,
             self.rot_head,
             self.trans_head,
             self.conf_head,
             self.kp_of_head,  # [New]
         ]
+
+        # -------- Fusion gate(s): route D compatible --------
+        if getattr(self, "split_fusion_heads", False):
+            # route D: two gates
+            if hasattr(self, "fusion_gate_rot"):
+                modules.append(self.fusion_gate_rot)
+            if hasattr(self, "fusion_gate_tc"):
+                modules.append(self.fusion_gate_tc)
+        else:
+            # baseline: single gate
+            if hasattr(self, "fusion_gate"):
+                modules.append(self.fusion_gate)
         for m in modules:
             for mod in m.modules():
                 if isinstance(mod, (nn.Conv2d, nn.Conv1d)):
@@ -267,22 +312,36 @@ class LGFF_SC(LGFFBase):
         fused_raw, rgb_emb = self.extract_and_fuse(
             feat_map, geo_emb, points, intrinsic, (H, W)
         )   # fused_raw: [B, C_rgb+C_geo, N], rgb_emb: [B, C_rgb, N]
+        if not self.split_fusion_heads:
+            gate = self.fusion_gate(fused_raw)
+            feat_fused = rgb_emb * gate + geo_emb * (1.0 - gate)
 
-        gate = self.fusion_gate(fused_raw)                   # [B, 1, N]
-        feat_fused = rgb_emb * gate + geo_emb * (1.0 - gate) # [B, C_fused, N]
+            feat_rot = feat_fused
+            feat_tc = feat_fused
+        else:
+            gate_rot = self.fusion_gate_rot(fused_raw)
+            gate_tc = self.fusion_gate_tc(fused_raw)
+
+            feat_rot = rgb_emb * gate_rot + geo_emb * (1.0 - gate_rot)
+            feat_tc = rgb_emb * gate_tc + geo_emb * (1.0 - gate_tc)
+
+        # if gate.shape[1] == 1:
+        #     # point-wise gate, broadcast to channels
+        #     feat_fused = rgb_emb * gate + geo_emb * (1.0 - gate)
+        # else:
+        #     # channel-wise gate
+        #     feat_fused = rgb_emb * gate + geo_emb * (1.0 - gate)
 
         # ------------------------------------------------------------------
         # 4. 构造 Head 输入
         # ------------------------------------------------------------------
         points_t = points.transpose(1, 2)                     # [B, 3, N]
+        # Rot Head 输入用 feat_rot
+        rot_input = feat_rot
 
-        # Rot Head 输入：feat_fused
-        rot_input = feat_fused                                # [B, C_fused, N]
+        # Trans/Conf/KpOf 输入用 feat_tc
+        trans_conf_kp_input = torch.cat([feat_tc, points_t], dim=1)
 
-        # Trans / Conf / KpOf Head 输入：feat_fused + points
-        trans_conf_kp_input = torch.cat(
-            [feat_fused, points_t], dim=1
-        )  # [B, C_fused+3, N]
 
         # ------------------------------------------------------------------
         # 5. 解耦预测
@@ -297,19 +356,40 @@ class LGFF_SC(LGFFBase):
         pred_t = self.trans_head(trans_conf_kp_input)         # [B, 3, N]
         pred_t = pred_t.permute(0, 2, 1).contiguous()         # [B, N, 3]
 
-        # C. Confidence
-        pred_c = self.conf_head(trans_conf_kp_input)          # [B, 1, N]
-        pred_c = pred_c.permute(0, 2, 1).contiguous()         # [B, N, 1]
+        # #原来的代码
+        # # C. Confidence
+        # pred_c = self.conf_head(trans_conf_kp_input)          # [B, 1, N]
+        # pred_c = pred_c.permute(0, 2, 1).contiguous()         # [B, N, 1]
+        # pred_c = torch.sigmoid(pred_c)
+
+        #E1
+        conf_detach = bool(getattr(self.cfg, "conf_detach_trunk", False))  # E1 开关
+        conf_in = trans_conf_kp_input.detach() if conf_detach else trans_conf_kp_input
+
+        pred_c = self.conf_head(conf_in)  # [B, 1, N]
+        pred_c = pred_c.permute(0, 2, 1).contiguous()  # [B, N, 1]
         pred_c = torch.sigmoid(pred_c)
 
         # D. [New] Keypoint Offsets
         # kp_of_raw: [B, 3*K, N]
-        kp_of_raw = self.kp_of_head(trans_conf_kp_input)
-        # 先 reshape 成 [B, K, 3, N] 再转成 [B, K, N, 3]，方便直接给 OFLoss 用
-        kp_of_raw = kp_of_raw.view(
-            B, self.num_keypoints, 3, N
-        )  # [B, K, 3, N]
-        pred_kp_ofs = kp_of_raw.permute(0, 1, 3, 2).contiguous()  # [B, K, N, 3]
+        #路线A
+        # kp_of_raw = self.kp_of_head(trans_conf_kp_input)
+        #路线B
+        lambda_kp_of = float(getattr(self.cfg, "lambda_kp_of", 0.3))
+        kp_detach = bool(getattr(self.cfg, "kp_of_detach_trunk", False))  # 路线B默认 True
+
+        pred_kp_ofs = None
+        if lambda_kp_of > 0.0:
+            kp_in = trans_conf_kp_input.detach() if kp_detach else trans_conf_kp_input
+            kp_of_raw = self.kp_of_head(kp_in)  # [B, 3K, N]
+            kp_of_raw = kp_of_raw.view(B, self.num_keypoints, 3, N)
+            pred_kp_ofs = kp_of_raw.permute(0, 1, 3, 2).contiguous()  # [B, K, N, 3]
+
+        # # 先 reshape 成 [B, K, 3, N] 再转成 [B, K, N, 3]，方便直接给 OFLoss 用
+        # kp_of_raw = kp_of_raw.view(
+        #     B, self.num_keypoints, 3, N
+        # )  # [B, K, 3, N]
+        # pred_kp_ofs = kp_of_raw.permute(0, 1, 3, 2).contiguous()  # [B, K, N, 3]
 
         return {
             "pred_quat": pred_q,

@@ -1,12 +1,18 @@
 """
-LGFF Loss Module (Optimized, no explicit rotation loss).
+LGFF Loss Module (v3 naming-fixed + explicit rotation loss).
 
-1. Translation Loss (Weighted L1) -> Fix Z-axis bias.
-2. DenseFusion-style ADD/ADD-S Loss on ROI points.
-3. Explicit Confidence Regularization -> Prevent confidence collapse.
-4. Optional CAD-level ADD/ADD-S Loss (using canonical model points),
-   aligned with the Evaluator.
-5. [NEW] Optional Keypoint Offset Loss (FFB6D-style), using pred_kp_ofs.
+Base behavior: identical to your current v3 (DenseFusion-style + t + conf_reg + optional cad_add + optional kp_of),
+with ONE addition:
+- Explicit rotation loss (SO(3) geodesic) on fused rotation, weighted by lambda_rot.
+
+Route-A compatibility:
+- Keypoint Offset Loss is STRICTLY gated by cfg.lambda_kp_of (read dynamically each forward).
+- If lambda_kp_of <= 0: kp loss is not computed, and does not affect gradients.
+
+Compatibility:
+- Exposes lambda_dense (alias of lambda_add) for TrainerSC expectations.
+- Metrics expose loss_dense (alias of old loss_add) + keep loss_add for backward plots.
+- Exposes lambda_rot and metric loss_rot for TrainerSC curriculum/breakdown.
 """
 
 from __future__ import annotations
@@ -32,25 +38,38 @@ class LGFFLoss(nn.Module):
         self.w_rate = getattr(cfg, "w_rate", 0.015)
         self.sym_class_ids = set(getattr(cfg, "sym_class_ids", []))
 
-        # ===== 权重配置（全部暴露到 cfg，方便调参） =====
-        self.lambda_t       = getattr(cfg, "lambda_t", 0.5)        # 平移权重
-        self.lambda_add     = getattr(cfg, "lambda_add", 1.0)      # ROI 几何权重
-        self.lambda_conf    = getattr(cfg, "lambda_conf", 0.1)     # conf 显式正则权重
-        self.lambda_add_cad = getattr(cfg, "lambda_add_cad", 0.2)  # CAD 级 ADD/ADD-S loss 权重
-        # [NEW] 关键点 offset 辅助 loss 权重（FFB6D 风格）
-        self.lambda_kp_of   = getattr(cfg, "lambda_kp_of", 0.6)
+        # ===== 权重配置（兼容 lambda_dense / lambda_add 两套命名） =====
+        self.lambda_t = float(getattr(cfg, "lambda_t", 0.5))  # 平移权重
 
-        # Z 轴额外权重（解决深度轴 bias）
-        self.t_z_weight = getattr(cfg, "t_z_weight", 2.0)
+        _lambda_dense = getattr(cfg, "lambda_dense", None)
+        if _lambda_dense is None:
+            _lambda_dense = getattr(cfg, "lambda_add", 1.0)
+        self.lambda_dense = float(_lambda_dense)   # 主名：供 trainer 使用
+        self.lambda_add = self.lambda_dense        # 别名：兼容旧代码/旧配置
+
+        # explicit rotation loss weight
+        self.lambda_rot = float(getattr(cfg, "lambda_rot", 0.0))
+
+        self.lambda_conf = float(getattr(cfg, "lambda_conf", 0.1))
+        self.lambda_add_cad = float(getattr(cfg, "lambda_add_cad", 0.2))
+        # NOTE: lambda_kp_of 不在 __init__ 固化，forward 动态读取，避免被 checkpoint/CLI 覆盖失效
+
+        # Z 轴额外权重
+        self.t_z_weight = float(getattr(cfg, "t_z_weight", 2.0))
         axis_weight = torch.tensor([1.0, 1.0, self.t_z_weight], dtype=torch.float32)
         self.register_buffer("axis_weight", axis_weight)
 
         # Confidence 正则参数
-        self.conf_alpha    = getattr(cfg, "conf_alpha", 10.0)      # 对误差的敏感度
-        self.conf_dist_max = getattr(cfg, "conf_dist_max", 0.1)    # 误差裁剪上限
+        self.conf_alpha = float(getattr(cfg, "conf_alpha", 10.0))
+        self.conf_dist_max = float(getattr(cfg, "conf_dist_max", 0.1))
+
+        # rot loss 数值稳定（acos clamp）
+        self.rot_geodesic_eps = float(getattr(cfg, "rot_geodesic_eps", 1e-6))
+
+
 
     # ------------------------------------------------------------------
-    # [NEW] Keypoint Offset Loss (FFB6D-style of_l1_loss)
+    # Keypoint Offset Loss (FFB6D-style of_l1_loss)
     # ------------------------------------------------------------------
     @staticmethod
     def _compute_kp_offset_loss(
@@ -60,8 +79,8 @@ class LGFFLoss(nn.Module):
     ) -> torch.Tensor:
         """
         pred_kp_ofs:  [B, K, N, 3]
-        kp_targ_ofst: [B, N, K, 3] 或 [B, K, N, 3]
-        labels:       [B, N] 或 [B, N, 1]，>0 表示该点属于物体
+        kp_targ_ofst: [B, N, K, 3] or [B, K, N, 3]
+        labels:       [B, N] or [B, N, 1], >0 indicates foreground points
         """
         assert pred_kp_ofs.dim() == 4 and pred_kp_ofs.size(-1) == 3, (
             "pred_kp_ofs shape must be [B, K, N, 3]"
@@ -72,14 +91,14 @@ class LGFFLoss(nn.Module):
 
         B, K, N, C = pred_kp_ofs.shape
 
-        # 处理 labels -> [B, N]
+        # labels -> [B, N]
         if labels.dim() == 3:
             labels = labels.squeeze(-1)
         assert labels.shape == (B, N), f"labels shape expected [B, N], got {labels.shape}"
 
-        # 对齐 gt offset 形状到 [B, K, N, 3]
+        # align gt offsets to [B, K, N, 3]
         if kp_targ_ofst.shape == (B, N, K, C):
-            kp_targ = kp_targ_ofst.permute(0, 2, 1, 3).contiguous()  # [B, K, N, 3]
+            kp_targ = kp_targ_ofst.permute(0, 2, 1, 3).contiguous()
         elif kp_targ_ofst.shape == (B, K, N, C):
             kp_targ = kp_targ_ofst
         else:
@@ -88,21 +107,38 @@ class LGFFLoss(nn.Module):
                 f"got {kp_targ_ofst.shape}"
             )
 
-        # 权重 mask: 只对前景点计算 offset
-        w = (labels > 1e-8).float()          # [B, N]
+        # foreground mask
+        w = (labels > 1e-8).float()  # [B, N]
         w = w.view(B, 1, N, 1).expand(-1, K, -1, C)  # [B, K, N, 3]
 
-        diff = pred_kp_ofs - kp_targ         # [B, K, N, 3]
-        abs_diff = torch.abs(diff) * w       # [B, K, N, 3]
+        diff = pred_kp_ofs - kp_targ
+        abs_diff = torch.abs(diff) * w
 
-        # FFB6D 的 normalize 方式：对每个 (B,K) 分别按点数归一化
-        abs_view = abs_diff.view(B, K, -1)   # [B, K, N*3]
-        w_view   = w.reshape(B, K, -1)          # [B, K, N*3]
+        # normalize per (B,K)
+        abs_view = abs_diff.view(B, K, -1)  # [B, K, N*3]
+        w_view = w.reshape(B, K, -1)        # [B, K, N*3]
 
-        per_kp_loss = abs_view.sum(dim=2) / (w_view.sum(dim=2) + 1e-3)  # [B, K]
-        loss = per_kp_loss.mean()  # 标量
+        per_kp_loss = abs_view.sum(dim=2) / (w_view.sum(dim=2) + 1e-3)
+        return per_kp_loss.mean()
 
-        return loss
+    # ------------------------------------------------------------------
+    # SO(3) Geodesic Loss from rotation matrices
+    # ------------------------------------------------------------------
+    def _so3_geodesic_loss(self, R_pred: torch.Tensor, R_gt: torch.Tensor) -> torch.Tensor:
+        """
+        R_pred, R_gt: [B,3,3] float tensors
+        Returns: mean geodesic angle in radians
+        """
+        R_rel = torch.matmul(R_pred, R_gt.transpose(1, 2))  # [B,3,3]
+        trace = R_rel[:, 0, 0] + R_rel[:, 1, 1] + R_rel[:, 2, 2]  # [B]
+        cos_theta = (trace - 1.0) * 0.5
+
+        eps = self.rot_geodesic_eps
+        cos_theta = cos_theta.clamp(min=-1.0 + eps, max=1.0 - eps)
+
+        theta = torch.acos(cos_theta)  # [B] in radians
+        loss = theta.mean()
+        return torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=1e4)
 
     # ------------------------------------------------------------------
     # forward
@@ -113,136 +149,170 @@ class LGFFLoss(nn.Module):
         batch: Dict[str, torch.Tensor],
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
 
-        # -------------------- 解析输出与 GT --------------------
+        # ---- outputs ----
         pred_q = outputs["pred_quat"]   # [B, N, 4]
         pred_t = outputs["pred_trans"]  # [B, N, 3]
         pred_c = outputs["pred_conf"]   # [B, N, 1]
 
+        # ---- GT ----
         gt_pose = batch["pose"]         # [B, 3, 4]
         gt_r = gt_pose[:, :3, :3]       # [B, 3, 3]
         gt_t = gt_pose[:, :3, 3]        # [B, 3]
 
         points_cam = batch["points"]    # [B, N, 3]
         B, N, _ = points_cam.shape
+        device = points_cam.device
+        device_type = device.type
 
-        # 逐样本对称性标记（用于 ROI / CAD 两级 ADD/ADD-S）
-        sym_ids = torch.as_tensor(
-            getattr(self.cfg, "sym_class_ids", []), device=points_cam.device
-        )
-        sym_mask = torch.zeros(B, dtype=torch.bool, device=points_cam.device)
+        # symmetry mask
+        sym_ids = torch.as_tensor(getattr(self.cfg, "sym_class_ids", []), device=device)
+        sym_mask = torch.zeros(B, dtype=torch.bool, device=device)
         cls_id_tensor = batch.get("cls_id", None)
         if cls_id_tensor is not None:
-            cls_flat = cls_id_tensor.view(-1).to(points_cam.device)
+            cls_flat = cls_id_tensor.view(-1).to(device=device)
             if sym_ids.numel() > 0:
                 sym_mask = (cls_flat.unsqueeze(1) == sym_ids.view(1, -1)).any(dim=1)
 
-        # 姿态融合：与 Evaluator / viz 完全一致，默认用 train_use_best_point
-        fused_rt = fuse_pose_from_outputs(
-            outputs,
-            geometry=self.geometry,
-            cfg=self.cfg,
-            stage="train",
-        )
+        # ------------------------------------------------------
+        # Pose fusion (robust under AMP): force FP32 + disable autocast here
+        # ------------------------------------------------------
+        with torch.amp.autocast(device_type=device_type, enabled=False):
+            fused_rt = fuse_pose_from_outputs(
+                outputs=outputs,
+                geometry=self.geometry,
+                cfg=self.cfg,
+                stage="train",
+            ).float()
+        fused_r = fused_rt[:, :3, :3]
         fused_t = fused_rt[:, :3, 3]
 
         # ======================================================
-        # Part 1: Translation Loss (Weighted L1, detach conf)
+        # Part 0: Explicit Rotation Loss (geodesic on fused rotation)
         # ======================================================
-        conf = pred_c.squeeze(2)                         # [B, N]
-        conf_stable = conf.clamp(min=1e-6)
-        conf_sum = conf_stable.sum(dim=1, keepdim=True)  # [B, 1]
-        # 防止 conf 通过平移 loss 学坏：只用它做加权，不回传梯度
-        conf_norm = (conf_stable / conf_sum).detach()    # [B, N]
+        loss_rot = points_cam.new_tensor(0.0)
+        if self.lambda_rot > 0.0:
+            nonsym_mask = ~sym_mask
+            if nonsym_mask.any():
+                with torch.amp.autocast(device_type=device_type, enabled=False):
+                    loss_rot = self._so3_geodesic_loss(
+                        R_pred=fused_r[nonsym_mask].float(),
+                        R_gt=gt_r[nonsym_mask].float(),
+                    )
+            else:
+                loss_rot = points_cam.new_tensor(0.0)
 
-        # 默认直接使用融合后的平移（保持与评估一致）；如需旧行为可配置
+        # ======================================================
+        # Part 1: Translation Loss (Weighted L1)
+        # ======================================================
+        conf = pred_c.squeeze(2)  # [B, N]
+        conf_stable = conf.clamp(min=1e-6)
+        conf_sum = conf_stable.sum(dim=1, keepdim=True)
+        conf_norm = (conf_stable / conf_sum).detach()
+
         use_fused_t = getattr(self.cfg, "loss_use_fused_pose", True)
         if use_fused_t:
-            t_pred_final = fused_t  # [B, 3]
+            t_pred_final = fused_t
         else:
             t_pred_final = (pred_t * conf_norm.unsqueeze(-1)).sum(dim=1)
 
-        diff_t = t_pred_final - gt_t                     # [B, 3]
+        diff_t = t_pred_final - gt_t
         abs_diff_t = torch.abs(diff_t)
 
-        axis_weight = self.axis_weight.to(
-            device=diff_t.device, dtype=diff_t.dtype
-        )
+        axis_weight = self.axis_weight.to(device=device, dtype=diff_t.dtype)
         loss_t = (abs_diff_t * axis_weight).mean()
         loss_t = torch.nan_to_num(loss_t, nan=0.0, posinf=1e4, neginf=1e4)
 
         # ======================================================
-        # Part 2: DenseFusion-style ROI 几何项 (ADD/ADD-S on ROI)
+        # Part 1.5: Optional Z-bias penalty (systematic bias on tz)
         # ======================================================
-        # 将相机坐标下的点云转换到物体坐标系
-        gt_r_inv = gt_r.transpose(1, 2).unsqueeze(1)     # [B, 1, 3, 3]
-        p_centered = points_cam - gt_t.unsqueeze(1)      # [B, N, 3]
-        points_model = torch.matmul(
-            p_centered.unsqueeze(2), gt_r_inv
-        ).squeeze(2)                                     # [B, N, 3]
+        lambda_t_bias_z = float(getattr(self.cfg, "lambda_t_bias_z", 0.3))
+        t_bias_z_mode = str(getattr(self.cfg, "t_bias_z_mode", "batch_mean")).lower()
+        # batch_mean: penalize systematic bias only (recommended)
+        # per_sample: penalize per-sample bias (stronger, intrusive)
 
-        # quat -> rotation (per-point)
-        pred_q_flat = pred_q.reshape(-1, 4)              # [B*N, 4]
+        loss_t_bias_z = points_cam.new_tensor(0.0)
+        if lambda_t_bias_z > 0.0:
+            # Use FP32 for numerical stability under AMP
+            dz = diff_t[:, 2].float()  # [B], signed
+
+            if t_bias_z_mode == "per_sample":
+                # stronger; tends to hurt <5mm metrics
+                # SmoothL1 is usually safer than pure abs
+                beta = float(getattr(self.cfg, "t_bias_beta", 0.005))  # meters, e.g. 5mm
+                loss_t_bias_z = F.smooth_l1_loss(dz, torch.zeros_like(dz), beta=beta, reduction="mean")
+            else:
+                # recommended: only suppress systematic (batch-level) bias
+                mu = dz.mean()  # scalar
+                # Option 1 (simplest & smooth): L2 on mean
+                loss_t_bias_z = mu * mu
+                # Option 2 (robust): SmoothL1 on mean
+                # beta = float(getattr(self.cfg, "t_bias_beta", 0.005))
+                # loss_t_bias_z = F.smooth_l1_loss(mu, mu.new_zeros(()), beta=beta, reduction="mean")
+
+            loss_t_bias_z = torch.nan_to_num(loss_t_bias_z, nan=0.0, posinf=1e4, neginf=1e4)
+
+        # ======================================================
+        # Part 2: DenseFusion-style ROI geometric term (ADD/ADD-S on ROI)
+        # ======================================================
+        gt_r_inv = gt_r.transpose(1, 2).unsqueeze(1)  # [B, 1, 3, 3]
+        p_centered = points_cam - gt_t.unsqueeze(1)   # [B, N, 3]
+        points_model = torch.matmul(p_centered.unsqueeze(2), gt_r_inv).squeeze(2)  # [B, N, 3]
+
+        pred_q_flat = pred_q.reshape(-1, 4)
         pred_r_flat = self.geometry.quat_to_rot(pred_q_flat)
-        pred_r = pred_r_flat.view(B, N, 3, 3)            # [B, N, 3, 3]
+        pred_r = pred_r_flat.view(B, N, 3, 3)
 
-        # 物体坐标系点 -> 预测相机坐标系
-        p_model_exp = points_model.unsqueeze(3)          # [B, N, 3, 1]
+        p_model_exp = points_model.unsqueeze(3)  # [B, N, 3, 1]
         p_rotated = torch.matmul(pred_r, p_model_exp).squeeze(3)  # [B, N, 3]
-        points_pred = p_rotated + pred_t                 # [B, N, 3]
-        points_target = points_cam                       # [B, N, 3]
+        points_pred = p_rotated + pred_t
+        points_target = points_cam
 
-        # ROI 内点的误差（逐样本处理是否对称）
         loss_dist = torch.norm(points_pred - points_target, dim=2, p=2)  # [B, N]
+
+        # ADD-S for symmetric
         if sym_mask.any():
             sym_indices = torch.where(sym_mask)[0]
             for idx in sym_indices:
                 dist_matrix = torch.cdist(
-                    points_pred[idx : idx + 1], points_target[idx : idx + 1], p=2
+                    points_pred[idx: idx + 1],
+                    points_target[idx: idx + 1],
+                    p=2,
                 )
                 loss_dist[idx] = torch.min(dist_matrix, dim=2).values.squeeze(0)
 
         # ======================================================
-        # Part 3: Dense Loss + Confidence Regularization
+        # Part 3: Dense loss + explicit confidence regression
         # ======================================================
-        # 3.1 原始 DenseFusion 风格：
-        #     L_dense = E[ dist * c - w * log(c) ]
         conf_clamped = conf.clamp(min=1e-4, max=1.0)
-        loss_dense = (
-            loss_dist * conf_clamped - self.w_rate * torch.log(conf_clamped)
-        ).mean()
+        loss_dense = (loss_dist * conf_clamped - self.w_rate * torch.log(conf_clamped)).mean()
         loss_dense = torch.nan_to_num(loss_dense, nan=0.0, posinf=1e4, neginf=1e4)
 
-        # 3.2 显式 conf 回归：误差小 -> conf 接近 1，误差大 -> conf 接近 0
         with torch.no_grad():
-            d_clipped = loss_dist.detach().clamp(
-                min=0.0, max=self.conf_dist_max
-            )
-            target_conf = torch.exp(-self.conf_alpha * d_clipped)  # [B, N]
+            d_clipped = loss_dist.detach().clamp(min=0.0, max=self.conf_dist_max)
+            target_conf = torch.exp(-self.conf_alpha * d_clipped)
 
         loss_conf_reg = F.mse_loss(conf, target_conf)
         loss_conf_reg = torch.nan_to_num(loss_conf_reg, nan=0.0, posinf=1e4, neginf=1e4)
 
         # ======================================================
-        # Part 4: 可选 CAD 级 ADD Loss（与 Evaluator 对齐）
+        # Part 4: Optional CAD-level ADD/ADD-S (aligned with evaluator)
         # ======================================================
         loss_add_cad = points_cam.new_tensor(0.0)
         if self.lambda_add_cad > 0.0 and ("model_points" in batch):
-            # 1) 默认使用融合姿态（与评估一致）；如需旧版 best-point 可在 cfg 中关闭
             use_fused_pose = getattr(self.cfg, "loss_use_fused_pose", True)
             if use_fused_pose:
-                pred_rt_cad = fused_rt  # [B, 3, 4]
+                pred_rt_cad = fused_rt
             else:
-                idx_max = conf.argmax(dim=1)  # [B]
+                idx_max = conf.argmax(dim=1)
                 idx_exp = idx_max.view(B, 1, 1)
-                best_q = torch.gather(pred_q, 1, idx_exp.expand(-1, 1, 4)).squeeze(1)  # [B, 4]
-                best_t = torch.gather(pred_t, 1, idx_exp.expand(-1, 1, 3)).squeeze(1)  # [B, 3]
+                best_q = torch.gather(pred_q, 1, idx_exp.expand(-1, 1, 4)).squeeze(1)
+                best_t = torch.gather(pred_t, 1, idx_exp.expand(-1, 1, 3)).squeeze(1)
                 best_q = F.normalize(best_q, dim=-1)
-                best_r = self.geometry.quat_to_rot(best_q)  # [B, 3, 3]
+                best_r = self.geometry.quat_to_rot(best_q)
                 pred_rt_cad = torch.cat([best_r, best_t.unsqueeze(-1)], dim=2)
 
-            gt_rt_cad = gt_pose                                            # [B, 3, 4]
-
-            model_points = batch["model_points"]  # [M, 3] 或 [B, M, 3]
+            gt_rt_cad = gt_pose
+            model_points = batch["model_points"]
             if model_points.dim() == 2:
                 model_points = model_points.unsqueeze(0).expand(B, -1, -1)
 
@@ -254,50 +324,65 @@ class LGFFLoss(nn.Module):
             loss_add_cad = torch.nan_to_num(loss_add_cad, nan=0.0, posinf=1e4, neginf=1e4)
 
         # ======================================================
-        # Part 5: [NEW] Keypoint Offset Loss（FFB6D-style）
+        # Part 5: Optional Keypoint Offset Loss (STRICT gating by cfg.lambda_kp_of)
         # ======================================================
         loss_kp_of = points_cam.new_tensor(0.0)
-        if (
-            self.lambda_kp_of > 0.0
-            and ("pred_kp_ofs" in outputs)
-            and ("kp_targ_ofst" in batch)
-            and ("labels" in batch)
-        ):
-            loss_kp_of = self._compute_kp_offset_loss(
-                pred_kp_ofs=outputs["pred_kp_ofs"],   # [B, K, N, 3]
-                kp_targ_ofst=batch["kp_targ_ofst"],   # [B, N, K, 3] or [B, K, N, 3]
-                labels=batch["labels"],               # [B, N] 或 [B, N, 1]
-            )
-            loss_kp_of = torch.nan_to_num(loss_kp_of, nan=0.0, posinf=1e4, neginf=1e4)
+        lambda_kp_of = float(getattr(self.cfg, "lambda_kp_of", 0.0))
+
+        if lambda_kp_of > 0.0:
+            if ("pred_kp_ofs" in outputs) and ("kp_targ_ofst" in batch) and ("labels" in batch):
+                loss_kp_of = self._compute_kp_offset_loss(
+                    pred_kp_ofs=outputs["pred_kp_ofs"],
+                    kp_targ_ofst=batch["kp_targ_ofst"],
+                    labels=batch["labels"],
+                )
+                loss_kp_of = torch.nan_to_num(loss_kp_of, nan=0.0, posinf=1e4, neginf=1e4)
+            else:
+                # missing keys -> treat as disabled (avoid crashes / side effects)
+                loss_kp_of = points_cam.new_tensor(0.0)
 
         # ======================================================
         # Final Loss
         # ======================================================
         total_loss = (
-            self.lambda_add * loss_dense
+            self.lambda_dense * loss_dense
             + self.lambda_t * loss_t
+            + lambda_t_bias_z * loss_t_bias_z
+            + self.lambda_rot * loss_rot
             + self.lambda_conf * loss_conf_reg
             + self.lambda_add_cad * loss_add_cad
-            + self.lambda_kp_of * loss_kp_of
+            + lambda_kp_of * loss_kp_of
         )
         total_loss = torch.nan_to_num(total_loss, nan=0.0, posinf=1e4, neginf=1e4)
 
         # ======================================================
-        # Metrics（用于日志记录/对比曲线）
+        # Metrics (trainer-compatible)
         # ======================================================
         with torch.no_grad():
             metrics = {
-                "loss_total": total_loss.item(),
-                "loss_add": loss_dense.item(),
-                "loss_t": loss_t.item(),
-                "loss_conf": loss_conf_reg.item(),
+                "loss_total": float(total_loss.item()),
+
+                "loss_dense": float(loss_dense.item()),
+                "loss_add": float(loss_dense.item()),
+
+                "loss_t": float(loss_t.item()),
+                "loss_rot": float(loss_rot.item()),
+                "loss_conf": float(loss_conf_reg.item()),
                 "loss_add_cad": float(loss_add_cad.item()),
-                "loss_kp_of": float(loss_kp_of.item()),   # [NEW]
-                "dist_mean": loss_dist.mean().item(),
-                "conf_mean": conf.mean().item(),
-                "t_err_mean": abs_diff_t.mean().item(),
-                "t_err_z": abs_diff_t[:, 2].mean().item(),
-                "t_bias_z": diff_t[:, 2].mean().item(),
+                "loss_kp_of": float(loss_kp_of.item()),
+
+                "lambda_kp_of": float(lambda_kp_of),
+
+                "dist_mean": float(loss_dist.mean().item()),
+                "conf_mean": float(conf.mean().item()),
+                "t_err_mean": float(abs_diff_t.mean().item()),
+                "t_err_z": float(abs_diff_t[:, 2].mean().item()),
+                "t_bias_z": float(diff_t[:, 2].mean().item()),
+
+                "loss_t_bias_z": float(loss_t_bias_z.item()),
+                "lambda_t_bias_z": float(lambda_t_bias_z),
+                "t_bias_z_batch": float(diff_t[:, 2].mean().item()),
+
             }
 
         return total_loss, metrics

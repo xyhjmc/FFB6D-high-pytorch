@@ -148,9 +148,98 @@ class TrainerSC:
             "val": [],
         }
 
+        # ====== Curriculum Loss 调度：对 lambda_t / lambda_rot 做 epoch 级调节 ======
+        self.total_epochs: int = getattr(self.cfg, "epochs", 50)
+        self.use_curriculum_loss: bool = getattr(self.cfg, "use_curriculum_loss", False)
+        # 在前 warmup_frac 的 epoch，中等权重保持不变；之后线性衰减到 final_factor
+        self.curriculum_warmup_frac: float = getattr(
+            self.cfg, "curriculum_warmup_frac", 0.4
+        )
+        self.curriculum_final_factor_t: float = getattr(
+            self.cfg, "curriculum_final_factor_t", 0.3
+        )
+        self.curriculum_final_factor_rot: float = getattr(
+            self.cfg, "curriculum_final_factor_rot", 0.3
+        )
+
+        # 记录初始的 loss 权重，作为 curriculum 的基准
+        # 注意：这里直接从 loss_fn 上读，避免 cfg 与 loss 内部默认不一致
+        self.base_lambda_dense: float = float(
+            getattr(self.loss_fn, "lambda_dense", getattr(self.cfg, "lambda_add", 1.0))
+        )
+        self.base_lambda_t: float = float(
+            getattr(self.loss_fn, "lambda_t", getattr(self.cfg, "lambda_t", 0.5))
+        )
+        self.base_lambda_rot: float = float(
+            getattr(self.loss_fn, "lambda_rot", getattr(self.cfg, "lambda_rot", 0.5))
+        )
+        self.base_lambda_conf: float = float(
+            getattr(self.loss_fn, "lambda_conf", getattr(self.cfg, "lambda_conf", 0.1))
+        )
+        self.base_lambda_add_cad: float = float(
+            getattr(self.loss_fn, "lambda_add_cad", getattr(self.cfg, "lambda_add_cad", 0.0))
+        )
+        self.base_lambda_kp_of: float = float(
+            getattr(self.loss_fn, "lambda_kp_of", getattr(self.cfg, "lambda_kp_of", 0.6))
+        )
+
         # 8. Resume (optional)
         if resume_path is not None and os.path.exists(resume_path):
             self._load_checkpoint(resume_path)
+
+    # ------------------------------------------------------------------
+    # Curriculum：根据 epoch 调整 loss_fn 内部的 lambda_t / lambda_rot
+    # ------------------------------------------------------------------
+    def _update_loss_schedule(self, epoch: int) -> None:
+        """基于 epoch 对 loss 分支权重做一个简单的 coarse-to-fine 调度。"""
+        if not self.use_curriculum_loss:
+            return
+
+        epoch_idx = epoch + 1
+        frac = epoch_idx / max(1, self.total_epochs)
+
+        warm = self.curriculum_warmup_frac
+        warm = min(max(warm, 0.0), 1.0)
+
+        if frac <= warm:
+            scale_t = 1.0
+            scale_rot = 1.0
+        else:
+            # 在 [warm, 1.0] 区间线性从 1.0 衰减到 final_factor
+            progress = (frac - warm) / max(1e-6, 1.0 - warm)
+            progress = min(max(progress, 0.0), 1.0)
+
+            ft = self.curriculum_final_factor_t
+            fr = self.curriculum_final_factor_rot
+            ft = min(max(ft, 0.0), 1.0)
+            fr = min(max(fr, 0.0), 1.0)
+
+            scale_t = 1.0 - progress * (1.0 - ft)
+            scale_rot = 1.0 - progress * (1.0 - fr)
+
+        # 应用到 loss_fn 内部权重
+        if hasattr(self.loss_fn, "lambda_t"):
+            self.loss_fn.lambda_t = self.base_lambda_t * scale_t
+        if hasattr(self.loss_fn, "lambda_rot"):
+            self.loss_fn.lambda_rot = self.base_lambda_rot * scale_rot
+
+        # 其他分支保持常数（如有需要，也可以在此对 lambda_dense / lambda_kp_of 做反向增强）
+        if hasattr(self.loss_fn, "lambda_dense"):
+            self.loss_fn.lambda_dense = self.base_lambda_dense
+        if hasattr(self.loss_fn, "lambda_conf"):
+            self.loss_fn.lambda_conf = self.base_lambda_conf
+        if hasattr(self.loss_fn, "lambda_add_cad"):
+            self.loss_fn.lambda_add_cad = self.base_lambda_add_cad
+        if hasattr(self.loss_fn, "lambda_kp_of"):
+            self.loss_fn.lambda_kp_of = self.base_lambda_kp_of
+
+        self.logger.info(
+            f"[Curriculum] Epoch {epoch_idx}: "
+            f"lambda_t={getattr(self.loss_fn, 'lambda_t', self.base_lambda_t):.4f}, "
+            f"lambda_rot={getattr(self.loss_fn, 'lambda_rot', self.base_lambda_rot):.4f}, "
+            f"lambda_dense={getattr(self.loss_fn, 'lambda_dense', self.base_lambda_dense):.4f}, "
+            f"lambda_kp_of={getattr(self.loss_fn, 'lambda_kp_of', self.base_lambda_kp_of):.4f}"
+        )
 
     # ------------------------------------------------------------------
     # 主训练入口
@@ -162,6 +251,9 @@ class TrainerSC:
 
         for epoch in range(self.start_epoch, epochs):
             epoch_idx = epoch + 1  # for display
+
+            # 更新当前 epoch 的 loss 权重（Curriculum）
+            self._update_loss_schedule(epoch)
 
             # --- Training ---
             train_metrics = self._train_one_epoch(epoch)
@@ -205,7 +297,7 @@ class TrainerSC:
             # 记录 epoch 级别的指标到 self.history
             self._record_epoch_metrics(epoch_idx, train_metrics, val_metrics)
 
-            # 仅统计：记录 loss 分量、权重与占比（与原始定义保持一致）
+            # 仅统计：记录 loss 分量、权重与占比（与新 loss 命名保持一致）
             self._append_loss_components(epoch_idx, train_metrics)
 
             # -------- 清晰的 Epoch 总结日志 --------
@@ -306,6 +398,13 @@ class TrainerSC:
                 if not isinstance(metrics, dict) or len(metrics) == 0:
                     metrics = {"loss_total": loss.detach()}
 
+            # 若 loss 出现 NaN/Inf，直接跳过该 step（防止梯度爆炸污染模型）
+            if not torch.isfinite(loss):
+                self.logger.warning(
+                    f"[Train] Epoch {epoch + 1}, step {i}: loss is NaN/Inf，skip this batch."
+                )
+                continue
+
             # 统一把 metric 转成 float（支持 0-dim tensor / float / int）
             processed_metrics: Dict[str, float] = {}
             for k, v in metrics.items():
@@ -349,7 +448,7 @@ class TrainerSC:
             }
 
             # 如果这些指标存在，就顺带展示
-            for k in ["loss_t", "dist_mean", "t_err_mean", "t_err_z", "t_bias_z"]:
+            for k in ["loss_t", "loss_rot", "loss_dense", "loss_conf", "loss_add_cad", "loss_kp_of"]:
                 if k in meters:
                     postfix[k] = f"{meters[k].val:.4f}"
 
@@ -445,13 +544,10 @@ class TrainerSC:
                     meters[k].update(v, bs)
 
                 # 2) 统一的姿态指标（和 EvaluatorSC / pose_metrics 一致）
-                #    - 使用 fuse_pose_from_outputs 进行姿态融合
-                #    - 使用 compute_batch_pose_metrics 计算 ADD/ADD-S/t_err/rot_err/cmd_acc
                 pred_rt = fuse_pose_from_outputs(
                     outputs, self.geometry, self.cfg, stage="eval"
                 )
                 gt_rt = batch["pose"]
-
                 model_points = batch["model_points"]  # [B, M, 3]
 
                 # 若 Trainer 侧还没有直径，且 M>1，则用当前 batch 的 CAD 点云估算一次
@@ -490,10 +586,9 @@ class TrainerSC:
                 postfix = {
                     main_key: f"{meters[main_key].val:.4f}",
                 }
-                for k in ["loss_t", "dist_mean", "t_err_mean", "t_err_z", "t_bias_z"]:
+                for k in ["loss_t", "loss_rot", "loss_dense", "loss_conf", "loss_add_cad", "loss_kp_of"]:
                     if k in meters:
                         postfix[k] = f"{meters[k].val:.4f}"
-
                 pbar.set_postfix(postfix)
 
         # 3) 汇总 loss 级别的平均指标
@@ -539,36 +634,64 @@ class TrainerSC:
             self.history["val"].append(val_entry)
 
     # ------------------------------------------------------------------
-    # 记录 loss 分量、权重与占比（仅用于监控）
+    # 记录 loss 分量、权重与占比（仅用于监控，已适配新 loss 命名）
     # ------------------------------------------------------------------
     def _append_loss_components(self, epoch_idx: int, train_metrics: Dict[str, float]) -> None:
+        """
+        注意：
+        - 新版 LGFFLoss 中主要分量命名为：
+          loss_dense, loss_t, loss_rot, loss_conf, loss_add_cad, loss_kp_of
+        - 这里使用 loss_fn 当前的 lambda_*（包含 curriculum 或 uncertainty 的影响），
+          以便统计“实际有效权重”下各分量占比。
+        """
         component_keys = [
-            "loss_add",
+            "loss_dense",
             "loss_t",
+            "loss_rot",
             "loss_conf",
             "loss_add_cad",
             "loss_kp_of",
         ]
         short_names = {
-            "loss_add": "add",
+            "loss_dense": "dense",
             "loss_t": "t",
+            "loss_rot": "rot",
             "loss_conf": "conf",
             "loss_add_cad": "add_cad",
             "loss_kp_of": "kp_of",
         }
 
+        # 从 loss_fn 上读取当前有效权重（包括 curriculum 调整后的值）
         lambdas = {
-            "loss_add": getattr(self.cfg, "lambda_add", 1.0),
-            "loss_t": getattr(self.cfg, "lambda_t", 0.5),
-            "loss_conf": getattr(self.cfg, "lambda_conf", 0.1),
-            "loss_add_cad": getattr(self.cfg, "lambda_add_cad", 0.0),
-            "loss_kp_of": getattr(self.cfg, "lambda_kp_of", 0.6),
+            "loss_dense": float(
+                getattr(self.loss_fn, "lambda_dense", self.base_lambda_dense)
+            ),
+            "loss_t": float(
+                getattr(self.loss_fn, "lambda_t", self.base_lambda_t)
+            ),
+            "loss_rot": float(
+                getattr(self.loss_fn, "lambda_rot", self.base_lambda_rot)
+            ),
+            "loss_conf": float(
+                getattr(self.loss_fn, "lambda_conf", self.base_lambda_conf)
+            ),
+            "loss_add_cad": float(
+                getattr(self.loss_fn, "lambda_add_cad", self.base_lambda_add_cad)
+            ),
+            "loss_kp_of": float(
+                getattr(self.loss_fn, "lambda_kp_of", self.base_lambda_kp_of)
+            ),
         }
 
         total_loss = float(train_metrics.get("loss_total", 0.0))
         components = {k: float(train_metrics.get(k, 0.0)) for k in component_keys}
 
-        weighted = {f"w_{short_names[k]}": lambdas[k] * components[k] for k in component_keys}
+        # 若后续启用了 uncertainty weighting，可以考虑将 lambdas 再乘以 exp(-log_var)
+        # 这里先保持简单，实现一个“近似占比”统计。
+        weighted = {
+            f"w_{short_names[k]}": lambdas[k] * components[k]
+            for k in component_keys
+        }
 
         ratios = {}
         for k in component_keys:
@@ -587,18 +710,21 @@ class TrainerSC:
         with open(self.loss_components_path, "a", encoding="utf-8", newline="") as f:
             fieldnames = [
                 "epoch",
-                "loss_add",
+                "loss_dense",
                 "loss_t",
+                "loss_rot",
                 "loss_conf",
                 "loss_add_cad",
                 "loss_kp_of",
-                "w_add",
+                "w_dense",
                 "w_t",
+                "w_rot",
                 "w_conf",
                 "w_add_cad",
                 "w_kp_of",
-                "ratio_add",
+                "ratio_dense",
                 "ratio_t",
+                "ratio_rot",
                 "ratio_conf",
                 "ratio_add_cad",
                 "ratio_kp_of",
@@ -611,12 +737,13 @@ class TrainerSC:
         # 简短日志，帮助人工检查量纲/权重
         def _fmt_ratio(full_key: str) -> str:
             short = short_names.get(full_key, full_key)
-            return f"{ratios.get(f'ratio_{short}', 0.0)*100:.0f}%"
+            return f"{ratios.get(f'ratio_{short}', 0.0) * 100:.0f}%"
 
         summary_lines = [
             f"[LossBreakdown] epoch={epoch_idx} | total={total_loss:.6f}",
-            f"  - add:   {components['loss_add']:.6f} ({_fmt_ratio('loss_add')})",
+            f"  - dense: {components['loss_dense']:.6f} ({_fmt_ratio('loss_dense')})",
             f"  - t:     {components['loss_t']:.6f} ({_fmt_ratio('loss_t')})",
+            f"  - rot:   {components['loss_rot']:.6f} ({_fmt_ratio('loss_rot')})",
             f"  - conf:  {components['loss_conf']:.6f} ({_fmt_ratio('loss_conf')})",
             f"  - cad:   {components['loss_add_cad']:.6f} ({_fmt_ratio('loss_add_cad')})",
             f"  - kp_of: {components['loss_kp_of']:.6f} ({_fmt_ratio('loss_kp_of')})",

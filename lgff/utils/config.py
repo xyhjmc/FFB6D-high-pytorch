@@ -1,3 +1,4 @@
+# lgff/utils/config.py
 import argparse
 import os
 import yaml
@@ -92,9 +93,9 @@ class LGFFConfig:
     seed: int = 42
     deterministic: bool = False
 
-    # ----------------- Model / Loss Hyper-params -----------------
+    # ----------------- Model / Feature Hyper-params -----------------
 
-    # [新增] 骨干网络名称，用于切换 ResNet / MobileNet
+    # 骨干网络名称，用于切换 ResNet / MobileNet
     backbone_name: str = "mobilenet_v3_large"
 
     backbone_arch: str = "small"  # 仅 MobileNet 使用
@@ -117,15 +118,74 @@ class LGFFConfig:
     head_feat_dim: int = 64
     head_dropout: float = 0.0
 
+    # ----------------- Loss / Geometry Hyper-params -----------------
+
+    # DenseFusion 中 conf 正则项的系数（如果还在用旧实现可保留）
     w_rate: float = 0.015
+
+    # 对称物体的 class id 列表（用于 ADD-S / CMD 等）
     sym_class_ids: List[int] = field(default_factory=list)
+
+    # 主几何 Loss 权重（LGFFLoss 使用）
+    lambda_dense: float = 1.0       # ROI Dense 几何项（点到点 / 点到最近点）
+    lambda_t: float = 0.5           # 平移 L1（含 Z 轴加权）
+    lambda_rot: float = 0.5         # SO(3) 测地距离
+    lambda_conf: float = 0.1        # 显式置信度回归
+    lambda_add_cad: float = 0.1     # CAD 级 ADD/ADD-S
+    lambda_kp_of: float = 0.3       # 关键点 offset 辅助分支
+
+    # [NEW] 可选：专门抑制 z 轴 bias 的附加分支（你做消融时用）
+    # - 默认 0.0：完全不启用，不影响旧实验复现
+    lambda_t_bias_z: float = 0.0
+
+    # [NEW] z-bias 的形式开关：True -> 用 |bias_z|；False -> 用 bias_z（带符号）
+    # - 建议默认 True（数值更稳定、方向不敏感），但你可做消融
+    t_bias_z_use_abs: bool = True
+
+    # 平移 / 置信度细节
+    t_z_weight: float = 2.0         # Z 轴额外权重
+    conf_alpha: float = 10.0        # 误差 -> 置信度 的敏感度
+    conf_dist_max: float = 0.05     # 误差截断上限（m）
+
+    # 是否使用测地旋转 Loss（方便开关对比实验）
+    use_geodesic_rot: bool = True
+
+    # 课程式 Loss 权重调度
+    use_curriculum_loss: bool = False
+    curriculum_warmup_frac: float = 0.4        # 前多少比例 epoch 保持原 lambda
+    curriculum_final_factor_t: float = 0.3     # t 的最终衰减倍数
+    curriculum_final_factor_rot: float = 0.3   # rot 的最终衰减倍数
+
+    # 多任务同方差不确定性加权（Kendall-style）
+    use_uncertainty_weighting: bool = False
+
+    # ----------------- Pose Fusion Control -----------------
 
     # 姿态融合控制：train/val/viz 阶段可独立切换 best-point vs Top-K 加权
     train_use_best_point: Optional[bool] = None
     eval_use_best_point: bool = True
     viz_use_best_point: Optional[bool] = None
+
+    # 通用的 top-k 融合上限（旧字段，默认仍保留）
     pose_fusion_topk: int = 64
+
+    # eval 专用 topk（如果你在 pose_metrics.py 做了 stage-aware topk，建议保留该字段）
+    eval_topk: Optional[int] = None
+
+    # [NEW] 可选：train/viz 专用 topk（用于你后续“训练用 topk、评估用 topk”的消融）
+    train_topk: Optional[int] = None
+    viz_topk: Optional[int] = None
+
+    # loss 中是否使用融合后的姿态（与 Evaluator 对齐）
     loss_use_fused_pose: bool = True
+
+    # ----------------- 评估 / 阈值相关 -----------------
+
+    # CMD 阈值（单位 m），Trainer / Evaluator / pose_metrics 统一使用
+    cmd_threshold_m: float = 0.02
+
+    # 物体直径（单位 m），如果不在 config 中写死，Trainer 会在 val 期间估算一次
+    obj_diameter_m: Optional[float] = None
 
     # ----------------- Logging / Output -----------------
     log_dir: str = "output/debug"
@@ -138,7 +198,7 @@ class LGFFConfig:
             else:
                 print(f"[Config] Warning: Unknown config key: {key} (ignored)")
 
-    # 增强：基础合法性校验与路径展开，避免静默错误
+    # 基础合法性校验，避免静默错误
     def validate(self) -> None:
         if self.resize_h <= 0 or self.resize_w <= 0:
             raise ValueError("resize_h/resize_w must be positive")
@@ -148,6 +208,32 @@ class LGFFConfig:
             raise ValueError("camera_intrinsic must be a 3x3 matrix")
         if self.num_keypoints <= 0:
             raise ValueError("num_keypoints must be > 0")
+
+        # lambdas 非负简单检查（防止手滑写成负数）
+        for name in [
+            "lambda_dense", "lambda_t", "lambda_rot",
+            "lambda_conf", "lambda_add_cad", "lambda_kp_of",
+            "lambda_t_bias_z",  # [NEW]
+        ]:
+            val = getattr(self, name)
+            if val < 0:
+                raise ValueError(f"{name} must be non-negative, got {val}")
+
+        # curriculum 参数基本范围检查
+        if not (0.0 <= self.curriculum_warmup_frac <= 1.0):
+            raise ValueError(f"curriculum_warmup_frac must be in [0,1], got {self.curriculum_warmup_frac}")
+        if not (0.0 <= self.curriculum_final_factor_t <= 1.0):
+            raise ValueError(f"curriculum_final_factor_t must be in [0,1], got {self.curriculum_final_factor_t}")
+        if not (0.0 <= self.curriculum_final_factor_rot <= 1.0):
+            raise ValueError(f"curriculum_final_factor_rot must be in [0,1], got {self.curriculum_final_factor_rot}")
+
+        # topk 合法性（None 表示不覆盖）
+        for kname in ["pose_fusion_topk", "train_topk", "eval_topk", "viz_topk"]:
+            kval = getattr(self, kname, None)
+            if kval is None:
+                continue
+            if not isinstance(kval, int) or kval <= 0:
+                raise ValueError(f"{kname} must be a positive int or None, got {kval}")
 
     def resolve_paths(self) -> None:
         self.dataset_root = os.path.expanduser(self.dataset_root)

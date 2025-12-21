@@ -33,21 +33,68 @@ class ModelComplexityLogger:
     def _count_parameters(model):
         base_model = model.module if hasattr(model, "module") else model
         total_params = sum(p.numel() for p in base_model.parameters())
-        return total_params, total_params * 4 / (1024 ** 2)
+        # param_mb 只是一个粗略换算：假定 float32 * 4 bytes
+        param_mb = total_params * 4 / (1024 ** 2)
+        return total_params, param_mb
+
+    @staticmethod
+    def _infer_batch_size(inputs: dict) -> int:
+        """
+        尝试从输入字典中推断 batch size：
+        取第一个形状 >=1 的 tensor 的 dim0 作为 batch_size。
+        """
+        for v in inputs.values():
+            if isinstance(v, torch.Tensor) and v.ndim >= 1:
+                return int(v.shape[0])
+        return 1  # 实在推不出来就当 1
 
     @staticmethod
     def _measure_flops(model, inputs):
+        """
+        使用 torch.profiler 统计一次 forward 的总 FLOPs（当前 batch），
+        并换算为：
+          - gflops_total: 当前 batch 的总 GFLOPs
+          - gflops_per_sample: 单样本 GFLOPs（gflops_total / batch_size）
+        """
         base_model = model.module if hasattr(model, "module") else model
+
+        # 推断 batch size（用于 per-sample 归一化）
+        batch_size = ModelComplexityLogger._infer_batch_size(inputs)
+
         activities = [ProfilerActivity.CPU]
-        if any(tensor.is_cuda for tensor in inputs.values() if isinstance(tensor, torch.Tensor)):
+        if any(
+            isinstance(t, torch.Tensor) and t.is_cuda
+            for t in inputs.values()
+        ):
             activities.append(ProfilerActivity.CUDA)
+
         with torch.no_grad():
-            with profile(activities=activities, record_shapes=True, with_flops=True) as prof:
+            with profile(
+                activities=activities,
+                record_shapes=True,
+                with_flops=True
+            ) as prof:
                 base_model(inputs)
-        total_flops = sum(evt.flops for evt in prof.key_averages() if evt.flops is not None)
-        return total_flops / 1e9
+
+        total_flops = sum(
+            evt.flops for evt in prof.key_averages() if evt.flops is not None
+        )
+
+        gflops_total = total_flops / 1e9
+        if batch_size > 0:
+            gflops_per_sample = gflops_total / batch_size
+        else:
+            gflops_per_sample = gflops_total
+
+        return gflops_total, gflops_per_sample, batch_size
 
     def maybe_log(self, model, batch, stage="unknown"):
+        """
+        只在每个 stage 第一次调用时打印：
+          - 参数量（总参数 & 约等于 MB）
+          - 当前 batch 的 forward 总 GFLOPs
+          - 单样本 GFLOPs（per image），更接近 YOLO 报法
+        """
         if stage in self._logged_stages:
             return None
 
@@ -59,9 +106,11 @@ class ModelComplexityLogger:
 
         params, param_mb = self._count_parameters(model)
         try:
-            gflops = self._measure_flops(model, prepared)
+            gflops_total, gflops_per_sample, batch_size = self._measure_flops(
+                model, prepared
+            )
         except Exception as exc:  # pragma: no cover - profiler issues are not fatal
-            gflops = None
+            gflops_total, gflops_per_sample, batch_size = None, None, None
             print(f"[ModelComplexity] Failed to compute FLOPs: {exc}")
 
         if was_training:
@@ -73,7 +122,21 @@ class ModelComplexityLogger:
             f"[ModelComplexity] Stage: {stage}",
             f"Parameters: {params:,} ({param_mb:.2f} MB)",
         ]
-        if gflops is not None:
-            msg_parts.append(f"Forward GFLOPs: {gflops:.3f}")
+        if gflops_total is not None:
+            msg_parts.append(
+                f"Forward GFLOPs (batch) = {gflops_total:.3f}"
+            )
+        if gflops_per_sample is not None and batch_size is not None:
+            msg_parts.append(
+                f"Forward GFLOPs (per sample) = {gflops_per_sample:.3f} (B={batch_size})"
+            )
+
         print(" | ".join(msg_parts))
-        return {"params": params, "param_mb": param_mb, "gflops": gflops}
+
+        return {
+            "params": params,
+            "param_mb": param_mb,
+            "gflops": gflops_total,
+            "gflops_per_sample": gflops_per_sample,
+            "batch_size": batch_size,
+        }

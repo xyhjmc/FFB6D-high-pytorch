@@ -1,5 +1,6 @@
 # =========================================
 # LGFF Single-Class Config (LINEMOD - APE)
+# Manifold-aware + Hybrid Loss 版本
 # =========================================
 
 # ---------- Dataset / BOP ----------
@@ -10,7 +11,7 @@ dataset_name: "bop-single"
 dataset_root: "/home/xyh/PycharmProjects/FFB6D-high-pytorch/lgff/data/linemod_ape_crop128_all"
 
 obj_id: 1
-num_points: 2048
+num_points: 1024
 num_keypoints: 8
 val_split: "test"               # 与裁剪脚本输出的 split 对齐
 
@@ -66,10 +67,61 @@ head_hidden_dim: 128
 head_feat_dim: 64
 head_dropout: 0.0
 
-# ---------- Loss & Symmetry ----------
-w_rate: 0.015
-sym_class_ids: []          # ape 非对称
+# ======================================================
+# Loss & Symmetry（新：Dense + Rot + CAD + KP 混合）
+# ======================================================
+w_rate: 0.015          # DenseFusion 中 conf 正则项系数
+sym_class_ids: []      # ape 非对称物体
+
+# 主几何 Loss 权重（新版 LGFFLoss 中的 lambda_*）
+
+lambda_dense: 1.0
+lambda_t: 1.0
+lambda_rot: 0.05
+lambda_conf: 0.05
+lambda_add_cad: 0.20
+lambda_kp_of: 0.3 # 先给 0.2，观察 loss_kp_of 曲线与占比
+
+
+t_z_weight: 2.0
+conf_alpha: 12.0
+conf_dist_max: 0.025
+
+# 使用与 Evaluator 一致的融合姿态做监督（平移 + CAD ADD）
+loss_use_fused_pose: true
+
+# （如果你在 LGFFLoss 中加了开关，可以保留；否则可忽略）
+use_geodesic_rot: true
+
+# ======================================================
+# Curriculum & Uncertainty（TrainerSC / LGFFLoss 用）
+# ======================================================
+
+# 是否启用 coarse-to-fine 课程式权重调度：
+#   前期 lambda_t / lambda_rot 较大，帮助快速对齐位姿参数；
+#   后期逐步减弱，让 dense / kp_of 等几何项主导精修。
+use_curriculum_loss: false
+curriculum_warmup_frac: 0.4      # 前 40% epoch 保持原始权重
+curriculum_final_factor_t: 0.3   # 末期 lambda_t 衰减到 0.3 * 初始
+curriculum_final_factor_rot: 0.3 # 末期 lambda_rot 衰减到 0.3 * 初始
+
+# 多任务同方差不确定性权重（如果你在 LGFFLoss 中实现了，可直接打开做实验）
+use_uncertainty_weighting: false
+
+# ======================================================
+# Pose 融合 / 评估阈值（与 EvaluatorSC 对齐）
+# ======================================================
+
+# 姿态融合策略（fuse_pose_from_outputs 用到的配置，保持原来习惯即可）
+train_use_best_point: true    # 训练阶段内部融合时：默认使用 best point 作为基准
+#eval_use_best_point: true     # 评估阶段同样使用 best point（可后续试 top-k 融合）
+eval_topk: 8                  # 若使用 top-k 融合，可通过 cfg 控制 k 值
+
+
+# CMD & obj 直径（单位 m）
+cmd_threshold_m: 0.02
+obj_diameter_m: 0.1016561314   # eval log 中估计得到的 ape 直径，可写死进配置
 
 # ---------- Logging / Output ----------
-log_dir: "output/linemod_ape_sc_mnl_all"
+log_dir: "/home/xyh/PycharmProjects/FFB6D-high-pytorch/output/linemod_ape_sc_mnl_all"
 # 不写 work_dir 会默认使用 log_dir
