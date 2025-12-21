@@ -29,6 +29,45 @@ def _resolve_topk(cfg, N: int, stage: str) -> int:
     return min(max(32, N // 4), N)
 
 
+def describe_fusion_policy(cfg, stage: str, num_points: Optional[int] = None) -> Dict[str, Optional[object]]:
+    """
+    Describe the resolved pose fusion policy for logging/debug.
+    When use_best_point=True, Top-K related values are hard-disabled (effective_topk=1).
+    """
+    use_best_point = _resolve_use_best_point(cfg, stage)
+    raw_stage_topk = getattr(cfg, f"{stage}_topk", None)
+    raw_fallback_topk = getattr(cfg, "pose_fusion_topk", None)
+
+    policy: Dict[str, Optional[object]] = {
+        "stage": stage,
+        "use_best_point": use_best_point,
+        "raw_stage_topk": raw_stage_topk,
+        "raw_pose_fusion_topk": raw_fallback_topk,
+    }
+
+    if use_best_point:
+        policy.update(
+            {
+                "fusion_mode": "best_point",
+                "effective_topk": 1,
+                "topk_ignored": True,
+            }
+        )
+    else:
+        resolved_topk: Optional[int] = None
+        if num_points is not None:
+            resolved_topk = _resolve_topk(cfg, num_points, stage)
+        policy.update(
+            {
+                "fusion_mode": "weighted_topk",
+                "effective_topk": resolved_topk,
+                "topk_ignored": False,
+            }
+        )
+
+    return policy
+
+
 def fuse_pose_from_outputs(
     outputs: Dict[str, torch.Tensor],
     geometry,
@@ -46,7 +85,8 @@ def fuse_pose_from_outputs(
     B, N, _ = pred_q.shape
     conf = pred_c.squeeze(-1)  # [B, N]
 
-    use_best_point = _resolve_use_best_point(cfg, stage)
+    fusion_policy = describe_fusion_policy(cfg, stage, num_points=N)
+    use_best_point = fusion_policy["use_best_point"]
 
     if use_best_point:
         idx = torch.argmax(conf, dim=1)  # [B]
@@ -62,7 +102,9 @@ def fuse_pose_from_outputs(
         return pred_rt
 
     # -------- Top-K + 置信度加权融合 --------
-    k = _resolve_topk(cfg, N, stage)
+    k = fusion_policy["effective_topk"]
+    if k is None:
+        k = _resolve_topk(cfg, N, stage)
     conf_topk, idx = torch.topk(conf, k=k, dim=1)
     conf_topk = conf_topk.clamp(min=1e-4)
 

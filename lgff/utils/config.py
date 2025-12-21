@@ -71,6 +71,7 @@ class LGFFConfig:
     # mask handling
     mask_invalid_policy: str = "skip"  # "skip" | "raise"
     allow_mask_fallback: bool = False
+    min_mask_nonzero_ratio: float = 0.001
 
     camera_intrinsic: List[List[float]] = field(
         default_factory=lambda: [
@@ -267,6 +268,8 @@ class LGFFConfig:
                 raise ValueError(f"{kname} must be a positive int or None, got {kval}")
         if self.mask_invalid_policy not in ("skip", "raise"):
             raise ValueError(f"mask_invalid_policy must be 'skip' or 'raise', got {self.mask_invalid_policy}")
+        if self.min_mask_nonzero_ratio < 0 or self.min_mask_nonzero_ratio > 1:
+            raise ValueError("min_mask_nonzero_ratio must be in [0,1]")
         if self.scene_overlap_policy not in ("warn", "raise"):
             raise ValueError(f"scene_overlap_policy must be 'warn' or 'raise', got {self.scene_overlap_policy}")
 
