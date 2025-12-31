@@ -80,6 +80,8 @@ class LGFF_SC_SEG(LGFFBase):
         self.pose_fusion_valid_mask_source: str = str(getattr(cfg, "pose_fusion_valid_mask_source", "labels")).lower()
         # 允许 cfg 里写 pose_fusion_conf_floor（你已在 yaml 里写）
         self.pose_fusion_conf_floor: float = float(getattr(cfg, "pose_fusion_conf_floor", 1e-4))
+        # 是否在模型内部用 seg mask 直接抑制 conf
+        self.pose_fusion_mask_conf_in_model: bool = bool(getattr(cfg, "pose_fusion_mask_conf_in_model", False))
 
         # ==================================================================
         # 1. RGB Branch
@@ -402,8 +404,13 @@ class LGFF_SC_SEG(LGFFBase):
         pred_c = torch.sigmoid(pred_c)
 
         # 可选：如果你希望在模型内就用 seg 抑制无效点 conf（不是必须）
-        # if self.pose_fusion_use_valid_mask and self.pose_fusion_valid_mask_source == "seg" and pred_valid_mask is not None:
-        #     pred_c = pred_c * pred_valid_mask.unsqueeze(-1).clamp_min(self.pose_fusion_conf_floor)
+        if (
+            self.pose_fusion_mask_conf_in_model
+            and self.pose_fusion_use_valid_mask
+            and self.pose_fusion_valid_mask_source == "seg"
+            and pred_valid_mask is not None
+        ):
+            pred_c = pred_c * pred_valid_mask.unsqueeze(-1).clamp_min(self.pose_fusion_conf_floor)
 
         pred_kp_ofs = None
         lambda_kp_of = float(getattr(self.cfg, "lambda_kp_of", 0.3))

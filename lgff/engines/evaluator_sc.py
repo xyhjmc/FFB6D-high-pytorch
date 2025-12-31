@@ -265,7 +265,34 @@ class EvaluatorSC:
         return summary
     # ------------------------------------------------------------------ #
     def _process_predictions(self, outputs: Dict[str, torch.Tensor]) -> torch.Tensor:
-        return fuse_pose_from_outputs(outputs, self.geometry, self.cfg, stage="eval")
+        valid_mask = None
+
+        if bool(getattr(self.cfg, "pose_fusion_use_valid_mask", False)):
+            mask_src = str(getattr(self.cfg, "pose_fusion_valid_mask_source", "")).lower()
+
+            if mask_src == "seg":
+                vm = outputs.get("pred_valid_mask_bool", None)
+                if vm is None:
+                    vm = outputs.get("pred_valid_mask", None)
+
+                if isinstance(vm, torch.Tensor):
+                    if vm.dim() == 3 and vm.shape[-1] == 1:
+                        vm = vm.squeeze(-1)
+
+                    B = int(outputs["pred_quat"].shape[0])
+                    if "points" in outputs and isinstance(outputs["points"], torch.Tensor) and outputs["points"].dim() >= 2:
+                        N = int(outputs["points"].shape[1])
+                    else:
+                        pq = outputs["pred_quat"]
+                        N = int(pq.shape[1]) if pq.dim() == 3 else 1
+
+                    if vm.dim() == 1 and vm.numel() == N:
+                        vm = vm.view(1, -1).expand(B, -1)
+
+                    if vm.dim() == 2 and vm.shape[0] == B and vm.shape[1] == N:
+                        valid_mask = vm
+
+        return fuse_pose_from_outputs(outputs, self.geometry, self.cfg, stage="eval", valid_mask=valid_mask)
 
     def _process_gt(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         return batch["pose"].to(self.device)
