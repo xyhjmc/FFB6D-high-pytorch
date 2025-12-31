@@ -177,7 +177,7 @@ class EvaluatorSC:
                 outputs = self.model(batch)
 
                 # 2. 默认基准：纯回归结果 [B, 3, 4]
-                pred_rt_reg = self._process_predictions(outputs)
+                pred_rt_reg = self._process_predictions(outputs, batch=batch)
 
                 # 初始化最终结果为纯回归
                 pred_rt_final = pred_rt_reg.clone()
@@ -264,7 +264,7 @@ class EvaluatorSC:
         self._dump_per_image_csv()
         return summary
     # ------------------------------------------------------------------ #
-    def _process_predictions(self, outputs: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def _process_predictions(self, outputs: Dict[str, torch.Tensor], batch: Optional[Dict[str, torch.Tensor]] = None) -> torch.Tensor:
         valid_mask = None
 
         if bool(getattr(self.cfg, "pose_fusion_use_valid_mask", False)):
@@ -291,6 +291,31 @@ class EvaluatorSC:
 
                     if vm.dim() == 2 and vm.shape[0] == B and vm.shape[1] == N:
                         valid_mask = vm
+
+                # seg mask missing or degenerate -> fall back to labels (keeps eval aligned with train/val)
+                if (valid_mask is None or (torch.is_tensor(valid_mask) and valid_mask.sum() <= 0)) and batch is not None:
+                    lbl = batch.get("labels", None)
+                    if isinstance(lbl, torch.Tensor):
+                        if lbl.dim() == 1:
+                            lbl = lbl.view(1, -1).expand(B, -1)
+                        if lbl.dim() == 2 and lbl.shape[0] == B:
+                            if lbl.shape[1] != N:
+                                # expand [B,1] style labels to per-point if provided
+                                lbl = lbl.expand(-1, N) if lbl.shape[1] == 1 else lbl
+                            if lbl.shape[1] == N:
+                                if valid_mask is None and not hasattr(self, "_seg_fallback_logged"):
+                                    self.logger.warning(
+                                        "[EvaluatorSC] Seg valid mask missing/empty; falling back to depth labels for pose fusion."
+                                    )
+                                    self._seg_fallback_logged = True
+                                valid_mask = lbl.to(dtype=torch.bool, device=outputs["pred_quat"].device)
+            elif mask_src == "labels" and batch is not None:
+                lbl = batch.get("labels", None)
+                if isinstance(lbl, torch.Tensor):
+                    if lbl.dim() == 1:
+                        lbl = lbl.view(1, -1).expand(outputs["pred_quat"].shape[0], -1)
+                    if lbl.dim() == 2 and lbl.shape[0] == outputs["pred_quat"].shape[0]:
+                        valid_mask = lbl.to(dtype=torch.bool, device=outputs["pred_quat"].device)
 
         return fuse_pose_from_outputs(outputs, self.geometry, self.cfg, stage="eval", valid_mask=valid_mask)
 
