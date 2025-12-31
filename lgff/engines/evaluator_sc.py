@@ -1,12 +1,21 @@
 """
 Evaluation pipeline for the single-class LGFF model.
 
-Key additions in this version:
-- Ensure BOTH ADD and ADD-S are computed and reported.
-- Provide accuracy-vs-threshold curves for BOTH add and add_s.
-- Per-image CSV includes succ_add_* flags analogous to succ_adds_*.
+This version:
+- Computes and reports BOTH ADD and ADD-S.
+- Outputs per-image CSV including succ_add_* flags analogous to succ_adds_*.
 - Robust fallback if compute_batch_pose_metrics misses 'add'/'add_s'.
-- [ICP] Configurable, robust, "refine only bad" by default, bad-metric can be ADD.
+- ICP: ALWAYS apply ICP to every sample (no gating / no "refine only bad").
+  (All “cheating / only refine bad” logic removed.)
+- [New] PnP Support: Uses RANSAC PnP if 'eval_use_pnp' is True in config.
+
+Notes:
+- Requires batch to provide:
+  - batch["pose"]          : [B,3,4] GT pose (model->cam)
+  - batch["model_points"] : [B,M,3] or [M,3]
+  - batch["point_cloud"]  : [B,N,3] observed points (cam), or batch["points"]
+  - optional: batch["labels"] foreground mask per point [B,N] or [N]
+  - optional: batch["cls_id"], batch["scene_id"], batch["im_id"]
 """
 
 from __future__ import annotations
@@ -28,6 +37,11 @@ from lgff.utils.pose_metrics import (
     fuse_pose_from_outputs,
     compute_batch_pose_metrics,
 )
+# [New] Import PnP Solver
+try:
+    from lgff.utils.pnp_solver import PnPSolver
+except ImportError:
+    PnPSolver = None
 
 
 def _np_percentile(x: np.ndarray, q: float) -> float:
@@ -102,16 +116,25 @@ class EvaluatorSC:
         self.per_image_records: List[Dict[str, Any]] = []
         self.sample_counter: int = 0
 
+        # ===== PnP Config (New) =====
+        self.use_pnp = bool(getattr(cfg, "eval_use_pnp", True))
+        if self.use_pnp:
+            if PnPSolver is None:
+                self.logger.error("[EvaluatorSC] PnPSolver could not be imported! Falling back to Regression.")
+                self.use_pnp = False
+                self.pnp_solver = None
+            else:
+                self.pnp_solver = PnPSolver(cfg)
+                self.logger.info("[EvaluatorSC] PnP Solver ENABLED (RANSAC Voting).")
+        else:
+            self.pnp_solver = None
+            self.logger.info("[EvaluatorSC] PnP Solver DISABLED (Using Regression Head).")
+
         # ===== ICP config (all via cfg) =====
         self.icp_enable: bool = bool(getattr(cfg, "icp_enable", False))
-        # strongly recommend True based on your experiments
-        self.icp_only_when_bad: bool = bool(getattr(cfg, "icp_only_when_bad", False))
-        # 'add' | 'adds' | 'dist_for_cmd'
-        self.icp_bad_metric: str = str(getattr(cfg, "icp_bad_metric", "add")).lower()
 
-        # threshold: use abs(m) if provided; else use rel(d) if provided; else fallback to cmd threshold
-        self.icp_bad_abs_th_m: Optional[float] = getattr(cfg, "icp_bad_abs_th_m", None)
-        self.icp_bad_rel_th_d: Optional[float] = getattr(cfg, "icp_bad_rel_th_d", None)
+        if self.use_pnp and self.icp_enable:
+            self.logger.info("[EvaluatorSC] Note: Both PnP and ICP are enabled. PnP result will be fed into ICP.")
 
         # ICP main params
         self.icp_iters: int = int(getattr(cfg, "icp_iters", 10))
@@ -122,16 +145,14 @@ class EvaluatorSC:
         self.icp_min_corr: int = int(getattr(cfg, "icp_min_corr", 50))
 
         # Optional point filtering
-        self.icp_z_min: Optional[float] = getattr(cfg, "icp_z_min", None)  # e.g. 0.1
-        self.icp_z_max: Optional[float] = getattr(cfg, "icp_z_max", None)  # e.g. 5.0
-        # Robust outlier removal by MAD (None/0 disables). Suggested 3.0~4.0
+        self.icp_z_min: Optional[float] = getattr(cfg, "icp_z_min", None)
+        self.icp_z_max: Optional[float] = getattr(cfg, "icp_z_max", None)
         self.icp_obs_mad_k: float = float(getattr(cfg, "icp_obs_mad_k", 0.0))
 
         # Optional multi-stage schedule (corr dist + iters)
         self.icp_corr_schedule_m: Optional[List[float]] = getattr(cfg, "icp_corr_schedule_m", None)
         self.icp_iters_schedule: Optional[List[int]] = getattr(cfg, "icp_iters_schedule", None)
 
-    # ------------------------------------------------------------------ #
     def run(self) -> Dict[str, float]:
         self.model.eval()
         self.logger.info(f"Start Evaluation on {len(self.test_loader)} batches...")
@@ -141,26 +162,107 @@ class EvaluatorSC:
         self.per_image_records = []
         self.sample_counter = 0
 
+        pnp_trigger_count = 0
+        reg_trigger_count = 0
+
         with torch.no_grad():
             for _, batch in enumerate(tqdm(self.test_loader, desc="Evaluating")):
                 batch = {
                     k: v.to(self.device) if isinstance(v, torch.Tensor) else v
                     for k, v in batch.items()
                 }
+                B = batch["rgb"].shape[0]
 
+                # 1. 模型推理
                 outputs = self.model(batch)
-                pred_rt = self._process_predictions(outputs)
 
+                # 2. 默认基准：纯回归结果 [B, 3, 4]
+                pred_rt_reg = self._process_predictions(outputs)
+
+                # 初始化最终结果为纯回归
+                pred_rt_final = pred_rt_reg.clone()
+
+                # 3. 动态分流逻辑 (Dynamic Branching)
+                # 计算当前 batch 的对称掩码
+                cls_ids = batch.get("cls_id", None)
+                sym_mask = self._sym_mask_from_cls_ids(cls_ids, B, self.device)  # [B] bool
+                nonsym_mask = ~sym_mask
+
+                # 只有当 (1) 开启PnP (2) 存在非对称物体 (3) 关键点存在 时，才启动 PnP
+                should_run_pnp = (
+                        self.use_pnp
+                        and nonsym_mask.any()
+                        and "pred_kp_ofs" in outputs
+                        and outputs["pred_kp_ofs"] is not None
+                )
+
+                if should_run_pnp:
+                    model_kps = batch.get("kp3d_model", None)
+                    if model_kps is not None:
+                        # 运行 PnP (对整个 Batch 跑，稍后只取 nonsym 部分)
+                        # 或者：更极致的做法是只对 nonsym 样本跑 PnP (节省算力)，这里为了代码简单，跑全量
+                        pred_rt_pnp_raw = self.pnp_solver.solve_batch(
+                            points=outputs["points"],
+                            pred_kp_ofs=outputs["pred_kp_ofs"],
+                            pred_conf=outputs.get("pred_conf", None),
+                            model_kps=model_kps
+                        )
+
+                        # --- [混合策略组装] ---
+                        # PnP 结果
+                        R_pnp = pred_rt_pnp_raw[:, :3, :3]
+                        t_pnp = pred_rt_pnp_raw[:, :3, 3]
+
+                        # Regression 结果 (用于 Z 轴修正)
+                        if "pred_trans" in outputs:
+                            # 加上置信度加权平均会更准
+                            pred_c = outputs.get("pred_conf", None)
+                            if pred_c is not None:
+                                c = pred_c.squeeze(2)
+                                w = c / (c.sum(dim=1, keepdim=True) + 1e-6)
+                                t_reg = (outputs["pred_trans"] * w.unsqueeze(-1)).sum(dim=1)
+                            else:
+                                t_reg = outputs["pred_trans"].mean(dim=1)
+                        else:
+                            t_reg = pred_rt_reg[:, :3, 3]
+
+                        # 混合 t: xy来自PnP, z来自Regression
+                        t_hybrid = torch.stack([t_pnp[:, 0], t_pnp[:, 1], t_reg[:, 2]], dim=1)
+
+                        # 组装 PnP Pose
+                        pred_rt_pnp_hybrid = torch.cat([R_pnp, t_hybrid.unsqueeze(-1)], dim=2)
+
+                        # --- [核心分流] ---
+                        # 非对称物体 (nonsym) -> 使用 PnP Hybrid 结果
+                        # 对称物体 (sym)    -> 保持 Regression 结果 (pred_rt_final 初始值)
+
+                        # 这里的 where 需要广播: [B] -> [B, 3, 4]
+                        mask_bc = nonsym_mask.view(B, 1, 1).expand(-1, 3, 4)
+                        pred_rt_final = torch.where(mask_bc, pred_rt_pnp_hybrid, pred_rt_final)
+
+                        pnp_count = nonsym_mask.sum().item()
+                        pnp_trigger_count += pnp_count
+                        reg_trigger_count += (B - pnp_count)
+                    else:
+                        reg_trigger_count += B
+                else:
+                    reg_trigger_count += B
+
+                # 4. ICP Refinement (始终开启，用于最后微调)
                 if self.icp_enable:
-                    pred_rt = self._icp_refine_batch(pred_rt, batch)
+                    # ICP 会基于当前的 pred_rt_final (可能是 PnP 也可能是 Reg) 继续优化
+                    pred_rt_final = self._icp_refine_batch(pred_rt_final, batch)
 
+                # 5. 计算指标
                 gt_rt = self._process_gt(batch)
-                self._compute_metrics(pred_rt, gt_rt, batch)
+                self._compute_metrics(pred_rt_final, gt_rt, batch)
+
+        self.logger.info(
+            f"Inference Stats: PnP+Hybrid used for {pnp_trigger_count} samples, Pure Regression used for {reg_trigger_count} samples.")
 
         summary = self._summarize_metrics()
         self._dump_per_image_csv()
         return summary
-
     # ------------------------------------------------------------------ #
     def _process_predictions(self, outputs: Dict[str, torch.Tensor]) -> torch.Tensor:
         return fuse_pose_from_outputs(outputs, self.geometry, self.cfg, stage="eval")
@@ -194,18 +296,8 @@ class EvaluatorSC:
             sym_mask = (cid.unsqueeze(1) == sym_ids.view(1, -1)).any(dim=1)
         return sym_mask
 
-    def _get_bad_threshold_m(self) -> float:
-        # priority: abs_th_m > rel_th_d > cmd_threshold_m
-        if self.icp_bad_abs_th_m is not None:
-            return float(self.icp_bad_abs_th_m)
-        if self.icp_bad_rel_th_d is not None:
-            d = float(self.obj_diameter or 0.0)
-            if d > 0:
-                return float(self.icp_bad_rel_th_d) * d
-        return float(self.cmd_acc_threshold_m)
-
     def _filter_obs_points(self, pts: torch.Tensor) -> torch.Tensor:
-        # pts: [N,3] in camera frame
+        # pts: [N,3] cam frame
         if pts.numel() == 0:
             return pts
 
@@ -214,7 +306,6 @@ class EvaluatorSC:
         if pts.shape[0] == 0:
             return pts
 
-        # Z-range filter
         if self.icp_z_min is not None:
             pts = pts[pts[:, 2] >= float(self.icp_z_min)]
         if self.icp_z_max is not None:
@@ -222,10 +313,9 @@ class EvaluatorSC:
         if pts.shape[0] == 0:
             return pts
 
-        # MAD outlier removal (very light & effective for ROI point clouds)
         if self.icp_obs_mad_k and self.icp_obs_mad_k > 0:
             center = pts.median(dim=0).values
-            r = torch.norm(pts - center.unsqueeze(0), dim=1)  # [N]
+            r = torch.norm(pts - center.unsqueeze(0), dim=1)
             med = r.median()
             mad = (r - med).abs().median().clamp_min(1e-6)
             keep = (r - med).abs() <= (self.icp_obs_mad_k * mad)
@@ -242,8 +332,8 @@ class EvaluatorSC:
         gt_rt: torch.Tensor,
         model_points: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        add = self.geometry.compute_add(pred_rt, gt_rt, model_points)     # [B]
-        adds = self.geometry.compute_adds(pred_rt, gt_rt, model_points)   # [B]
+        add = self.geometry.compute_add(pred_rt, gt_rt, model_points)      # [B]
+        adds = self.geometry.compute_adds(pred_rt, gt_rt, model_points)    # [B]
         return add, adds
 
     # ------------------------------------------------------------------ #
@@ -251,6 +341,12 @@ class EvaluatorSC:
     # ------------------------------------------------------------------ #
     @staticmethod
     def _kabsch_umeyama(P: torch.Tensor, Q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Solve R,t minimizing || (R P + t) - Q || in least squares.
+        P,Q: [K,3]
+        Returns:
+          R: [3,3], t: [3]
+        """
         assert P.ndim == 2 and Q.ndim == 2 and P.shape == Q.shape and P.shape[1] == 3
 
         mu_P = P.mean(dim=0)
@@ -259,7 +355,7 @@ class EvaluatorSC:
         Y = Q - mu_Q
 
         H = X.t() @ Y
-        U, S, Vt = torch.linalg.svd(H, full_matrices=False)
+        U, _, Vt = torch.linalg.svd(H, full_matrices=False)
         V = Vt.transpose(0, 1)
 
         R = V @ U.transpose(0, 1)
@@ -285,7 +381,7 @@ class EvaluatorSC:
         device = rt_init.device
         dtype = rt_init.dtype
 
-        if obs_points is None or model_points is None:
+        if (obs_points is None) or (model_points is None):
             return rt_init
         if obs_points.ndim != 2 or obs_points.shape[1] != 3:
             return rt_init
@@ -312,8 +408,10 @@ class EvaluatorSC:
         prev_mean = None
 
         for _ in range(int(iters)):
+            # transform model points to camera
             P = mp @ R.transpose(0, 1) + t.unsqueeze(0)  # [m,3]
 
+            # nearest neighbor in obs
             D = torch.cdist(P.unsqueeze(0), obs.unsqueeze(0), p=2).squeeze(0)  # [m,n]
             nn_dist, nn_idx = torch.min(D, dim=1)
             Q = obs[nn_idx]
@@ -326,6 +424,7 @@ class EvaluatorSC:
             Q_sel = Q[mask]
             d_sel = nn_dist[mask]
 
+            # trimming
             if 0.0 < trim_ratio < 1.0 and P_sel.shape[0] > min_corr:
                 k = max(min_corr, int(P_sel.shape[0] * trim_ratio))
                 topk = torch.topk(d_sel, k=k, largest=False).indices
@@ -335,7 +434,7 @@ class EvaluatorSC:
 
             mean_d = float(d_sel.mean().item())
             if prev_mean is not None and abs(prev_mean - mean_d) < 1e-5:
-                # converged
+                # converged-ish; still continue a bit for stability
                 pass
             prev_mean = mean_d
 
@@ -346,12 +445,9 @@ class EvaluatorSC:
         return torch.cat([R, t.view(3, 1)], dim=1)
 
     # ------------------------------------------------------------------ #
-    # ICP refinement batch with "refine only bad" gating (BAD metric = ADD by default)
+    # ICP refinement: ALWAYS refine all samples (no gating)
     # ------------------------------------------------------------------ #
     def _icp_refine_batch(self, pred_rt: torch.Tensor, batch: Dict[str, Any]) -> torch.Tensor:
-        # if not bool(getattr(self.cfg, "icp_enable", False)):
-        #     return pred_rt
-
         device = pred_rt.device
         B = pred_rt.shape[0]
 
@@ -381,7 +477,7 @@ class EvaluatorSC:
             else:
                 labels = None
 
-        # model_points [B,M,3]
+        # model points
         if "model_points" not in batch:
             self.logger.warning("[EvaluatorSC][ICP] No model_points in batch, skip ICP.")
             return pred_rt
@@ -392,36 +488,7 @@ class EvaluatorSC:
             model_points_b = model_points_b.unsqueeze(0).expand(B, -1, -1)
         model_points_b = model_points_b.to(device)
 
-        # ensure diameter for rel threshold
-        self._ensure_obj_diameter(model_points_b)
-
-        # compute coarse add/adds for gating (fast, pure geometry)
-        gt_rt = batch.get("pose", None)
-        if not isinstance(gt_rt, torch.Tensor):
-            # if no GT available, cannot gate by error -> fallback: no ICP (safer)
-            self.logger.warning("[EvaluatorSC][ICP] No GT pose in batch, skip ICP gating -> skip ICP.")
-            return pred_rt
-        gt_rt = gt_rt.to(device)
-
-        add_coarse = self.geometry.compute_add(pred_rt, gt_rt, model_points_b)    # [B]
-        adds_coarse = self.geometry.compute_adds(pred_rt, gt_rt, model_points_b) # [B]
-
-        cls_ids = batch.get("cls_id", None)
-        sym_mask = self._sym_mask_from_cls_ids(cls_ids, B=B, device=device)  # [B]
-
-        dist_for_cmd = torch.where(sym_mask, adds_coarse, add_coarse)  # [B]
-
-        # choose gating metric
-        if self.icp_bad_metric == "adds":
-            metric = adds_coarse
-        elif self.icp_bad_metric == "dist_for_cmd":
-            metric = dist_for_cmd
-        else:
-            metric = add_coarse  # default 'add'
-
-        bad_th = self._get_bad_threshold_m()
-
-        # ICP schedule
+        # schedule
         corr_schedule = self.icp_corr_schedule_m
         iters_schedule = self.icp_iters_schedule
         use_schedule = (
@@ -433,16 +500,6 @@ class EvaluatorSC:
 
         for i in range(B):
             rt_i = pred_rt[i]
-
-            # gating
-            if self.icp_only_when_bad:
-                if metric.dim() == 0:
-                    m_i = float(metric.detach().cpu().item())
-                else:
-                    m_i = float(metric[i].detach().cpu().item())
-                if m_i <= bad_th:
-                    refined_list.append(rt_i)
-                    continue
 
             pts_i = obs_points[i]  # [N,3]
             if labels is not None:
@@ -505,7 +562,7 @@ class EvaluatorSC:
         gt_rt: torch.Tensor,
         batch: Dict[str, torch.Tensor],
     ) -> None:
-        model_points = batch["model_points"].to(self.device)  # [B,M,3]
+        model_points = batch["model_points"].to(self.device)  # [B,M,3] or [M,3]
         if model_points.dim() == 2:
             model_points = model_points.unsqueeze(0).expand(pred_rt.shape[0], -1, -1)
 
@@ -536,7 +593,7 @@ class EvaluatorSC:
             if k not in batch_metrics:
                 batch_metrics[k] = torch.zeros((pred_rt.shape[0],), dtype=torch.float32, device=pred_rt.device)
 
-        # ---------------- global meter (SAFE: to cpu) ----------------
+        # ---------------- global meter ----------------
         for name, tensor_1d in batch_metrics.items():
             if not isinstance(tensor_1d, torch.Tensor):
                 continue

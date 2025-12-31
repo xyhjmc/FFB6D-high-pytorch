@@ -1,6 +1,8 @@
 """
 Offline Preprocessing Tool for LGFF (JSON-based).
 Fast cropping using 'scene_gt_info.json' bounding boxes.
+AND
+Automatic Keypoint Generation (Corners for Phone, Random/FPS for others).
 
 - 对每个子数据集（train_pbr/train_real/...）显示 scene 级进度条
 - 对每个 scene 内部的 im_id：
@@ -8,6 +10,7 @@ Fast cropping using 'scene_gt_info.json' bounding boxes.
     - 若在非 TTY 环境（如 PyCharm 默认 console）：用简洁的 print 进度
 - 只有在当前 scene 产生了至少 1 个 crop 时，才在 dst 下创建对应 scene 目录并写 JSON
 - 额外打印统计信息：每个子数据集的 crop 数、整体 crop 总数
+- [NEW] 最后自动生成 keypoints/obj_xxxxxx.npy，优先使用 corners.txt
 """
 
 import os
@@ -18,7 +21,7 @@ import numpy as np
 import cv2
 from pathlib import Path
 from tqdm import tqdm
-
+from plyfile import PlyData  # 确保你的环境安装了 plyfile (pip install plyfile)
 
 IS_TTY = sys.stdout.isatty()  # 终端才用完整 tqdm 条
 
@@ -113,7 +116,7 @@ def process_scene(scene_path, out_path, obj_id, crop_size=128, pad_ratio=0.15) -
             # 某些 BOP 子集可能缺深度，直接跳过
             continue
 
-        rgb_full   = cv2.imread(str(rgb_f))
+        rgb_full    = cv2.imread(str(rgb_f))
         depth_full = cv2.imread(str(depth_f), cv2.IMREAD_UNCHANGED)
         if rgb_full is None or depth_full is None:
             continue
@@ -145,7 +148,7 @@ def process_scene(scene_path, out_path, obj_id, crop_size=128, pad_ratio=0.15) -
             ensure_out_dirs()
 
             # --- Crop ---
-            rgb_crop   = rgb_full[y1:y2, x1:x2]
+            rgb_crop    = rgb_full[y1:y2, x1:x2]
             depth_crop = depth_full[y1:y2, x1:x2]
 
             # Mask
@@ -162,7 +165,7 @@ def process_scene(scene_path, out_path, obj_id, crop_size=128, pad_ratio=0.15) -
                 mask_crop = np.ones(rgb_crop.shape[:2], dtype=np.uint8) * 255
 
             # --- Resize ---
-            rgb_fin   = cv2.resize(rgb_crop,   (crop_size, crop_size), interpolation=cv2.INTER_LINEAR)
+            rgb_fin    = cv2.resize(rgb_crop,    (crop_size, crop_size), interpolation=cv2.INTER_LINEAR)
             depth_fin = cv2.resize(depth_crop, (crop_size, crop_size), interpolation=cv2.INTER_NEAREST)
             mask_fin  = cv2.resize(mask_crop,  (crop_size, crop_size), interpolation=cv2.INTER_NEAREST)
 
@@ -212,6 +215,118 @@ def process_scene(scene_path, out_path, obj_id, crop_size=128, pad_ratio=0.15) -
     return out_im_id
 
 
+import numpy as np
+from pathlib import Path
+from plyfile import PlyData  # 确保安装了 plyfile: pip install plyfile
+
+
+# =========================================================
+#  核心算法：最远点采样 (FPS)
+# =========================================================
+def farthest_point_sampling(points: np.ndarray, n_samples: int) -> np.ndarray:
+    """
+    使用最远点采样 (FPS) 从点云中选取关键点。
+
+    Args:
+        points: [N, 3] 输入点云
+        n_samples: 需要采样的点数 (K)
+    Returns:
+        selected_points: [K, 3] 采样后的点
+    """
+    N, D = points.shape
+    if N <= n_samples:
+        return points
+
+    # 初始化索引列表
+    centroids = np.zeros(n_samples, dtype=int)
+
+    # 1. 随机选择第一个点 (为了确定性，这里固定选 index=0，也可以随机)
+    # rng = np.random.default_rng(0)
+    # centroids[0] = rng.choice(N)
+    centroids[0] = 0
+
+    # 2. 初始化距离矩阵 (到已选点集的最小距离)
+    # 初始状态下，所有点到“已选点集”的距离都是无穷大
+    distance = np.full(N, np.inf)
+
+    # 3. 迭代选择剩余 K-1 个点
+    for i in range(1, n_samples):
+        # 获取上一个选中的点的坐标 [1, 3]
+        last_centroid = points[centroids[i - 1]]
+
+        # 计算所有点到上一个选中点的欧氏距离平方 [N]
+        # 使用广播机制: (N, 3) - (1, 3)
+        dist = np.sum((points - last_centroid) ** 2, axis=1)
+
+        # 更新 distance: 每个点记录它到“所有已选点”的最小距离
+        distance = np.minimum(distance, dist)
+
+        # 选择距离最远的点作为下一个关键点
+        centroids[i] = np.argmax(distance)
+
+    return points[centroids]
+
+
+# =========================================================
+#  工具函数：关键点生成 (基于模型 + FPS)
+# =========================================================
+def gen_keypoints(src_root: Path, dst_root: Path, obj_id: int, num_kps: int = 8):
+    """
+    生成并保存关键点文件 (obj_{id}.npy)。
+
+    策略：
+    1. 读取 .ply 模型。
+    2. 处理单位 (mm -> m)。
+    3. 使用 FPS 算法在物体表面均匀采样 num_kps 个点。
+    """
+    # 输出目录
+    kp_out_dir = dst_root / "keypoints"
+    kp_out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = kp_out_dir / f"obj_{obj_id:06d}.npy"
+
+    print(f"\n[Keypoints] Generating keypoints for obj_{obj_id} using FPS...")
+
+    # 1. 读取模型文件
+    # 尝试标准路径和 eval 路径
+    model_path = src_root / "models" / f"obj_{obj_id:06d}.ply"
+    if not model_path.exists():
+        model_path = src_root / "models_eval" / f"obj_{obj_id:06d}.ply"
+
+    if not model_path.exists():
+        print(f"  -> [Error] Cannot find model .ply at {model_path}. Skipping.")
+        return
+
+    try:
+        # 读取 PLY
+        ply = PlyData.read(str(model_path))
+        v = ply["vertex"].data
+        pts = np.stack([v["x"], v["y"], v["z"]], axis=1).astype(np.float32)
+
+        # 2. 单位检查与转换 (LineMod 的 ply 通常是 mm，我们需要 m)
+        # 如果最大值超过 10 (通常物体不会超过 10米)，则认为是毫米
+        if np.abs(pts).max() > 10.0:
+            print(f"  -> Detected mm unit (max={np.abs(pts).max():.2f}), converting to meters...")
+            pts = pts / 1000.0
+
+        # 3. 执行 FPS 采样
+        # 如果模型点数少于需要的关键点数 (极少见)，直接重复填充
+        if pts.shape[0] < num_kps:
+            print(f"  -> [Warning] Mesh has fewer points ({pts.shape[0]}) than num_kps ({num_kps}).")
+            indices = np.random.choice(pts.shape[0], num_kps, replace=True)
+            kps = pts[indices]
+        else:
+            kps = farthest_point_sampling(pts, num_kps)
+            print(f"  -> FPS Sampling done. Selected {num_kps} points.")
+
+        # 4. 保存
+        np.save(str(out_path), kps.astype(np.float32))
+        print(f"  -> Saved to: {out_path}")
+
+    except Exception as e:
+        print(f"  -> [Error] Failed to process obj_{obj_id}: {e}")
+        import traceback
+        traceback.print_exc()
+
 def main():
     parser = argparse.ArgumentParser(
         description="Crop BOP dataset based on scene_gt_info.json"
@@ -225,11 +340,11 @@ def main():
     parser.add_argument(
         "--dst",
         required=False,
-        default="/home/xyh/PycharmProjects/FFB6D-high-pytorch/lgff/data/linemod_bowl_crop128_all",
+        default="/home/xyh/PycharmProjects/FFB6D-high-pytorch/lgff/data/linemod_phone_crop128_all",
         help="Output root for cropped dataset",
     )
     parser.add_argument(
-        "--obj_id", type=int, required=False, default=3, help="Object ID to crop"
+        "--obj_id", type=int, required=False, default=15, help="Object ID to crop (e.g. 15 for phone)"
     )
     parser.add_argument(
         "--size", type=int, default=128, help="Target resize size (e.g. 128)"
@@ -301,6 +416,9 @@ def main():
         f"[Overall Summary] Total crops: {total_crops}, "
         f"scenes with target across all subsets: {total_scenes_with_data}."
     )
+
+    # >>>>>>>> 自动生成关键点 <<<<<<<<
+    gen_keypoints(src_root, dst_root, args.obj_id)
 
 
 if __name__ == "__main__":

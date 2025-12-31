@@ -1,6 +1,6 @@
 # lgff/utils/pose_metrics.py
 from __future__ import annotations
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -8,21 +8,31 @@ import numpy as np
 
 
 def _resolve_use_best_point(cfg, stage: str) -> bool:
-    """Resolve whether to use best-point or confidence fusion for a stage."""
-    # stage-aware override, e.g., train_use_best_point / eval_use_best_point / viz_use_best_point
     stage_flag = getattr(cfg, f"{stage}_use_best_point", None)
     if stage_flag is not None:
         return bool(stage_flag)
-    # backward compatibility
     return getattr(cfg, "eval_use_best_point", True)
 
 
 def _resolve_topk(cfg, N: int) -> int:
-    """Resolve Top-K used for weighted fusion (meters, camera frame)."""
     topk_cfg = getattr(cfg, "pose_fusion_topk", None)
     if topk_cfg is not None and topk_cfg > 0:
-        return min(int(topk_cfg), N)
-    return min(max(32, N // 4), N)
+        return max(1, min(int(topk_cfg), N))
+    return max(1, min(max(32, N // 4), N))
+
+
+def _as_batched_per_point(x: torch.Tensor, B: int, N: int, last_dim: int) -> torch.Tensor:
+    """
+    Normalize tensor to [B,N,last_dim] if possible.
+    Accepts:
+      - [B,N,last_dim]
+      - [B,last_dim]  -> expand to [B,N,last_dim]
+    """
+    if x.dim() == 3 and x.shape[0] == B and x.shape[1] == N and x.shape[2] == last_dim:
+        return x
+    if x.dim() == 2 and x.shape[0] == B and x.shape[1] == last_dim:
+        return x.unsqueeze(1).expand(B, N, last_dim)
+    raise ValueError(f"Cannot reshape to [B,N,{last_dim}]. Got {tuple(x.shape)}")
 
 
 def fuse_pose_from_outputs(
@@ -30,126 +40,230 @@ def fuse_pose_from_outputs(
     geometry,
     cfg,
     stage: str = "eval",
+    valid_mask: Optional[torch.Tensor] = None,   # [B,N] bool/int; optional
 ) -> torch.Tensor:
     """
-    从网络输出的 dense 点级结果中，得到每个样本的 [R|t] 姿态矩阵 [B,3,4]。
-    逻辑直接复用 EvaluatorSC._process_predictions。
-    """
-    pred_q = outputs["pred_quat"]   # [B, N, 4]
-    pred_t = outputs["pred_trans"]  # [B, N, 3]
-    pred_c = outputs["pred_conf"]   # [B, N, 1]
+    Fuse per-point predictions into per-sample pose [B,3,4].
 
-    B, N, _ = pred_q.shape
-    conf = pred_c.squeeze(-1)  # [B, N]
+    Robustness:
+    - Supports pred_quat: [B,N,4] or [B,4]
+    - Supports pred_trans: [B,N,3] or [B,3]
+    - Supports pred_conf: [B,N,1] or [B,N] or missing (fallback to uniform)
+    - Optional valid_mask (labels/pred-seg) to ignore invalid points in fusion
+    """
+    if "pred_quat" not in outputs or outputs["pred_quat"] is None:
+        raise KeyError("outputs must contain 'pred_quat'")
+
+    pred_q_raw = outputs["pred_quat"]
+    pred_t_raw = outputs.get("pred_trans", None)
+    pred_c_raw = outputs.get("pred_conf", None)
+
+    device = pred_q_raw.device
+    B = int(pred_q_raw.shape[0])
+
+    # infer N
+    if pred_q_raw.dim() == 3:
+        N = int(pred_q_raw.shape[1])
+    elif pred_q_raw.dim() == 2:
+        # global quaternion case -> treat as N=1
+        N = 1
+    else:
+        raise ValueError(f"pred_quat dim invalid: {pred_q_raw.dim()}")
+
+    # normalize shapes to [B,N,*]
+    pred_q = _as_batched_per_point(pred_q_raw, B=B, N=N, last_dim=4)
+
+    if pred_t_raw is None:
+        # no translation head: return rotation + zero t
+        pred_t = torch.zeros((B, N, 3), device=device, dtype=pred_q.dtype)
+    else:
+        pred_t = _as_batched_per_point(pred_t_raw, B=B, N=N, last_dim=3)
+
+    # conf: [B,N]
+    if pred_c_raw is None:
+        conf = torch.ones((B, N), device=device, dtype=pred_q.dtype)
+    else:
+        if pred_c_raw.dim() == 3 and pred_c_raw.shape[-1] == 1:
+            conf = pred_c_raw.squeeze(-1)
+        elif pred_c_raw.dim() == 2 and pred_c_raw.shape == (B, N):
+            conf = pred_c_raw
+        else:
+            # allow [B,1] or [B] -> expand
+            if pred_c_raw.dim() == 2 and pred_c_raw.shape[0] == B and pred_c_raw.shape[1] == 1:
+                conf = pred_c_raw.expand(B, N)
+            elif pred_c_raw.dim() == 1 and pred_c_raw.shape[0] == B:
+                conf = pred_c_raw.view(B, 1).expand(B, N)
+            else:
+                raise ValueError(f"pred_conf shape invalid: {tuple(pred_c_raw.shape)}")
+
+    conf = conf.to(dtype=pred_q.dtype).clamp(min=0.0)
+
+    # optional valid mask
+    if valid_mask is not None and isinstance(valid_mask, torch.Tensor):
+        vm = valid_mask
+        if vm.dim() == 1:
+            vm = vm.view(1, -1).expand(B, -1)
+        if vm.dim() == 2 and vm.shape[0] == B and vm.shape[1] == N:
+            conf = conf * vm.to(device=device, dtype=pred_q.dtype)
+        # else: silently ignore to keep backward compatibility
 
     use_best_point = _resolve_use_best_point(cfg, stage)
 
+    # normalize quats (per-point)
+    pred_q = F.normalize(pred_q, dim=-1)
+
     if use_best_point:
-        idx = torch.argmax(conf, dim=1)  # [B]
+        # if all conf == 0, fallback to argmax on tiny eps (stable)
+        conf_eps = conf + 1e-12
+        idx = torch.argmax(conf_eps, dim=1)  # [B]
+
         idx_expand_q = idx.view(B, 1, 1).expand(-1, 1, 4)
         idx_expand_t = idx.view(B, 1, 1).expand(-1, 1, 3)
 
-        best_q = torch.gather(pred_q, 1, idx_expand_q).squeeze(1)  # [B, 4]
-        best_t = torch.gather(pred_t, 1, idx_expand_t).squeeze(1)  # [B, 3]
+        best_q = torch.gather(pred_q, 1, idx_expand_q).squeeze(1)  # [B,4]
+        best_t = torch.gather(pred_t, 1, idx_expand_t).squeeze(1)  # [B,3]
 
         best_q = F.normalize(best_q, dim=-1)
-        rot = geometry.quat_to_rot(best_q)  # [B, 3, 3]
-        pred_rt = torch.cat([rot, best_t.unsqueeze(-1)], dim=2)  # [B, 3, 4]
-        return pred_rt
+        rot = geometry.quat_to_rot(best_q)  # [B,3,3]
+        return torch.cat([rot, best_t.unsqueeze(-1)], dim=2)
 
-    # -------- Top-K + 置信度加权融合 --------
+    # -------- Top-K weighted fusion --------
     k = _resolve_topk(cfg, N)
-    conf_topk, idx = torch.topk(conf, k=k, dim=1)
-    conf_topk = conf_topk.clamp(min=1e-4)
+
+    # if conf all zeros, use uniform weights
+    conf_sum = conf.sum(dim=1, keepdim=True)
+    conf_safe = torch.where(conf_sum > 0, conf, torch.ones_like(conf))
+
+    conf_topk, idx = torch.topk(conf_safe, k=k, dim=1)
+    conf_topk = conf_topk.clamp(min=1e-6)
 
     def _gather(t: torch.Tensor) -> torch.Tensor:
         expand_shape = idx.unsqueeze(-1).expand(-1, -1, t.size(-1))
         return torch.gather(t, dim=1, index=expand_shape)
 
-    top_q = _gather(pred_q)  # [B, K, 4]
-    top_t = _gather(pred_t)  # [B, K, 3]
+    top_q = _gather(pred_q)  # [B,K,4]
+    top_t = _gather(pred_t)  # [B,K,3]
 
-    top_q = F.normalize(top_q, dim=-1)
-    ref_q = top_q[:, :1, :]
+    # quaternion sign alignment to the first quat
+    ref_q = top_q[:, :1, :]  # [B,1,4]
     dot = torch.sum(ref_q * top_q, dim=-1, keepdim=True)
     sign = torch.where(dot >= 0, torch.ones_like(dot), -torch.ones_like(dot))
     top_q = top_q * sign
 
-    weights = conf_topk / conf_topk.sum(dim=1, keepdim=True).clamp(min=1e-6)
-    quat_cov = torch.einsum("bki,bkj->bij", weights.unsqueeze(-1) * top_q, top_q)
-    eigvals, eigvecs = torch.linalg.eigh(quat_cov)
-    fused_q = eigvecs[..., -1]
+    weights = conf_topk / conf_topk.sum(dim=1, keepdim=True).clamp(min=1e-6)  # [B,K]
 
-    fused_t = torch.sum(top_t * weights.unsqueeze(-1), dim=1)
+    # Markley-style weighted average via eigenvector of covariance
+    quat_cov = torch.einsum("bk,bki,bkj->bij", weights, top_q, top_q)  # [B,4,4]
+    eigvals, eigvecs = torch.linalg.eigh(quat_cov)
+    fused_q = eigvecs[..., -1]  # [B,4]
+    fused_q = F.normalize(fused_q, dim=-1)
+
+    # align fused sign to ref
+    ref0 = ref_q.squeeze(1)  # [B,4]
+    dot2 = torch.sum(fused_q * ref0, dim=-1, keepdim=True)
+    fused_q = fused_q * torch.where(dot2 >= 0, torch.ones_like(dot2), -torch.ones_like(dot2))
+
+    fused_t = torch.sum(top_t * weights.unsqueeze(-1), dim=1)  # [B,3]
 
     rot = geometry.quat_to_rot(fused_q)
-    pred_rt = torch.cat([rot, fused_t.unsqueeze(-1)], dim=2)
-    return pred_rt
+    return torch.cat([rot, fused_t.unsqueeze(-1)], dim=2)
+
+
+def _maybe_sample_model_points(
+    model_points: torch.Tensor, cfg, stage: str = "eval"
+) -> torch.Tensor:
+    """
+    Optional speed knob for ADD/ADD-S: sample model points if too many.
+    cfg keys:
+      - eval_model_point_sample_num (int, default 0 -> disable)
+      - eval_model_point_sample_seed (int, default 0)
+    """
+    sample_num = int(getattr(cfg, f"{stage}_model_point_sample_num", getattr(cfg, "eval_model_point_sample_num", 0)) or 0)
+    if sample_num <= 0:
+        return model_points
+
+    B, M, _ = model_points.shape
+    if M <= sample_num:
+        return model_points
+
+    seed = int(getattr(cfg, "eval_model_point_sample_seed", 0))
+    g = torch.Generator(device=model_points.device)
+    g.manual_seed(seed)
+
+    idx = torch.randperm(M, generator=g, device=model_points.device)[:sample_num]
+    return model_points[:, idx, :]
 
 
 def compute_batch_pose_metrics(
-    pred_rt: torch.Tensor,  # [B,3,4]
-    gt_rt: torch.Tensor,  # [B,3,4]
-    model_points: torch.Tensor,  # [B,M,3]
+    pred_rt: torch.Tensor,          # [B,3,4]
+    gt_rt: torch.Tensor,            # [B,3,4]
+    model_points: torch.Tensor,     # [B,M,3]
     cls_ids: Optional[torch.Tensor],
     geometry,
     cfg,
 ) -> Dict[str, torch.Tensor]:
     """
-    一次性对一个 batch 计算 ADD / ADD-S / t_err / rot_err 等指标。
-    返回 shape=[B] 的 tensor（在 CPU 上），方便后面自己决定怎么汇总。
+    Compute ADD / ADD-S / t_err / rot_err / cmd_acc for a batch.
+    Returns 1D tensors on CPU, shape [B].
     """
     device = pred_rt.device
 
-    model_points = model_points.to(device)  # [B,M,3]
+    if model_points.dim() == 2:
+        model_points = model_points.unsqueeze(0).expand(pred_rt.shape[0], -1, -1)
+    model_points = model_points.to(device)
+
+    # optional sampling for speed
+    model_points = _maybe_sample_model_points(model_points, cfg, stage="eval")
 
     gt_r = gt_rt[:, :3, :3]
     gt_t = gt_rt[:, :3, 3]
-
     pred_r = pred_rt[:, :3, :3]
     pred_t = pred_rt[:, :3, 3]
 
-    # 1) 投影 CAD 点云
-    points_gt   = torch.bmm(model_points, gt_r.transpose(1, 2))   + gt_t.unsqueeze(1)
-    points_pred = torch.bmm(model_points, pred_r.transpose(1, 2)) + pred_t.unsqueeze(1)
+    # --- ADD / ADD-S (prefer GeometryToolkit if available) ---
+    add_dist: torch.Tensor
+    adds_dist: torch.Tensor
 
-    # ADD
-    add_dist = torch.norm(points_pred - points_gt, dim=2).mean(dim=1)  # [B]
+    if hasattr(geometry, "compute_add") and hasattr(geometry, "compute_adds"):
+        add_dist = geometry.compute_add(pred_rt, gt_rt, model_points)       # [B]
+        adds_dist = geometry.compute_adds(pred_rt, gt_rt, model_points)     # [B]
+    else:
+        # fallback (your original)
+        points_gt = torch.bmm(model_points, gt_r.transpose(1, 2)) + gt_t.unsqueeze(1)
+        points_pred = torch.bmm(model_points, pred_r.transpose(1, 2)) + pred_t.unsqueeze(1)
+        add_dist = torch.norm(points_pred - points_gt, dim=2).mean(dim=1)
 
-    # ADD-S: 最近邻 (per-sample 以支持多物体扩展)
-    adds_list: List[torch.Tensor] = []
-    for b in range(points_pred.size(0)):
-        dist_mat = torch.cdist(points_pred[b], points_gt[b])  # [M,M]
-        adds_list.append(dist_mat.min(dim=1).values.mean())
-    adds_dist = torch.stack(adds_list).to(device)  # [B]
+        adds_list: List[torch.Tensor] = []
+        for b in range(points_pred.size(0)):
+            dist_mat = torch.cdist(points_pred[b], points_gt[b])
+            adds_list.append(dist_mat.min(dim=1).values.mean())
+        adds_dist = torch.stack(adds_list).to(device)
 
-    # 是否对称（逐样本判断，兼容未来多物体/混合 batch）
+    # --- symmetry mask ---
     sym_ids = torch.as_tensor(getattr(cfg, "sym_class_ids", []), device=device)
     sym_mask = torch.zeros(pred_rt.size(0), dtype=torch.bool, device=device)
     if cls_ids is not None:
         cls_tensor = cls_ids
-        if cls_tensor.dim() > 1:
-            cls_tensor = cls_tensor.view(-1)
-        cls_tensor = cls_tensor.to(device)
-        if sym_ids.numel() > 0:
-            sym_mask = (cls_tensor.unsqueeze(1) == sym_ids.view(1, -1)).any(dim=1)
+        if isinstance(cls_tensor, torch.Tensor):
+            if cls_tensor.dim() > 1:
+                cls_tensor = cls_tensor.view(-1)
+            cls_tensor = cls_tensor.to(device)
+            if sym_ids.numel() > 0:
+                sym_mask = (cls_tensor.unsqueeze(1) == sym_ids.view(1, -1)).any(dim=1)
 
     dist_for_acc = torch.where(sym_mask, adds_dist, add_dist)
 
-    # 2) translation error
-    t_diff = pred_t - gt_t  # [B,3]
-    t_err = torch.norm(t_diff, dim=1)  # [B]
+    # --- translation error ---
+    t_diff = pred_t - gt_t
+    t_err = torch.norm(t_diff, dim=1)
 
-    # 3) rotation error (deg)
-    rot_err = geometry.rotation_error_from_mats(
-        pred_r, gt_r, return_deg=True
-    )  # [B]
+    # --- rotation error ---
+    rot_err = geometry.rotation_error_from_mats(pred_r, gt_r, return_deg=True)
 
-    # 4) CMD / <2cm 准确率（按 BOP 常用）
-    cmd_threshold_m = getattr(cfg, "cmd_threshold_m", 0.02)
-    cmd_acc = (dist_for_acc < cmd_threshold_m).float()  # [B]
+    # --- CMD acc ---
+    cmd_threshold_m = float(getattr(cfg, "cmd_threshold_m", 0.02))
+    cmd_acc = (dist_for_acc < cmd_threshold_m).float()
 
-    # 整理成 dict，并搬到 CPU（方便 numpy 处理）
     out = {
         "add": add_dist.detach().cpu(),
         "add_s": adds_dist.detach().cpu(),
@@ -168,20 +282,11 @@ def summarize_pose_metrics(
     obj_diameter: float,
     cmd_threshold_m: float,
 ) -> Dict[str, float]:
-    """
-    给定一个 epoch / 全测试集累积的指标列表，计算 mean, 各分位数，acc<阈值 等。
-    这部分逻辑可以直接照你 Evaluator 里现有的 _summarize_metrics / 新增指标来填。
-    """
     summary: Dict[str, float] = {}
 
-    # 均值
     for k, values in meter.items():
-        if len(values) == 0:
-            summary[f"mean_{k}"] = 0.0
-        else:
-            summary[f"mean_{k}"] = float(np.mean(values))
+        summary[f"mean_{k}"] = float(np.mean(values)) if len(values) > 0 else 0.0
 
-    # 分位数 / 阈值准确率，示意：
     for name in ["add_s", "add", "t_err", "rot_err"]:
         if name in meter and len(meter[name]) > 0:
             arr = np.array(meter[name], dtype=np.float32)
@@ -196,10 +301,9 @@ def summarize_pose_metrics(
                 summary["rot_err_deg_p90"] = float(np.percentile(arr, 90))
                 summary["rot_err_deg_p95"] = float(np.percentile(arr, 95))
 
-    # 准确率阈值示意（你可以直接搬你 Evaluator 现有实现）
     if "add_s" in meter and len(meter["add_s"]) > 0:
         adds = np.array(meter["add_s"], dtype=np.float32)
-        summary["acc_adds<5mm"]  = float((adds < 0.005).mean())
+        summary["acc_adds<5mm"] = float((adds < 0.005).mean())
         summary["acc_adds<10mm"] = float((adds < 0.010).mean())
         summary["acc_adds<15mm"] = float((adds < 0.015).mean())
         summary["acc_adds<20mm"] = float((adds < 0.020).mean())
@@ -210,7 +314,7 @@ def summarize_pose_metrics(
             summary["acc_adds<0.050d"] = float((adds < 0.050 * obj_diameter).mean())
             acc_010d = float((adds < 0.100 * obj_diameter).mean())
             summary["acc_adds<0.100d"] = acc_010d
-            summary["acc_adds_0.1d"]   = acc_010d
+            summary["acc_adds_0.1d"] = acc_010d
 
     if "t_err" in meter and len(meter["t_err"]) > 0:
         te = np.array(meter["t_err"], dtype=np.float32)
@@ -218,7 +322,6 @@ def summarize_pose_metrics(
         summary["acc_t<20mm"] = float((te < 0.020).mean())
         summary["acc_t<30mm"] = float((te < 0.030).mean())
 
-    summary["obj_diameter"]  = obj_diameter
-    summary["cmd_threshold_m"] = cmd_threshold_m
-
+    summary["obj_diameter"] = float(obj_diameter)
+    summary["cmd_threshold_m"] = float(cmd_threshold_m)
     return summary

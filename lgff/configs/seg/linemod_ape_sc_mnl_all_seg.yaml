@@ -121,6 +121,37 @@ eval_topk: 8                  # 若使用 top-k 融合，可通过 cfg 控制 k 
 cmd_threshold_m: 0.02
 obj_diameter_m: 0.1016561314   # eval log 中估计得到的 ape 直径，可写死进配置
 
+
+return_mask: true
+
+# ===== model switch =====
+model_variant: sc_seg
+loss_variant: seg
+
+# ===== pose fusion (use point-valid mask) =====
+pose_fusion_use_valid_mask: true
+pose_fusion_valid_mask_source: labels     # labels / seg
+pose_fusion_conf_floor: 1.0e-4
+
+# ===== seg head =====
+use_seg_head: true
+lambda_seg: 0.2
+
+seg_head_in: rgb                          # rgb / fused (看你实现支持什么)
+seg_head_channels: 64
+seg_output_stride: 4                      # 对 point-seg 基本无影响，保留即可
+
+seg_loss_type: bce_dice                   # bce / bce_dice
+seg_pos_weight: null
+seg_ignore_invalid: true                  # 使用 labels==0 的点做 ignore
+seg_detach_trunk: true                    # 稳：先不让 seg 反向冲击 trunk
+
+# ===== seg supervision =====
+seg_supervision: point
+seg_supervision_source: labels            # labels / pcld_valid_mask
+
+
+
 # ---------- Logging / Output ----------
-log_dir: "/home/xyh/PycharmProjects/FFB6D-high-pytorch/output/linemod_ape_sc_mnl_all"
+log_dir: "/home/xyh/PycharmProjects/FFB6D-high-pytorch/output/linemod_ape_sc_mnl_all_seg"
 # 不写 work_dir 会默认使用 log_dir

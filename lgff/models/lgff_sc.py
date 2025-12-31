@@ -57,6 +57,10 @@ class LGFF_SC(LGFFBase):
         freeze_bn = getattr(cfg, "backbone_freeze_bn", True)
         mobilenet_arch = getattr(cfg, "backbone_arch", "large")
 
+        # [修改] 读取 intermediate 配置
+        self.return_intermediate = getattr(cfg, "backbone_return_intermediate", False)
+        low_level_index = getattr(cfg, "backbone_low_level_index", 2)
+
         if "resnet" in backbone_name and ResNetExtractor is not None:
             self.rgb_backbone = ResNetExtractor(
                 arch=backbone_name,
@@ -70,12 +74,36 @@ class LGFF_SC(LGFFBase):
                 output_stride=backbone_os,
                 pretrained=pretrained,
                 freeze_bn=freeze_bn,
-                return_intermediate=False,
+                # [修改] 传入配置，而不是写死 False
+                return_intermediate=self.return_intermediate,
+                low_level_index=low_level_index,
             )
 
-        last_channels = self.rgb_backbone.out_channels
+        # [修改] 动态获取通道数并定义降维层
         rgb_feat_dim = getattr(cfg, "rgb_feat_dim", 128)
-        self.rgb_reduce = nn.Conv2d(last_channels, rgb_feat_dim, 1, bias=False)
+
+        # 运行一次 Dummy Forward 来获取真实的通道数
+        with torch.no_grad():
+            dummy_in = torch.zeros(1, 3, 128, 128)
+            dummy_out = self.rgb_backbone(dummy_in)
+
+        if self.return_intermediate and isinstance(dummy_out, (tuple, list)):
+            high_ch = dummy_out[0].shape[1]
+            low_ch = dummy_out[1].shape[1]
+
+            # 策略：高层和底层各分一半通道 (例如 128 -> 64 + 64)
+            # 这样拼接后总维度依然是 rgb_feat_dim，不需要修改后续 Fusion 代码
+            self.high_dim = rgb_feat_dim // 2
+            self.low_dim = rgb_feat_dim - self.high_dim
+
+            self.rgb_reduce = nn.Conv2d(high_ch, self.high_dim, 1, bias=False)
+            self.rgb_low_reduce = nn.Conv2d(low_ch, self.low_dim, 1, bias=False)
+            print(f"[LGFF_SC] Multi-scale Enabled: High({high_ch}->{self.high_dim}) + Low({low_ch}->{self.low_dim})")
+        else:
+            # 旧逻辑：只用最后一层
+            last_channels = self.rgb_backbone.out_channels
+            self.rgb_reduce = nn.Conv2d(last_channels, rgb_feat_dim, 1, bias=False)
+            self.rgb_low_reduce = None
 
         # ==================================================================
         # 2. Geometry Branch (PointNet over normalized PC)
@@ -103,17 +131,11 @@ class LGFF_SC(LGFFBase):
         # 3. Fusion Module
         # ==================================================================
         fusion_in_dim = rgb_feat_dim + geo_feat_dim  # [rgb_emb, geo_emb]
-        #yuanban
-        # self.fusion_gate = nn.Sequential(
-        #     nn.Conv1d(fusion_in_dim, 128, 1, bias=False),
-        #     nn.ReLU(inplace=True),
-        #     nn.Conv1d(128, 1, 1, bias=True),
-        #     nn.Sigmoid(),
-        # )
+
         gate_mode = getattr(cfg, "gate_mode", "channel")
         gate_hidden = int(getattr(cfg, "gate_hidden", 128))
         gate_out_ch = 1 if gate_mode == "point" else rgb_feat_dim  # C_fused
-        #实验D
+        # 实验D
         self.split_fusion_heads = bool(getattr(cfg, "split_fusion_heads", False))
 
         if not self.split_fusion_heads:
@@ -218,6 +240,10 @@ class LGFF_SC(LGFFBase):
             self.kp_of_head,  # [New]
         ]
 
+        # [新增] 初始化 low_reduce
+        if hasattr(self, "rgb_low_reduce") and self.rgb_low_reduce is not None:
+            modules.append(self.rgb_low_reduce)
+
         # -------- Fusion gate(s): route D compatible --------
         if getattr(self, "split_fusion_heads", False):
             # route D: two gates
@@ -292,12 +318,33 @@ class LGFF_SC(LGFFBase):
             pc_normed = pc_centered
 
         # ------------------------------------------------------------------
-        # 1. RGB Feature
+        # 1. RGB Feature (支持多尺度融合)
         # ------------------------------------------------------------------
-        feat_map = self.rgb_backbone(rgb)
-        if isinstance(feat_map, (tuple, list)):
-            feat_map = feat_map[0]
-        feat_map = self.rgb_reduce(feat_map)                  # [B, C_rgb, H', W']
+        feat_out = self.rgb_backbone(rgb)
+
+        if self.return_intermediate and isinstance(feat_out, (tuple, list)):
+            # [修改] 处理双流特征
+            feat_high, feat_low = feat_out
+
+            # 1. 降维
+            feat_high = self.rgb_reduce(feat_high)        # [B, 64, H/8, W/8]
+            feat_low = self.rgb_low_reduce(feat_low)      # [B, 64, H/4, W/4]
+
+            # 2. 上采样高层特征以匹配底层尺寸
+            feat_high = F.interpolate(
+                feat_high,
+                size=feat_low.shape[-2:],
+                mode="bilinear",
+                align_corners=False
+            )
+
+            # 3. 拼接
+            feat_map = torch.cat([feat_high, feat_low], dim=1) # [B, 128, H/4, W/4]
+        else:
+            # 旧逻辑
+            if isinstance(feat_out, (tuple, list)):
+                feat_out = feat_out[0]
+            feat_map = self.rgb_reduce(feat_out)          # [B, 128, H', W']
 
         # ------------------------------------------------------------------
         # 2. Geometry Feature (用归一化点云)
@@ -325,13 +372,6 @@ class LGFF_SC(LGFFBase):
             feat_rot = rgb_emb * gate_rot + geo_emb * (1.0 - gate_rot)
             feat_tc = rgb_emb * gate_tc + geo_emb * (1.0 - gate_tc)
 
-        # if gate.shape[1] == 1:
-        #     # point-wise gate, broadcast to channels
-        #     feat_fused = rgb_emb * gate + geo_emb * (1.0 - gate)
-        # else:
-        #     # channel-wise gate
-        #     feat_fused = rgb_emb * gate + geo_emb * (1.0 - gate)
-
         # ------------------------------------------------------------------
         # 4. 构造 Head 输入
         # ------------------------------------------------------------------
@@ -356,13 +396,8 @@ class LGFF_SC(LGFFBase):
         pred_t = self.trans_head(trans_conf_kp_input)         # [B, 3, N]
         pred_t = pred_t.permute(0, 2, 1).contiguous()         # [B, N, 3]
 
-        # #原来的代码
-        # # C. Confidence
-        # pred_c = self.conf_head(trans_conf_kp_input)          # [B, 1, N]
-        # pred_c = pred_c.permute(0, 2, 1).contiguous()         # [B, N, 1]
-        # pred_c = torch.sigmoid(pred_c)
-
-        #E1
+        # C. Confidence
+        # E1
         conf_detach = bool(getattr(self.cfg, "conf_detach_trunk", False))  # E1 开关
         conf_in = trans_conf_kp_input.detach() if conf_detach else trans_conf_kp_input
 
@@ -372,9 +407,6 @@ class LGFF_SC(LGFFBase):
 
         # D. [New] Keypoint Offsets
         # kp_of_raw: [B, 3*K, N]
-        #路线A
-        # kp_of_raw = self.kp_of_head(trans_conf_kp_input)
-        #路线B
         lambda_kp_of = float(getattr(self.cfg, "lambda_kp_of", 0.3))
         kp_detach = bool(getattr(self.cfg, "kp_of_detach_trunk", False))  # 路线B默认 True
 
@@ -384,12 +416,6 @@ class LGFF_SC(LGFFBase):
             kp_of_raw = self.kp_of_head(kp_in)  # [B, 3K, N]
             kp_of_raw = kp_of_raw.view(B, self.num_keypoints, 3, N)
             pred_kp_ofs = kp_of_raw.permute(0, 1, 3, 2).contiguous()  # [B, K, N, 3]
-
-        # # 先 reshape 成 [B, K, 3, N] 再转成 [B, K, N, 3]，方便直接给 OFLoss 用
-        # kp_of_raw = kp_of_raw.view(
-        #     B, self.num_keypoints, 3, N
-        # )  # [B, K, 3, N]
-        # pred_kp_ofs = kp_of_raw.permute(0, 1, 3, 2).contiguous()  # [B, K, N, 3]
 
         return {
             "pred_quat": pred_q,

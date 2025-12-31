@@ -1,8 +1,9 @@
 """
 Visualization script for Single-Class LGFF inference (full-image overlay).
+Updated with Hybrid PnP Strategy (PnP Rot/XY + Reg Z).
 
 This tool loads a trained checkpoint, runs forward passes on a chosen split,
-selects the fused pose per sample (same logic as evaluator), and renders:
+applies the Hybrid PnP+Regression strategy, selects the pose, and renders:
 
   * RGB image (either cropped ROI or original full image, if provided)
     with:
@@ -41,13 +42,19 @@ from lgff.engines.evaluator_sc import EvaluatorSC
 from lgff.eval_sc import load_model_weights, resolve_checkpoint_path
 from lgff.utils.pose_metrics import compute_batch_pose_metrics
 
+# [New] Import PnP Solver
+try:
+    from lgff.utils.pnp_solver import PnPSolver
+except ImportError:
+    PnPSolver = None
+
 
 # ----------------------------------------------------------------------
 # CLI
 # ----------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Visualize LGFF Single-Class Predictions (full-image overlay)"
+        description="Visualize LGFF Single-Class Predictions (Hybrid PnP Strategy)"
     )
     parser.add_argument(
         "--checkpoint",
@@ -102,7 +109,6 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional path to per_image_metrics.csv for cross-checking metrics",
     )
-    # 你说这部分不用动，我保持原样（default 写死）
     parser.add_argument(
         "--orig-root",
         type=str,
@@ -249,9 +255,6 @@ def draw_two_cubes_overlay(
 ) -> np.ndarray:
     """
     在一张图上同时画 Pred cube 和 GT cube（线色不同），并标注小文字。
-
-    注意：输入 rgb_np 是 RGB（matplotlib 风格），但 cv2 的颜色是 BGR。
-    这里内部做 RGB<->BGR 转换，确保颜色显示正确。
     """
     # RGB -> BGR for cv2 drawing
     img_bgr = cv2.cvtColor(rgb_np, cv2.COLOR_RGB2BGR)
@@ -323,7 +326,6 @@ def render_sample(
 ) -> None:
     """
     渲染一个样本：
-
       - 上：RGB + Pred/GT cube 叠加图
       - 下：4x4 Homogeneous pose matrix
     """
@@ -432,7 +434,7 @@ def main() -> None:
     # 1) 用当前工程的配置系统载入基础 cfg
     cfg_cli: LGFFConfig = load_config()
 
-    # 2) checkpoint config merge（保证 backbone / 维度一致）
+    # 2) checkpoint config merge
     ckpt_path = resolve_checkpoint_path(args.checkpoint)
     ckpt = torch.load(ckpt_path, map_location="cpu")
     cfg = merge_cfg_from_checkpoint(cfg_cli, ckpt.get("config"))
@@ -457,15 +459,26 @@ def main() -> None:
     num_workers = args.num_workers or getattr(cfg, "num_workers", 4)
     per_image_metrics = load_per_image_metrics(args.per_image_csv)
 
-    # 原始数据集 root（命令行优先；你说 orig-root 不动，我就保持这里逻辑不变）
+    # 原始数据集 root
     orig_root = args.orig_root or getattr(cfg, "orig_dataset_root", None)
     if orig_root is not None:
         logger.info(f"[viz_sc] Will overlay cubes on original dataset at: {orig_root}")
 
+    # PnP Config
+    use_pnp = bool(getattr(cfg, "eval_use_pnp", True))
+    pnp_solver = None
+    if use_pnp:
+        if PnPSolver is not None:
+            pnp_solver = PnPSolver(cfg)
+            logger.info(f"[viz_sc] PnP Solver ENABLED (Hybrid Strategy). Config: {getattr(cfg, 'pnp_ransac_iter', 100)} iters.")
+        else:
+            logger.warning("[viz_sc] PnPSolver import failed, PnP disabled.")
+            use_pnp = False
+
     logger.info(
         f"Visualizing split={split} | batch_size={args.batch_size} | "
         f"num_workers={num_workers} | num_samples={args.num_samples} | "
-        f"checkpoint={ckpt_path}"
+        f"checkpoint={ckpt_path} | use_pnp={use_pnp}"
     )
     if per_image_metrics:
         logger.info(f"Loaded per-image metrics for cross-checking: {len(per_image_metrics)} rows")
@@ -500,21 +513,7 @@ def main() -> None:
         example_batch = next(iter(loader))
         complexity_info = complexity_logger.maybe_log(model, example_batch, stage="viz_full")
         if complexity_info:
-            logger.info(
-                " | ".join(
-                    [
-                        "[ModelComplexity] Stage=viz_full",
-                        f"Params: {complexity_info['params']:,} ({complexity_info['param_mb']:.2f} MB)",
-                        (
-                            f"GFLOPs: {complexity_info['gflops']:.3f}"
-                            if complexity_info.get("gflops") is not None
-                            else "GFLOPs: N/A"
-                        ),
-                    ]
-                )
-            )
-    except StopIteration:
-        logger.warning("Visualization loader is empty; skip complexity logging.")
+            logger.info(f"[ModelComplexity] Stage=viz_full | Params: {complexity_info['params']:,}")
     except Exception as exc:
         logger.warning(f"Model complexity logging failed: {exc}")
 
@@ -533,8 +532,8 @@ def main() -> None:
     sym_class_ids = set(getattr(cfg, "sym_class_ids", []))
 
     # config-driven switches
-    use_icp = bool(getattr(cfg, "viz_use_icp", getattr(cfg, "icp_enable", True)))
-    show_coarse_metrics = bool(getattr(cfg, "viz_show_coarse_metrics", True)) and use_icp
+    use_icp = bool(getattr(cfg, "viz_use_icp", getattr(cfg, "icp_enable", False)))
+    show_coarse_metrics = bool(getattr(cfg, "viz_show_coarse_metrics", True)) and (use_icp or use_pnp)
     metric_tol = float(getattr(cfg, "viz_metric_tol", 1e-6))
 
     if use_icp:
@@ -543,6 +542,8 @@ def main() -> None:
         logger.info("[viz_sc] ICP refine DISABLED for visualization.")
 
     saved = 0
+    pnp_used_count = 0
+
     with torch.no_grad():
         for _, batch in enumerate(loader):
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
@@ -550,10 +551,45 @@ def main() -> None:
 
             outputs = model(batch)
 
-            # 1) coarse fused pose
+            # 1) Base regression pose (DenseFusion style)
             pred_rt_coarse = helper._process_predictions(outputs)  # [B,3,4]
 
-            # 2) refine pose (config-driven)
+            # 2) [Hybrid Strategy] PnP Rot + Reg Trans Override
+            if use_pnp and "pred_kp_ofs" in outputs and outputs["pred_kp_ofs"] is not None:
+                model_kps = batch.get("kp3d_model", None)
+                if model_kps is not None:
+                    # Solve PnP [B, 3, 4] (Rot and Trans from PnP)
+                    pred_rt_pnp_raw = pnp_solver.solve_batch(
+                        points=outputs["points"],
+                        pred_kp_ofs=outputs["pred_kp_ofs"],
+                        pred_conf=outputs.get("pred_conf", None),
+                        model_kps=model_kps
+                    )
+
+                    # Extract Components
+                    R_pnp = pred_rt_pnp_raw[:, :3, :3] # [B, 3, 3]
+                    t_pnp = pred_rt_pnp_raw[:, :3, 3]  # [B, 3]
+
+                    # Get Regression Translation (usually better Z)
+                    if "pred_trans" in outputs:
+                        t_reg = outputs["pred_trans"].mean(dim=1) # [B, 3]
+                    else:
+                        t_reg = pred_rt_coarse[:, :3, 3]
+
+                    # Mix: x,y from PnP; z from Regression
+                    t_final_list = []
+                    for b_idx in range(t_pnp.shape[0]):
+                        tx = t_pnp[b_idx, 0]
+                        ty = t_pnp[b_idx, 1]
+                        tz = t_reg[b_idx, 2] # Trust Regression Z
+                        t_final_list.append(torch.stack([tx, ty, tz]))
+                    t_final = torch.stack(t_final_list) # [B, 3]
+
+                    # Reassemble [B, 3, 4]
+                    pred_rt_coarse = torch.cat([R_pnp, t_final.unsqueeze(-1)], dim=2)
+                    pnp_used_count += B
+
+            # 3) refine pose (config-driven)
             if use_icp:
                 pred_rt = helper._icp_refine_batch(pred_rt_coarse, batch)  # [B,3,4]
             else:
@@ -561,7 +597,7 @@ def main() -> None:
 
             gt_rt = helper._process_gt(batch)
 
-            # model points
+            # model points setup
             if "model_points" in batch:
                 model_points = batch["model_points"]
                 if model_points.dim() == 2:
@@ -591,7 +627,7 @@ def main() -> None:
                 cls_id = int(batch["cls_id"][i].item()) if "cls_id" in batch else -1
                 scene_id = int(batch["scene_id"][i].item()) if "scene_id" in batch else -1
                 im_id = int(batch["im_id"][i].item()) if "im_id" in batch else -1
-                is_sym = cls_id in sym_class_ids  # <-- 修复：你原脚本这里漏了
+                is_sym = cls_id in sym_class_ids
 
                 # choose image & K
                 if orig_root is not None and scene_id >= 0 and im_id >= 0:
@@ -604,9 +640,7 @@ def main() -> None:
                         )
                     except Exception as e:
                         logger.warning(
-                            f"[viz_sc] Failed to load full image for "
-                            f"scene={scene_id}, im={im_id}: {e}. "
-                            f"Falling back to cropped ROI visualization."
+                            f"[viz_sc] Failed load full img {scene_id}/{im_id}: {e}. Fallback ROI."
                         )
                         rgb_np = denormalize_image(batch["rgb"][i].detach().cpu())
                         K_vis = batch["intrinsic"][i].detach().cpu().numpy()
@@ -668,7 +702,7 @@ def main() -> None:
                 t_err = float(metrics_ref["t_err"][0])
                 rot_err = float(metrics_ref["rot_err"][0])
 
-                # optional coarse metrics for debug
+                # optional coarse metrics for debug (Hybrid/PnP result before ICP)
                 add0 = add_s0 = t_err0 = rot0 = None
                 if show_coarse_metrics:
                     pred_rt0_i = pred_rt_coarse[i]
@@ -711,7 +745,8 @@ def main() -> None:
                     return (f"{name}(pred)={pred_scaled:.4f}{unit} / CSV=N/A", warn)
 
                 title_lines = [
-                    f"sample_{saved:03d} | scene={scene_id} im={im_id} cls={cls_id} | sym={is_sym} | icp={use_icp}",
+                    f"sample_{saved:03d} | scene={scene_id} im={im_id} cls={cls_id} | sym={is_sym}",
+                    f"PnP Hybrid: {use_pnp} | ICP: {use_icp}"
                 ]
 
                 warn_flags = []
@@ -731,21 +766,21 @@ def main() -> None:
                 warn_flags.append(w)
                 title_lines.append(pair)
 
-                # show coarse->refined delta in title (very useful to confirm refine is working)
+                # Show Delta: Hybrid -> ICP
                 if show_coarse_metrics and add0 is not None:
                     title_lines.append(
-                        f"COARSE->REF | ADD: {add0:.4f} -> {add:.4f} m | "
+                        f"HYBRID->ICP | ADD: {add0:.4f} -> {add:.4f} m | "
                         f"ADD-S: {add_s0:.4f} -> {add_s:.4f} m"
                     )
                     title_lines.append(
-                        f"COARSE->REF | t_err: {t_err0*1000.0:.2f} -> {t_err*1000.0:.2f} mm | "
+                        f"HYBRID->ICP | t_err: {t_err0*1000.0:.2f} -> {t_err*1000.0:.2f} mm | "
                         f"rot: {rot0:.2f} -> {rot_err:.2f} deg"
                     )
 
                 if any(warn_flags):
                     logger.warning(f"Metric mismatch over tolerance for scene={scene_id}, im={im_id}")
 
-                pose_matrix = build_pose_matrix(pred_rt_i)  # refined (or coarse if icp disabled)
+                pose_matrix = build_pose_matrix(pred_rt_i)
                 title = "\n".join(title_lines)
                 save_path = os.path.join(save_dir, f"sample_{saved:03d}.png")
 
@@ -761,6 +796,9 @@ def main() -> None:
 
             if saved >= args.num_samples:
                 break
+
+    if use_pnp:
+        logger.info(f"PnP Hybrid Strategy was triggered for {pnp_used_count} batch items.")
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ from lgff.losses.loss_block import (
     of_l1_loss,
 )
 from lgff.losses.lgff_loss import LGFFLoss
+from lgff.losses.lgff_loss_seg import LGFFLoss_SEG
 
 __all__ = [
     "LGFFLoss",
@@ -26,4 +27,5 @@ __all__ = [
     "OfstMapL1Loss",
     "OfstMapKp3dL1Loss",
     "of_l1_loss",
+    "LGFFLoss_SEG",
 ]

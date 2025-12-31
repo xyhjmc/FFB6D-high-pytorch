@@ -31,15 +31,12 @@ def _binary_erosion(mask: np.ndarray, radius: int = 1) -> np.ndarray:
     mask = mask.astype(bool)
     k = 2 * radius + 1
     pad = radius
-    # pad with False so erosion shrinks mask at borders
     m = np.pad(mask, ((pad, pad), (pad, pad)), mode="constant", constant_values=False)
 
-    # sliding window view (H, W, k, k)
     try:
         win = np.lib.stride_tricks.sliding_window_view(m, (k, k))
         return np.all(win, axis=(-1, -2))
     except Exception:
-        # fallback: very small radius only
         out = mask.copy()
         for _ in range(radius):
             up = np.pad(out, ((1, 0), (0, 0)), mode="constant", constant_values=False)[:-1, :]
@@ -59,7 +56,6 @@ def _depth_edge_mask(depth_m: np.ndarray, thresh_m: float) -> np.ndarray:
         return np.ones_like(depth_m, dtype=bool)
 
     d = depth_m.astype(np.float32)
-    # invalid depth treated as 0; gradient around zeros will be large -> filtered out
     dx = np.abs(d[:, 1:] - d[:, :-1])
     dy = np.abs(d[1:, :] - d[:-1, :])
 
@@ -76,7 +72,7 @@ class SingleObjectDataset(Dataset):
     """
     SingleObjectDataset: single-object BOP-format loader.
 
-    Outputs:
+    Outputs (always):
         rgb:          [3, H, W] float32
         point_cloud:  [N, 3]    float32 (camera frame, meters)
         pose:         [3, 4]    float32 (GT [R|t], meters)
@@ -89,7 +85,11 @@ class SingleObjectDataset(Dataset):
         labels:       [N]       long (1=foreground-valid, 0=invalid/placeholder)
         kp3d_model:   [K, 3]    float32
         kp3d_cam:     [K, 3]    float32
-        pcld_valid_mask: [N]    bool (extra debug/robustness hook)
+        pcld_valid_mask: [N]    bool
+
+    Optional outputs (controlled by cfg):
+        mask:         [1, H, W] float32 in {0,1}   (raw visible mask, for seg supervision)
+        mask_valid:   [1, H, W] float32 in {0,1}   (robust valid_pix, for debugging/alt supervision)
     """
 
     def __init__(self, cfg: LGFFConfig, split: str = "train") -> None:
@@ -102,15 +102,23 @@ class SingleObjectDataset(Dataset):
         # mm -> m divisor (usually 1000.0)
         self.depth_scale = float(getattr(cfg, "depth_scale", 1000.0))
 
+        # NOTE: for your offline-cropped ROI=128 dataset,
+        # set resize_h=128, resize_w=128 in cfg.
         self.resize_h = int(getattr(cfg, "resize_h", 480))
         self.resize_w = int(getattr(cfg, "resize_w", 640))
 
         self.obj_id = int(getattr(cfg, "obj_id", 1))
 
+        # ---------------------------
+        # Optional return controls
+        # ---------------------------
+        self.return_mask = bool(getattr(cfg, "return_mask", False))
+        self.return_valid_mask = bool(getattr(cfg, "return_valid_mask", False))
+
         # Robust sampling controls (B-1)
         self.depth_z_min_m = float(getattr(cfg, "depth_z_min_m", 0.10))
         self.depth_z_max_m = float(getattr(cfg, "depth_z_max_m", 5.00))
-        self.mask_erosion = int(getattr(cfg, "mask_erosion", 1))          # 0 to disable
+        self.mask_erosion = int(getattr(cfg, "mask_erosion", 1))  # 0 to disable
         self.depth_edge_thresh_m = float(getattr(cfg, "depth_edge_thresh_m", 0.0))  # <=0 to disable
 
         # CAD points
@@ -156,7 +164,8 @@ class SingleObjectDataset(Dataset):
                 f"[SingleObjectDataset] split={split}, obj_id={self.obj_id}, "
                 f"num_samples={len(self.samples)} | "
                 f"z_range=[{self.depth_z_min_m},{self.depth_z_max_m}]m | "
-                f"erosion={self.mask_erosion} | edge_th={self.depth_edge_thresh_m}"
+                f"erosion={self.mask_erosion} | edge_th={self.depth_edge_thresh_m} | "
+                f"return_mask={self.return_mask} | return_valid_mask={self.return_valid_mask}"
             )
 
     # ------------------------------------------------------------------
@@ -169,8 +178,13 @@ class SingleObjectDataset(Dataset):
                 d = self.root / sub
                 if d.is_dir():
                     candidates.append(d)
-        else:
+        elif self.split == "val" or self.split == "test":
             for sub in ["test", "val", "test_all"]:
+                d = self.root / sub
+                if d.is_dir():
+                    candidates.append(d)
+        else:
+            for sub in [ "test_lmo"]:
                 d = self.root / sub
                 if d.is_dir():
                     candidates.append(d)
@@ -326,9 +340,7 @@ class SingleObjectDataset(Dataset):
 
         d = np.array(d_img).astype(np.float32)
 
-        # raw -> mm -> m
         depth_m = d * float(depth_scale_scene) / float(self.depth_scale)
-        # sanitize
         depth_m[~np.isfinite(depth_m)] = 0.0
         depth_m[depth_m < 0] = 0.0
 
@@ -344,7 +356,6 @@ class SingleObjectDataset(Dataset):
                 m = m[..., 0]
             mask = (m > 0)
         else:
-            # val/test fallback: depth>0 as "some foreground"
             mask = (depth_m > 1e-8)
 
         return mask.astype(bool)
@@ -356,7 +367,6 @@ class SingleObjectDataset(Dataset):
         """
         valid = mask & depth_valid & (optional erosion) & (optional edge_filter)
         """
-        # depth validity
         depth_valid = (
             np.isfinite(depth_m)
             & (depth_m > self.depth_z_min_m)
@@ -365,12 +375,10 @@ class SingleObjectDataset(Dataset):
 
         valid = mask.astype(bool) & depth_valid
 
-        # remove strong depth discontinuities (edge noise)
         if self.depth_edge_thresh_m > 0:
             non_edge = _depth_edge_mask(depth_m, self.depth_edge_thresh_m)
             valid &= non_edge
 
-        # erode to avoid boundary pixels
         if self.mask_erosion > 0:
             valid = _binary_erosion(valid, radius=self.mask_erosion)
 
@@ -404,14 +412,12 @@ class SingleObjectDataset(Dataset):
             valid_mask = np.zeros((num_points,), dtype=bool)
             return sampled, valid_mask
 
-        # sample with/without replacement
         if valid_idxs.size >= num_points:
             choice = np.random.choice(valid_idxs, size=num_points, replace=False)
         else:
             choice = np.random.choice(valid_idxs, size=num_points, replace=True)
 
         sampled_pts = pts_flat[choice].astype(np.float32)
-        # sampled points are valid by construction
         valid_mask = np.ones((num_points,), dtype=bool)
         return sampled_pts, valid_mask
 
@@ -437,10 +443,10 @@ class SingleObjectDataset(Dataset):
             K[1, 2] *= scale_y
 
         rgb_np = self._load_rgb(rec["rgb_path"])
-        raw_mask = self._load_mask(rec["mask_path"], depth_m)
+        raw_mask = self._load_mask(rec["mask_path"], depth_m)  # bool [H,W]
 
-        # B-1: build robust valid pixel mask
-        valid_pix = self._build_valid_pixel_mask(raw_mask, depth_m)
+        # robust valid pixel mask
+        valid_pix = self._build_valid_pixel_mask(raw_mask, depth_m)  # bool [H,W]
 
         pts_img = self._depth_to_points(depth_m, K)  # [H,W,3]
         pcld, pcld_valid_mask = self._sample_points(pts_img, valid_pix, self.num_points)  # [N,3]
@@ -451,8 +457,8 @@ class SingleObjectDataset(Dataset):
         K_t = torch.from_numpy(K.astype(np.float32))
 
         # --- keypoint offsets ---
-        R = pose_t[:, :3]     # [3,3]
-        t = pose_t[:, 3]      # [3]
+        R = pose_t[:, :3]  # [3,3]
+        t = pose_t[:, 3]   # [3]
         kp_model = self.kp3d_model_torch.to(dtype=torch.float32)  # [K,3]
         kp_cam = (R @ kp_model.T).T + t.unsqueeze(0)              # [K,3]
 
@@ -461,7 +467,7 @@ class SingleObjectDataset(Dataset):
         # labels: 1 for valid sampled points, 0 for placeholders (only happens when no valid pixels)
         labels = torch.from_numpy(pcld_valid_mask.astype(np.int64))  # [N]
 
-        return {
+        out: Dict[str, torch.Tensor] = {
             "rgb": rgb_t,
             "point_cloud": points_t,
             "points": points_t,  # alias for loss/eval
@@ -474,14 +480,28 @@ class SingleObjectDataset(Dataset):
             "im_id": torch.tensor(int(rec.get("im_id", -1)), dtype=torch.long),
 
             # kp supervision
-            "kp_targ_ofst": kp_targ_ofst,           # [N,K,3]
-            "labels": labels,                       # [N]
-            "kp3d_model": self.kp3d_model_torch,     # [K,3]
-            "kp3d_cam": kp_cam,                     # [K,3]
+            "kp_targ_ofst": kp_targ_ofst,        # [N,K,3]
+            "labels": labels,                    # [N]
+            "kp3d_model": self.kp3d_model_torch,  # [K,3]
+            "kp3d_cam": kp_cam,                  # [K,3]
 
-            # extra robustness hook
+            # extra robustness hook (point-level)
             "pcld_valid_mask": torch.from_numpy(pcld_valid_mask.astype(np.bool_)),  # [N]
         }
+
+        # ----------------------------
+        # Optional: 2D masks for SegHead training / debugging
+        # ----------------------------
+        if self.return_mask:
+            # raw visible mask (not depth-filtered, not eroded unless your mask file is already visib)
+            m = raw_mask.astype(np.float32)  # [H,W] in {0,1}
+            out["mask"] = torch.from_numpy(m).unsqueeze(0)  # [1,H,W]
+
+        if self.return_valid_mask:
+            mv = valid_pix.astype(np.float32)  # [H,W] in {0,1}
+            out["mask_valid"] = torch.from_numpy(mv).unsqueeze(0)  # [1,H,W]
+
+        return out
 
 
 __all__ = ["SingleObjectDataset"]
