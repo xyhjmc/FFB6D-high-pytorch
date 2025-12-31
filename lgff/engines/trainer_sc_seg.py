@@ -31,7 +31,6 @@ from lgff.utils.pose_metrics import (
 
 class AverageMeter:
     """Computes and stores the average and current value."""
-
     def __init__(self) -> None:
         self.reset()
 
@@ -50,14 +49,14 @@ class AverageMeter:
 
 class TrainerSC:
     def __init__(
-            self,
-            model: LGFF_SC,
-            loss_fn: LGFFLoss,
-            train_loader: DataLoader,
-            val_loader: Optional[DataLoader],
-            cfg: LGFFConfig,
-            output_dir: str = "output",
-            resume_path: Optional[str] = None,
+        self,
+        model: LGFF_SC,
+        loss_fn: LGFFLoss,
+        train_loader: DataLoader,
+        val_loader: Optional[DataLoader],
+        cfg: LGFFConfig,
+        output_dir: str = "output",
+        resume_path: Optional[str] = None,
     ) -> None:
         self.cfg = cfg
         self.logger = logging.getLogger("lgff.trainer")
@@ -136,20 +135,19 @@ class TrainerSC:
             "val": [],
         }
 
-        # ====== [修改] Curriculum Loss 调度 ======
-        # 仅保留 lambda_t 的调度，移除了 lambda_rot
+        # ====== Curriculum Loss 调度（你原先只调 lambda_t） ======
         self.total_epochs: int = getattr(self.cfg, "epochs", 50)
         self.use_curriculum_loss: bool = getattr(self.cfg, "use_curriculum_loss", False)
 
-        self.curriculum_warmup_frac: float = getattr(
-            self.cfg, "curriculum_warmup_frac", 0.4
-        )
-        self.curriculum_final_factor_t: float = getattr(
-            self.cfg, "curriculum_final_factor_t", 0.3
-        )
-        # [移除] self.curriculum_final_factor_rot
+        self.curriculum_warmup_frac: float = getattr(self.cfg, "curriculum_warmup_frac", 0.4)
+        self.curriculum_final_factor_t: float = getattr(self.cfg, "curriculum_final_factor_t", 0.3)
 
-        # 记录基准权重
+        # ====== [新增] Seg warmup（与 curriculum 分离，默认开启但不破坏旧版本） ======
+        # 只有当 loss_fn 有 lambda_seg 时才生效
+        self.seg_warmup_frac: float = float(getattr(self.cfg, "seg_warmup_frac", 0.02))
+        self.seg_warmup_mode: str = str(getattr(self.cfg, "seg_warmup_mode", "linear")).lower()
+
+        # 记录基准权重（从 loss_fn 优先读取）
         self.base_lambda_dense: float = float(
             getattr(self.loss_fn, "lambda_dense", getattr(self.cfg, "lambda_add", 1.0))
         )
@@ -162,57 +160,73 @@ class TrainerSC:
         self.base_lambda_kp_of: float = float(
             getattr(self.loss_fn, "lambda_kp_of", getattr(self.cfg, "lambda_kp_of", 2.0))
         )
-        # [移除] base_lambda_rot, base_lambda_add_cad
+        # seg（若无则为 0，不影响）
+        self.base_lambda_seg: float = float(getattr(self.loss_fn, "lambda_seg", 0.0))
 
         # 8. Resume
         if resume_path is not None and os.path.exists(resume_path):
             self._load_checkpoint(resume_path)
 
     # ------------------------------------------------------------------
-    # Curriculum：根据 epoch 调整 lambda_t
+    # Curriculum：根据 epoch 调整 lambda_t +（可选）lambda_seg warmup
     # ------------------------------------------------------------------
     def _update_loss_schedule(self, epoch: int) -> None:
         """
-        [修改] 仅调度 Translation Loss。
-        Rotation Loss 已被移除，无需调度。
+        - Translation curriculum: warmup 前保持 1.0，之后线性衰减到 final_factor_t
+        - Seg warmup: 前 seg_warmup_frac 线性从 0 升到 1（乘 base_lambda_seg）
         """
-        if not self.use_curriculum_loss:
-            return
-
         epoch_idx = epoch + 1
         frac = epoch_idx / max(1, self.total_epochs)
 
-        warm = self.curriculum_warmup_frac
-        warm = min(max(warm, 0.0), 1.0)
+        # ---- (A) Translation curriculum ----
+        if self.use_curriculum_loss:
+            warm = float(self.curriculum_warmup_frac)
+            warm = min(max(warm, 0.0), 1.0)
 
-        if frac <= warm:
-            scale_t = 1.0
-        else:
-            # 线性衰减
-            progress = (frac - warm) / max(1e-6, 1.0 - warm)
-            progress = min(max(progress, 0.0), 1.0)
+            if frac <= warm:
+                scale_t = 1.0
+            else:
+                progress = (frac - warm) / max(1e-6, 1.0 - warm)
+                progress = min(max(progress, 0.0), 1.0)
 
-            ft = self.curriculum_final_factor_t
-            ft = min(max(ft, 0.0), 1.0)
-            scale_t = 1.0 - progress * (1.0 - ft)
+                ft = float(self.curriculum_final_factor_t)
+                ft = min(max(ft, 0.0), 1.0)
+                scale_t = 1.0 - progress * (1.0 - ft)
 
-        # 应用到 loss_fn
-        if hasattr(self.loss_fn, "lambda_t"):
-            self.loss_fn.lambda_t = self.base_lambda_t * scale_t
+            if hasattr(self.loss_fn, "lambda_t"):
+                self.loss_fn.lambda_t = self.base_lambda_t * scale_t
 
-        # 恢复其他权重 (防止被意外修改，保持常数)
-        if hasattr(self.loss_fn, "lambda_dense"):
-            self.loss_fn.lambda_dense = self.base_lambda_dense
-        if hasattr(self.loss_fn, "lambda_conf"):
-            self.loss_fn.lambda_conf = self.base_lambda_conf
-        if hasattr(self.loss_fn, "lambda_kp_of"):
-            self.loss_fn.lambda_kp_of = self.base_lambda_kp_of
+            # 恢复其他权重为常数（避免被别处意外改）
+            if hasattr(self.loss_fn, "lambda_dense"):
+                self.loss_fn.lambda_dense = self.base_lambda_dense
+            if hasattr(self.loss_fn, "lambda_conf"):
+                self.loss_fn.lambda_conf = self.base_lambda_conf
+            if hasattr(self.loss_fn, "lambda_kp_of"):
+                self.loss_fn.lambda_kp_of = self.base_lambda_kp_of
 
+        # ---- (B) Seg warmup（仅当 loss_fn 支持 seg）----
+        if hasattr(self.loss_fn, "lambda_seg") and self.base_lambda_seg > 0.0:
+            w = min(max(self.seg_warmup_frac, 0.0), 1.0)
+
+            if w <= 1e-9:
+                scale_seg = 1.0
+            else:
+                if self.seg_warmup_mode == "linear":
+                    scale_seg = min(max(frac / w, 0.0), 1.0)
+                else:
+                    # fallback
+                    scale_seg = min(max(frac / w, 0.0), 1.0)
+
+            self.loss_fn.lambda_seg = self.base_lambda_seg * scale_seg
+
+        # 日志打印（可选，避免太吵：你也可以改成每 N epoch 打一次）
+        seg_now = float(getattr(self.loss_fn, "lambda_seg", 0.0))
         self.logger.info(
-            f"[Curriculum] Epoch {epoch_idx}: "
-            f"lambda_t={getattr(self.loss_fn, 'lambda_t', self.base_lambda_t):.4f}, "
-            f"lambda_kp={getattr(self.loss_fn, 'lambda_kp_of', self.base_lambda_kp_of):.4f}, "
-            f"lambda_dense={getattr(self.loss_fn, 'lambda_dense', self.base_lambda_dense):.4f}"
+            f"[Schedule] Epoch {epoch_idx}: "
+            f"lambda_t={float(getattr(self.loss_fn, 'lambda_t', self.base_lambda_t)):.4f}, "
+            f"lambda_kp={float(getattr(self.loss_fn, 'lambda_kp_of', self.base_lambda_kp_of)):.4f}, "
+            f"lambda_dense={float(getattr(self.loss_fn, 'lambda_dense', self.base_lambda_dense)):.4f}, "
+            f"lambda_seg={seg_now:.4f}"
         )
 
     # ------------------------------------------------------------------
@@ -221,7 +235,7 @@ class TrainerSC:
     def fit(self) -> None:
         self.logger.info(f"Start training on device: {self.device}")
 
-        epochs = getattr(self.cfg, "epochs", 50)
+        epochs = int(getattr(self.cfg, "epochs", 50))
 
         for epoch in range(self.start_epoch, epochs):
             epoch_idx = epoch + 1
@@ -256,23 +270,20 @@ class TrainerSC:
             self._save_checkpoint(epoch, is_best=False)
             self._record_epoch_metrics(epoch_idx, train_metrics, val_metrics)
 
-            # [修改] 记录 Loss 分量（已清理 Rot/CAD）
+            # 记录 Loss 分量（自动包含 seg，若存在）
             self._append_loss_components(epoch_idx, train_metrics)
 
-            # -------- 日志 --------
+            # 日志
             self._log_epoch_summary(epoch_idx, epochs, train_metrics, val_metrics)
 
         self._save_metrics_history()
         self.writer.close()
 
     def _log_epoch_summary(self, epoch_idx, epochs, train_metrics, val_metrics):
-        """辅助函数：打印整洁的 Epoch 总结"""
         train_loss = train_metrics.get("loss_total", float("nan"))
         val_loss = val_metrics.get("loss_total", float("nan"))
-
         lr_now = self.optimizer.param_groups[0]["lr"]
 
-        # 关注的指标
         t_err_mean_val = val_metrics.get("t_err_mean", float("nan"))
         acc_5mm = val_metrics.get("acc_add<5mm", float("nan"))
         acc_adds_5mm = val_metrics.get("acc_adds<5mm", float("nan"))
@@ -306,6 +317,8 @@ class TrainerSC:
             leave=True,
         )
 
+        log_interval = int(getattr(self.cfg, "log_interval", 10))
+
         for i, batch in pbar:
             batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
@@ -314,16 +327,16 @@ class TrainerSC:
             with autocast("cuda", enabled=self.use_amp):
                 outputs = self.model(batch)
                 loss, metrics = self.loss_fn(outputs, batch)
+                if not isinstance(metrics, dict):
+                    metrics = {"loss_total": loss.detach()}
 
-                if not isinstance(metrics, dict): metrics = {"loss_total": loss.detach()}
-
-            if not torch.isfinite(loss):
+            if loss is None or (not torch.isfinite(loss)):
                 continue
 
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
 
-            max_grad_norm = getattr(self.cfg, "max_grad_norm", 2.0)
+            max_grad_norm = float(getattr(self.cfg, "max_grad_norm", 2.0))
             if max_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=max_grad_norm)
 
@@ -331,164 +344,159 @@ class TrainerSC:
             self.scaler.update()
 
             # Meters update
-            bs = batch["rgb"].size(0)
+            bs = int(batch["rgb"].size(0))
             if not meters:
-                for k in metrics.keys(): meters[k] = AverageMeter()
+                for k in metrics.keys():
+                    meters[k] = AverageMeter()
             for k, v in metrics.items():
                 val = v.item() if isinstance(v, torch.Tensor) else float(v)
+                if k not in meters:
+                    meters[k] = AverageMeter()
                 meters[k].update(val, bs)
 
-            # Tqdm update
-            # [修改] 只展示关键 Loss
+            # Tqdm update（自动包含 seg）
             postfix = {
-                "loss": f"{meters['loss_total'].val:.4f}",
+                "loss": f"{meters.get('loss_total', AverageMeter()).val:.4f}",
                 "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
             }
-            # 动态添加存在的 loss 分量
-            for k in ["loss_t", "loss_kp", "loss_dense", "loss_conf"]:
+            for k in ["loss_t", "loss_kp", "loss_dense", "loss_conf", "loss_seg"]:
                 if k in meters:
                     postfix[k] = f"{meters[k].val:.4f}"
-
             pbar.set_postfix(postfix)
 
             # Tensorboard Logging
-            if i % getattr(self.cfg, "log_interval", 10) == 0:
+            if i % log_interval == 0:
                 self.global_step += 1
                 for k, m in meters.items():
                     self.writer.add_scalar(f"Train/{k}", m.val, self.global_step)
 
+                # 同步记录当前 lambda（便于观察 warmup）
+                if hasattr(self.loss_fn, "lambda_seg"):
+                    self.writer.add_scalar("Train/lambda_seg", float(getattr(self.loss_fn, "lambda_seg", 0.0)), self.global_step)
+                self.writer.add_scalar("Train/lambda_t", float(getattr(self.loss_fn, "lambda_t", 0.0)), self.global_step)
+
         return {k: m.avg for k, m in meters.items()} if meters else {}
 
-        # ------------------------------------------------------------------
-        # 验证阶段：loss + 统一 pose 指标
-        # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Validate: loss + pose metrics
+    # ------------------------------------------------------------------
     def _validate(self, epoch: int) -> Dict[str, float]:
-            if self.val_loader is None or len(self.val_loader) == 0:
-                return {"loss_total": float("nan")}
+        if self.val_loader is None or len(self.val_loader) == 0:
+            return {"loss_total": float("nan")}
 
-            self.model.eval()
-            meters: Dict[str, AverageMeter] = {}
+        self.model.eval()
+        meters: Dict[str, AverageMeter] = {}
+        pose_meter: Dict[str, list[float]] = {}
 
-            # Pose metrics container
-            pose_meter: Dict[str, list[float]] = {}
+        with torch.no_grad():
+            pbar = tqdm(
+                self.val_loader,
+                desc=f"[Val]   Epoch {epoch + 1}",
+                leave=True
+            )
 
-            with torch.no_grad():
-                pbar = tqdm(
-                    self.val_loader,
-                    desc=f"[Val]   Epoch {epoch + 1}",
-                    leave=True  # 验证完保留进度条，方便查看最终结果
+            for batch in pbar:
+                batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+
+                with autocast("cuda", enabled=self.use_amp):
+                    outputs = self.model(batch)
+                    loss, metrics = self.loss_fn(outputs, batch)
+                    if not isinstance(metrics, dict):
+                        metrics = {"loss_total": loss.detach()} if loss is not None else {}
+
+                # 1) Update loss meters
+                bs = int(batch["rgb"].size(0))
+                if not meters:
+                    for k in metrics.keys():
+                        meters[k] = AverageMeter()
+                for k, v in metrics.items():
+                    val = v.item() if isinstance(v, torch.Tensor) else float(v)
+                    if k not in meters:
+                        meters[k] = AverageMeter()
+                    meters[k].update(val, bs)
+
+                # 2) Pose metrics
+                pred_rt = fuse_pose_from_outputs(
+                    outputs, self.geometry, self.cfg, stage="eval",
+                    valid_mask=batch.get("labels", None)  # [B,N]
                 )
 
-                for batch in pbar:
-                    batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                if self.obj_diameter is None and batch["model_points"].size(1) > 1:
+                    mp0 = batch["model_points"][0]
+                    self.obj_diameter = float(torch.cdist(mp0.unsqueeze(0), mp0.unsqueeze(0)).max().item())
 
-                    with autocast("cuda", enabled=self.use_amp):
-                        outputs = self.model(batch)
-                        # 计算 Loss
-                        loss, metrics = self.loss_fn(outputs, batch)
+                batch_pose_metrics = compute_batch_pose_metrics(
+                    pred_rt=pred_rt,
+                    gt_rt=batch["pose"],
+                    model_points=batch["model_points"],
+                    cls_ids=batch.get("cls_id"),
+                    geometry=self.geometry,
+                    cfg=self.cfg,
+                )
 
-                        # 兼容性处理：确保 metrics 存在
-                        if not isinstance(metrics, dict):
-                            metrics = {"loss_total": loss.detach()} if loss is not None else {}
+                for name, val_list in batch_pose_metrics.items():
+                    if name not in pose_meter:
+                        pose_meter[name] = []
+                    # 处理不同类型的返回值
+                    if torch.is_tensor(val_list):
+                        if val_list.numel() == 1:  # 单个值张量
+                            pose_meter[name].append(val_list.item())
+                        else:  # 多元素张量
+                            pose_meter[name].extend(val_list.detach().cpu().numpy().tolist())
+                    else:  # 标量值
+                        pose_meter[name].append(float(val_list))
 
-                    # 1. Update Loss Meters
-                    bs = batch["rgb"].size(0)
-                    if not meters:
-                        for k in metrics.keys(): meters[k] = AverageMeter()
-                    for k, v in metrics.items():
-                        val = v.item() if isinstance(v, torch.Tensor) else float(v)
-                        meters[k].update(val, bs)
+                # tqdm postfix（验证看 avg）
+                if "loss_total" in meters:
+                    postfix = {"loss": f"{meters['loss_total'].avg:.4f}"}
+                    for k in ["loss_t", "loss_kp", "loss_dense", "loss_conf", "loss_seg"]:
+                        if k in meters:
+                            postfix[k] = f"{meters[k].avg:.4f}"
+                    pbar.set_postfix(postfix)
 
-                    # 2. Compute Pose Metrics (保持原逻辑)
-                    pred_rt = fuse_pose_from_outputs(outputs, self.geometry, self.cfg, stage="eval")
+        avg_metrics = {k: m.avg for k, m in meters.items()} if meters else {}
 
-                    if self.obj_diameter is None and batch["model_points"].size(1) > 1:
-                        mp0 = batch["model_points"][0]
-                        self.obj_diameter = float(torch.cdist(mp0.unsqueeze(0), mp0.unsqueeze(0)).max().item())
+        obj_diam = float(self.obj_diameter) if self.obj_diameter else 0.0
+        pose_summary = summarize_pose_metrics(pose_meter, obj_diam, self.cmd_acc_threshold_m)
+        avg_metrics.update(pose_summary)
 
-                    batch_pose_metrics = compute_batch_pose_metrics(
-                        pred_rt=pred_rt,
-                        gt_rt=batch["pose"],
-                        model_points=batch["model_points"],
-                        cls_ids=batch.get("cls_id"),
-                        geometry=self.geometry,
-                        cfg=self.cfg,
-                    )
+        # Tensorboard (epoch level)
+        for k, v in avg_metrics.items():
+            self.writer.add_scalar(f"Val/{k}", float(v), epoch + 1)
 
-                    for name, val_list in batch_pose_metrics.items():
-                        if name not in pose_meter: pose_meter[name] = []
-                        pose_meter[name].extend(val_list.cpu().numpy().tolist())
+        return avg_metrics
 
-                    # ==========================================
-                    # [新增] 实时更新验证进度条的 Loss 显示
-                    # ==========================================
-                    if "loss_total" in meters:
-                        postfix = {
-                            "loss": f"{meters['loss_total'].avg:.4f}"  # 验证集通常看 avg
-                        }
-                        # 顺带显示几个核心分量，方便诊断
-                        for k in ["loss_t", "loss_kp", "loss_dense", "loss_conf"]:
-                            if k in meters:
-                                postfix[k] = f"{meters[k].avg:.4f}"
-
-                        pbar.set_postfix(postfix)
-
-            avg_metrics = {k: m.avg for k, m in meters.items()} if meters else {}
-
-            # Summarize Pose Metrics
-            obj_diam = self.obj_diameter if self.obj_diameter else 0.0
-            pose_summary = summarize_pose_metrics(pose_meter, obj_diam, self.cmd_acc_threshold_m)
-            avg_metrics.update(pose_summary)
-
-            # Tensorboard
-            for k, v in avg_metrics.items():
-                self.writer.add_scalar(f"Val/{k}", v, epoch + 1)
-
-            return avg_metrics
     # ------------------------------------------------------------------
     # Helper: Record Metrics
     # ------------------------------------------------------------------
     def _record_epoch_metrics(self, epoch_idx, train_metrics, val_metrics):
-        self.history["train"].append({"epoch": epoch_idx, **train_metrics})
+        self.history["train"].append({"epoch": int(epoch_idx), **train_metrics})
         if self.val_loader:
-            self.history["val"].append({"epoch": epoch_idx, **val_metrics})
+            self.history["val"].append({"epoch": int(epoch_idx), **val_metrics})
 
     # ------------------------------------------------------------------
-    # [修改] Loss Components Logging (Removed Rot/CAD)
+    # Loss Components CSV (auto supports seg if present)
     # ------------------------------------------------------------------
     def _append_loss_components(self, epoch_idx: int, train_metrics: Dict[str, float]) -> None:
-        # 仅关注 v8.1 Loss 的核心分量
-        component_keys = [
-            "loss_dense",
-            "loss_t",
-            "loss_kp",  # 旧版叫 loss_kp_of，新 Loss 返回叫 loss_kp，请检查 Loss 返回的 key
-            "loss_conf",
-        ]
-        # 兼容 key 名字
-        actual_keys = []
-        for k in component_keys:
-            if k in train_metrics:
-                actual_keys.append(k)
-            elif k == "loss_kp" and "loss_kp_of" in train_metrics:
-                actual_keys.append("loss_kp_of")
+        # 统一 key（允许不存在）
+        component_keys = ["loss_dense", "loss_t", "loss_kp", "loss_conf", "loss_seg"]
 
         lambdas = {
             "loss_dense": float(getattr(self.loss_fn, "lambda_dense", self.base_lambda_dense)),
             "loss_t": float(getattr(self.loss_fn, "lambda_t", self.base_lambda_t)),
             "loss_kp": float(getattr(self.loss_fn, "lambda_kp_of", self.base_lambda_kp_of)),
-            # loss_fn 属性名通常叫 lambda_kp_of
-            "loss_kp_of": float(getattr(self.loss_fn, "lambda_kp_of", self.base_lambda_kp_of)),
             "loss_conf": float(getattr(self.loss_fn, "lambda_conf", self.base_lambda_conf)),
+            "loss_seg": float(getattr(self.loss_fn, "lambda_seg", self.base_lambda_seg)),
         }
 
         total_loss = float(train_metrics.get("loss_total", 0.0))
-        row = {"epoch": epoch_idx}
+        row: Dict[str, float] = {"epoch": float(epoch_idx)}
 
-        for k in actual_keys:
+        for k in component_keys:
+            if k not in train_metrics:
+                continue
             val = float(train_metrics.get(k, 0.0))
-            # 找到对应的 lambda (如果是 loss_kp，尝试找 lambda_kp_of)
-            lam = lambdas.get(k, lambdas.get("loss_kp_of", 1.0))
-
+            lam = float(lambdas.get(k, 1.0))
             w_val = val * lam
             ratio = w_val / total_loss if total_loss > 1e-8 else 0.0
 
@@ -496,27 +504,36 @@ class TrainerSC:
             row[f"w_{k}"] = w_val
             row[f"ratio_{k}"] = ratio
 
-        # Write CSV
+        # Also log current lambdas (useful)
+        row["lambda_t"] = float(getattr(self.loss_fn, "lambda_t", self.base_lambda_t))
+        row["lambda_dense"] = float(getattr(self.loss_fn, "lambda_dense", self.base_lambda_dense))
+        row["lambda_conf"] = float(getattr(self.loss_fn, "lambda_conf", self.base_lambda_conf))
+        row["lambda_kp"] = float(getattr(self.loss_fn, "lambda_kp_of", self.base_lambda_kp_of))
+        if hasattr(self.loss_fn, "lambda_seg"):
+            row["lambda_seg"] = float(getattr(self.loss_fn, "lambda_seg", self.base_lambda_seg))
+
         file_exists = os.path.exists(self.loss_components_path)
         keys = sorted(row.keys())
         with open(self.loss_components_path, "a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=keys)
-            if not file_exists: writer.writeheader()
+            if not file_exists:
+                writer.writeheader()
             writer.writerow(row)
 
-    # ... (其余 save/load/scheduler 方法保持不变) ...
-    # _save_metrics_history, _step_scheduler, _save_checkpoint, _load_checkpoint
-    # 这些通用方法不需要修改。
-
+    # ------------------------------------------------------------------
+    # Save / Scheduler / Checkpoint
+    # ------------------------------------------------------------------
     def _save_metrics_history(self) -> None:
-        if not self.history["train"]: return
+        if not self.history["train"]:
+            return
         with open(os.path.join(self.output_dir, "metrics_history.json"), "w") as f:
             json.dump(self.history, f, indent=2)
 
     def _step_scheduler(self, metric):
         if self.scheduler:
             if isinstance(self.scheduler, ReduceLROnPlateau):
-                if metric is not None: self.scheduler.step(metric)
+                if metric is not None:
+                    self.scheduler.step(metric)
             else:
                 self.scheduler.step()
 
@@ -526,7 +543,7 @@ class TrainerSC:
             "state_dict": self.model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "best_val_loss": self.best_val_loss,
-            "config": asdict(self.cfg) if hasattr(self.cfg, "__dataclass_fields__") else self.cfg.__dict__
+            "config": asdict(self.cfg) if hasattr(self.cfg, "__dataclass_fields__") else self.cfg.__dict__,
         }
         torch.save(state, os.path.join(self.output_dir, "checkpoint_last.pth"))
         if is_best:
@@ -536,8 +553,8 @@ class TrainerSC:
         ckpt = torch.load(path, map_location=self.device)
         self.model.load_state_dict(ckpt["state_dict"])
         self.optimizer.load_state_dict(ckpt["optimizer"])
-        self.start_epoch = ckpt["epoch"] + 1
-        self.best_val_loss = ckpt["best_val_loss"]
+        self.start_epoch = int(ckpt["epoch"]) + 1
+        self.best_val_loss = float(ckpt.get("best_val_loss", float("inf")))
 
 
 __all__ = ["TrainerSC"]

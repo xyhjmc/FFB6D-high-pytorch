@@ -435,7 +435,4 @@ class LGFF_SC_SEG(LGFFBase):
         }
 
 
-# 兼容：如果你外部仍然写死 import LGFF_SC，则让它指向 seg 版本（可按需删除）
-LGFF_SC = LGFF_SC_SEG
-
-__all__ = ["LGFF_SC_SEG", "LGFF_SC", "SegHead2D"]
+__all__ = ["LGFF_SC_SEG", "SegHead2D"]

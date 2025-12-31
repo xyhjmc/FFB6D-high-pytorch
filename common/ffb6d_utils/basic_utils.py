@@ -652,9 +652,9 @@ class Basic_Utils():
     def cal_add_cuda(self, pred_RT, gt_RT, p3ds):
         """Compute ADD for batched or single poses.
 
-        Returns a per-sample mean distance tensor of shape ``[B]`` instead of a
-        single scalar so that downstream evaluators can safely iterate over the
-        batch without shape errors.
+        ``torch.mm`` requires 2D inputs and previously assumed unbatched tensors,
+        which caused a runtime error when CAD-level ADD was enabled with batched
+        ``model_points``/poses. We now support both batched and unbatched usage.
         """
 
         # Ensure batched shapes: [B, N, 3] for points and [B, 3, 4] for poses.
@@ -672,14 +672,10 @@ class Basic_Utils():
         gt_p3ds = torch.bmm(p3ds, rot_gt.transpose(1, 2)) + t_gt.unsqueeze(1)
 
         dis = torch.norm(pred_p3ds - gt_p3ds, dim=2)  # [B, N]
-        return dis.mean(dim=1)
+        return dis.mean()
 
     def cal_adds_cuda(self, pred_RT, gt_RT, p3ds):
-        """Symmetric ADD (closest point) with batch support.
-
-        Returns ``[B]`` per-sample means instead of a scalar to preserve the
-        batch dimension for evaluators.
-        """
+        """Symmetric ADD (closest point) with batch support."""
 
         if pred_RT.dim() == 2:
             pred_RT = pred_RT.unsqueeze(0)
@@ -696,7 +692,7 @@ class Basic_Utils():
 
         dis = torch.cdist(pred, gt)  # [B, N, N]
         mdis = dis.min(dim=2)[0]     # [B, N]
-        return mdis.mean(dim=1)
+        return mdis.mean()
 
     def best_fit_transform_torch(self, A, B):
         '''

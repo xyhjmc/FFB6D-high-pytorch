@@ -12,5 +12,5 @@ __all__ = [
     "PSPNet",
     "Modified_PSPNet",
     "RandLANet",
-     "LGFF_SC_SEG",
+    "LGFF_SC_SEG",
 ]
