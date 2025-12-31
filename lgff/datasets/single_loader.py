@@ -233,13 +233,10 @@ class SingleObjectDataset(Dataset):
                     inst_name = f"{im_id:06d}_{gt_idx:06d}.png"
                     mask_visib = scene_dir / "mask_visib" / inst_name
                     mask_full = scene_dir / "mask" / inst_name
-                    mask_path: Optional[Path] = None
-                    if mask_visib.exists():
-                        mask_path = mask_visib
-                    elif mask_full.exists():
-                        mask_path = mask_full
+                    mask_visib_path = mask_visib if mask_visib.exists() else None
+                    mask_full_path = mask_full if mask_full.exists() else None
 
-                    if mask_path is None and self.split == "train":
+                    if mask_visib_path is None and mask_full_path is None and self.split == "train":
                         continue
                     if not rgb_path.exists() or not depth_path.exists():
                         continue
@@ -248,7 +245,8 @@ class SingleObjectDataset(Dataset):
                         {
                             "rgb_path": rgb_path,
                             "depth_path": depth_path,
-                            "mask_path": mask_path,
+                            "mask_visib_path": mask_visib_path,
+                            "mask_full_path": mask_full_path,
                             "K": K,
                             "depth_scale": depth_scale_scene,
                             "pose": pose,
@@ -443,7 +441,23 @@ class SingleObjectDataset(Dataset):
             K[1, 2] *= scale_y
 
         rgb_np = self._load_rgb(rec["rgb_path"])
-        raw_mask = self._load_mask(rec["mask_path"], depth_m)  # bool [H,W]
+        # pick mask path according to supervision source
+        seg_src = str(getattr(self.cfg, "seg_supervision_source", "mask_visib")).lower().strip()
+        seg_enabled = bool(getattr(self.cfg, "use_seg_head", False)) or str(getattr(self.cfg, "model_variant", "sc")).endswith("seg")
+        if seg_src == "mask_full":
+            mask_path = rec.get("mask_full_path", None)
+        else:
+            mask_path = rec.get("mask_visib_path", None)
+
+        if mask_path is None:
+            if seg_enabled or self.return_mask or self.return_valid_mask:
+                raise RuntimeError(
+                    f"[SingleObjectDataset] seg_supervision_source={seg_src} but corresponding mask file is missing "
+                    f"for scene {rec.get('scene_id', '?')} image {rec.get('im_id', '?')}."
+                )
+            raw_mask = self._load_mask(None, depth_m)  # fallback to depth-valid
+        else:
+            raw_mask = self._load_mask(mask_path, depth_m)  # bool [H,W]
 
         # robust valid pixel mask
         valid_pix = self._build_valid_pixel_mask(raw_mask, depth_m)  # bool [H,W]
@@ -493,7 +507,7 @@ class SingleObjectDataset(Dataset):
         # Optional: 2D masks for SegHead training / debugging
         # ----------------------------
         if self.return_mask:
-            # raw visible mask (not depth-filtered, not eroded unless your mask file is already visib)
+            # chosen mask (visib/full) as supervision target
             m = raw_mask.astype(np.float32)  # [H,W] in {0,1}
             out["mask"] = torch.from_numpy(m).unsqueeze(0)  # [1,H,W]
 

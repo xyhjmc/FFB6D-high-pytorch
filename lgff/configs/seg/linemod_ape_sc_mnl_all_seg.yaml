@@ -123,14 +123,15 @@ obj_diameter_m: 0.1016561314   # eval log 中估计得到的 ape 直径，可写
 
 
 return_mask: true
+return_valid_mask: true
 
 # ===== model switch =====
 model_variant: sc_seg
 loss_variant: seg
 
 # ===== pose fusion (use point-valid mask) =====
-pose_fusion_use_valid_mask: true
-pose_fusion_valid_mask_source: labels     # labels / seg
+pose_fusion_use_valid_mask: false         # eval 不依赖 seg valid mask
+pose_fusion_valid_mask_source: labels     # 保留占位
 pose_fusion_conf_floor: 1.0e-4
 
 # ===== seg head =====
@@ -147,8 +148,8 @@ seg_ignore_invalid: true                  # 使用 labels==0 的点做 ignore
 seg_detach_trunk: true                    # 稳：先不让 seg 反向冲击 trunk
 
 # ===== seg supervision =====
-seg_supervision: point
-seg_supervision_source: labels            # labels / pcld_valid_mask
+seg_supervision: mask
+seg_supervision_source: mask_visib        # mask_visib / mask_full
 
 
 

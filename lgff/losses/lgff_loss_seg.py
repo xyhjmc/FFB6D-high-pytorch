@@ -74,6 +74,13 @@ class LGFFLoss_SEG(nn.Module):
         # --- Seg loss options ---
         self.seg_dice_weight = float(getattr(cfg, "seg_dice_weight", 0.5))
         self.seg_min_foreground = float(getattr(cfg, "seg_min_foreground", 1.0))  # pixels (in 128x128)
+        self.seg_loss_type: str = str(getattr(cfg, "seg_loss_type", "bce")).lower().strip()
+        self.seg_pos_weight = getattr(cfg, "seg_pos_weight", None)
+        if self.seg_pos_weight is not None:
+            self.register_buffer("seg_pos_weight_tensor", torch.tensor(float(self.seg_pos_weight), dtype=torch.float32))
+        else:
+            self.seg_pos_weight_tensor = None
+        self.seg_ignore_invalid: bool = bool(getattr(cfg, "seg_ignore_invalid", True))
 
     @staticmethod
     def _safe_isin(x: torch.Tensor, set_ids: torch.Tensor) -> torch.Tensor:
@@ -125,24 +132,82 @@ class LGFFLoss_SEG(nn.Module):
         dice = (2.0 * inter + eps) / (union + eps)
         return 1.0 - dice.mean()
 
-    def _seg_loss(self, pred_mask_logits: torch.Tensor, gt_mask: torch.Tensor) -> torch.Tensor:
+    def _seg_loss(
+        self,
+        pred_mask_logits: torch.Tensor,
+        gt_mask: torch.Tensor,
+        mask_valid: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """
         pred_mask_logits: [B,1,H,W]
         gt_mask:         [B,1,H,W] float in {0,1}
+        mask_valid:      [B,1,H,W] float/bool in {0,1}, optional (ignored pixels=0)
         """
-        # optional skip: if GT mask is essentially empty for all samples, skip (rare but can happen)
+        device = pred_mask_logits.device
+        dtype = pred_mask_logits.dtype
+
         with torch.no_grad():
             fg = gt_mask.sum(dim=(1, 2, 3))  # [B]
-            valid = fg > self.seg_min_foreground
-        if not valid.any():
-            return torch.tensor(0.0, device=pred_mask_logits.device, dtype=pred_mask_logits.dtype)
+            valid_fg = fg > self.seg_min_foreground
+        if not valid_fg.any():
+            return torch.tensor(0.0, device=device, dtype=dtype)
 
-        logits_v = pred_mask_logits[valid]
-        gt_v = gt_mask[valid]
+        logits_v = pred_mask_logits[valid_fg]
+        gt_v = gt_mask[valid_fg]
 
-        bce = F.binary_cross_entropy_with_logits(logits_v, gt_v)
-        dice = self._dice_loss_from_logits(logits_v, gt_v)
-        return bce + self.seg_dice_weight * dice
+        # align mask_valid to logits
+        mv = None
+        if mask_valid is not None:
+            mv = mask_valid
+            if mv.dim() == 3:
+                mv = mv.unsqueeze(1)
+            mv = mv.float()
+            if mv.shape[-2:] != logits_v.shape[-2:]:
+                mv = F.interpolate(mv, size=logits_v.shape[-2:], mode="nearest")
+            mv = mv[valid_fg].clamp(0.0, 1.0)
+
+        # BCE
+        pos_weight = None
+        if self.seg_pos_weight_tensor is not None:
+            pos_weight = self.seg_pos_weight_tensor.to(device=device, dtype=dtype)
+        bce = F.binary_cross_entropy_with_logits(
+            logits_v,
+            gt_v,
+            reduction="none",
+            pos_weight=pos_weight,
+        )
+        if mv is not None and self.seg_ignore_invalid:
+            bce = bce * mv
+            denom = mv.sum().clamp(min=1.0)
+            bce = bce.sum() / denom
+        else:
+            bce = bce.mean()
+
+        if self.seg_loss_type == "bce":
+            return bce
+
+        if self.seg_loss_type == "bce_dice":
+            prob = torch.sigmoid(logits_v)
+            tgt = gt_v
+            mask_use = None
+            if mv is not None and self.seg_ignore_invalid:
+                mask_use = mv
+                prob = prob * mask_use
+                tgt = tgt * mask_use
+
+            prob_flat = prob.flatten(1)
+            tgt_flat = tgt.flatten(1)
+            if mask_use is not None:
+                mflat = mask_use.flatten(1)
+                inter = (prob_flat * tgt_flat).sum(dim=1)
+                union = (prob_flat * mflat).sum(dim=1) + (tgt_flat * mflat).sum(dim=1)
+            else:
+                inter = (prob_flat * tgt_flat).sum(dim=1)
+                union = prob_flat.sum(dim=1) + tgt_flat.sum(dim=1)
+            dice = 1.0 - (2.0 * inter + 1e-6) / (union + 1e-6)
+            return bce + self.seg_dice_weight * dice.mean()
+
+        raise ValueError(f"Unsupported seg_loss_type={self.seg_loss_type}")
 
     def forward(self, outputs, batch):
         # -------------------------
@@ -315,24 +380,23 @@ class LGFFLoss_SEG(nn.Module):
         loss_seg = torch.tensor(0.0, device=device, dtype=points.dtype)
 
         if self.lambda_seg > 0 and pred_mask_logits is not None:
-            # Prefer "mask" key; fallback to "mask_visib" if your dataloader uses BOP naming.
             gt_mask = batch.get("mask", None)
             if gt_mask is None:
-                gt_mask = batch.get("mask_visib", None)
+                raise ValueError("[LGFFLoss_SEG] Seg supervision requires batch['mask']; got None.")
 
-            if gt_mask is not None:
-                # normalize/shape to [B,1,H,W] float in {0,1}
-                if gt_mask.dim() == 3:
-                    gt_mask = gt_mask.unsqueeze(1)
-                gt_mask = gt_mask.float()
-                if gt_mask.max() > 1.0:
-                    gt_mask = (gt_mask > 0).float()
+            # normalize/shape to [B,1,H,W] float in {0,1}
+            if gt_mask.dim() == 3:
+                gt_mask = gt_mask.unsqueeze(1)
+            gt_mask = gt_mask.float()
+            if gt_mask.max() > 1.0:
+                gt_mask = (gt_mask > 0).float()
 
-                # Ensure spatial match (robust)
-                if gt_mask.shape[-2:] != pred_mask_logits.shape[-2:]:
-                    gt_mask = F.interpolate(gt_mask, size=pred_mask_logits.shape[-2:], mode="nearest")
+            # Ensure spatial match (robust)
+            if gt_mask.shape[-2:] != pred_mask_logits.shape[-2:]:
+                gt_mask = F.interpolate(gt_mask, size=pred_mask_logits.shape[-2:], mode="nearest")
 
-                loss_seg = self._seg_loss(pred_mask_logits, gt_mask).to(points.dtype)
+            mask_valid = batch.get("mask_valid", None)
+            loss_seg = self._seg_loss(pred_mask_logits, gt_mask, mask_valid=mask_valid).to(points.dtype)
 
         # -------------------------
         # 7) Total
