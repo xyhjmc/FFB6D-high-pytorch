@@ -132,12 +132,16 @@ def _build_model_and_loss(cfg: LGFFConfig, geometry: GeometryToolkit):
     return model, loss_fn
 
 
+def _is_seg_enabled(cfg: LGFFConfig) -> bool:
+    return bool(getattr(cfg, "use_seg_head", False)) or str(getattr(cfg, "model_variant", "sc")).endswith("seg")
+
+
 def _check_seg_requirements(cfg: LGFFConfig, train_ds: SingleObjectDataset, logger: logging.Logger) -> None:
     """
     If seg is enabled, verify dataset returns seg GT keys.
     This does not modify dataset; it just warns early.
     """
-    need_seg = bool(getattr(cfg, "use_seg_head", False)) or (getattr(cfg, "loss_variant", "base") == "seg")
+    need_seg = _is_seg_enabled(cfg) or (getattr(cfg, "loss_variant", "base") == "seg")
     if not need_seg:
         return
 
@@ -147,16 +151,16 @@ def _check_seg_requirements(cfg: LGFFConfig, train_ds: SingleObjectDataset, logg
         logger.warning(f"[SegCheck] Failed to read train_ds[0] for seg check: {e}")
         return
 
-    has_seg = ("seg_mask" in sample) or ("seg_gt" in sample) or ("mask" in sample)
+    has_seg = ("mask" in sample)
     if not has_seg:
-        logger.warning(
-            "[SegCheck] Seg is ENABLED but dataset sample has no 'seg_mask'/'seg_gt'/'mask' key.\n"
-            "           Your sc_seg / loss_seg will likely need a GT mask tensor.\n"
-            "           Recommended: extend SingleObjectDataset to optionally return a resized binary mask "
-            "           (e.g., sample['seg_mask']=torch.bool[H,W])."
+        raise RuntimeError(
+            "[SegCheck] Seg is ENABLED but dataset sample has no 'mask' key. "
+            "Check cfg.return_mask and seg_supervision_source."
         )
-    else:
-        logger.info("[SegCheck] Dataset provides a mask-like key (seg_mask/seg_gt/mask).")
+    if bool(getattr(cfg, "seg_ignore_invalid", True)) and bool(getattr(cfg, "return_valid_mask", False)):
+        if "mask_valid" not in sample:
+            raise RuntimeError("[SegCheck] seg_ignore_invalid=True but dataset sample has no 'mask_valid'.")
+    logger.info("[SegCheck] Dataset provides required mask keys for seg training.")
 
 
 def main() -> None:
@@ -172,6 +176,20 @@ def main() -> None:
     if getattr(cfg, "work_dir", None) is None:
         cfg.work_dir = getattr(cfg, "log_dir", "output/debug")
     os.makedirs(cfg.work_dir, exist_ok=True)
+
+    # 3.5) force seg dataset flags when seg is enabled
+    if _is_seg_enabled(cfg):
+        cfg.use_seg_head = True
+        cfg.seg_supervision = "mask"
+        if str(getattr(cfg, "seg_supervision_source", "mask_visib")).lower().strip() not in {"mask_visib", "mask_full"}:
+            cfg.seg_supervision_source = "mask_visib"
+        cfg.return_mask = True
+        if bool(getattr(cfg, "seg_ignore_invalid", True)):
+            cfg.return_valid_mask = True
+        try:
+            cfg.validate()
+        except Exception as e:
+            raise RuntimeError(f"[Config] Seg validation failed after enforcing seg flags: {e}")
 
     # 4) logger
     log_file = os.path.join(cfg.work_dir, "train.log")

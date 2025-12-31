@@ -146,19 +146,12 @@ class LGFFConfig:
     # point-level threshold after sampling pred_mask_logits -> per-point valid mask
     seg_point_thresh: float = 0.5
 
-    # supervision mode: "point" or "mask"
-    # - "point": build per-point GT valid mask, then supervise sampled logits
-    # - "mask" : supervise dense 2D logits with dense 2D GT mask
-    seg_supervision: str = "point"
+    # supervision mode: only "mask" is supported for seg training in this repo.
+    seg_supervision: str = "mask"
 
-    # source of supervision:
-    # point: labels / pcld_valid_mask / mask / mask_valid / mask_visib / mask_full
-    # mask : mask / mask_valid / mask_visib / mask_full
-    #
-    # NOTE:
-    # - Your current SingleObjectDataset provides: labels, pcld_valid_mask, mask, mask_valid (if enabled)
-    # - It does NOT provide "mask_visib"/"mask_full" unless you extend the dataset.
-    seg_supervision_source: str = "labels"
+    # source of supervision (controls which on-disk mask to load):
+    # mask_visib / mask_full (BOP-style). The dataset converts the chosen mask to out["mask"].
+    seg_supervision_source: str = "mask_visib"
 
     # ----------------- Loss / Geometry Hyper-params -----------------
     w_rate: float = 0.015
@@ -270,42 +263,29 @@ class LGFFConfig:
 
         # ----------------- SEG validation (dataset-key aligned) -----------------
         if bool(getattr(self, "use_seg_head", False)) or str(getattr(self, "model_variant", "sc")).endswith("seg"):
-            sup = str(getattr(self, "seg_supervision", "point")).lower().strip()
-            src = str(getattr(self, "seg_supervision_source", "labels")).lower().strip()
+            sup = str(getattr(self, "seg_supervision", "mask")).lower().strip()
+            src = str(getattr(self, "seg_supervision_source", "mask_visib")).lower().strip()
 
-            allowed_sup = {"point", "mask"}
-            if sup not in allowed_sup:
-                raise ValueError(f"seg_supervision must be one of {allowed_sup}, got {sup}")
+            # Only mask supervision is supported for seg.
+            if sup != "mask":
+                raise ValueError("seg_supervision must be 'mask' when seg head is enabled (point supervision not supported).")
 
-            # IMPORTANT:
-            # - "mask" / "mask_valid" are the keys returned by your SingleObjectDataset (when enabled).
-            # - "mask_visib" / "mask_full" are only valid if you extend dataset to return them explicitly.
-            allowed_src_mask = {"mask", "mask_valid", "mask_visib", "mask_full"}
-            allowed_src_point = {"labels", "pcld_valid_mask", "mask", "mask_valid", "mask_visib", "mask_full"}
-
-            if sup == "mask":
-                if src not in allowed_src_mask:
-                    raise ValueError(
-                        f"seg_supervision_source must be one of {allowed_src_mask} when seg_supervision='mask', got {src}"
-                    )
-            else:
-                if src not in allowed_src_point:
-                    raise ValueError(
-                        f"seg_supervision_source must be one of {allowed_src_point} when seg_supervision='point', got {src}"
-                    )
+            allowed_src_mask = {"mask_visib", "mask_full"}
+            if src not in allowed_src_mask:
+                raise ValueError(
+                    f"seg_supervision_source must be one of {allowed_src_mask} when seg_supervision='mask', got {src}"
+                )
 
             # helpful warnings (do not hard fail)
             if float(getattr(self, "lambda_seg", 0.0)) <= 0:
                 print("[Config] Warning: seg head is enabled but lambda_seg<=0; seg head will not be trained.")
 
-            # if user wants mask supervision but dataset likely won't return it unless return_mask/return_valid_mask enabled
-            if sup == "mask" and src in {"mask", "mask_valid"}:
-                if not bool(getattr(self, "return_mask", False)) and not bool(getattr(self, "return_valid_mask", False)):
-                    print(
-                        "[Config] Warning: seg_supervision='mask' expects dataset to return 2D mask, "
-                        "but return_mask/return_valid_mask are both False. "
-                        "Set return_mask: true (and/or return_valid_mask: true) in your YAML."
-                    )
+            # dataset knobs: warn if user forgot to request masks
+            if not bool(getattr(self, "return_mask", False)):
+                print(
+                    "[Config] Warning: seg head is enabled but return_mask=False. "
+                    "Training launcher will auto-enable return_mask; ensure your YAML or CLI allows it."
+                )
 
         # pose_fusion_valid_mask_source sanity
         vsrc = str(getattr(self, "pose_fusion_valid_mask_source", "labels")).lower().strip()
