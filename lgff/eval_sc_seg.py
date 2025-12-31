@@ -38,8 +38,8 @@ try:
 except ImportError:
     from lgff.utils.geometry import GeometryToolkit
 
-from lgff.datasets.single_loader import SingleObjectDataset
-from lgff.engines.evaluator_sc import EvaluatorSC
+from lgff.datasets.single_loader_seg import SingleObjectDataset as SingleObjectDatasetSeg
+from lgff.engines.evaluator_sc_seg import EvaluatorSC as EvaluatorSCSeg
 
 
 def parse_args() -> argparse.Namespace:
@@ -128,7 +128,7 @@ def load_model_weights(
 
 
 def build_dataloader(cfg: LGFFConfig, split: str, batch_size: int, num_workers: int) -> DataLoader:
-    dataset = SingleObjectDataset(cfg, split=split)
+    dataset = SingleObjectDatasetSeg(cfg, split=split)
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -204,7 +204,7 @@ def main() -> None:
     model.eval()
 
     # Evaluator (your updated one: ADD+ADD-S + PnP + ICP + CSV)
-    evaluator = EvaluatorSC(
+    evaluator = EvaluatorSCSeg(
         model=model, test_loader=test_loader, cfg=cfg, geometry=geometry, save_dir=work_dir
     )
     metrics = evaluator.run()
