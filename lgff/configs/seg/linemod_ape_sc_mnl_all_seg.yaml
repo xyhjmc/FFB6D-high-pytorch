@@ -130,8 +130,8 @@ model_variant: sc_seg
 loss_variant: seg
 
 # ===== pose fusion (use point-valid mask) =====
-pose_fusion_use_valid_mask: false         # eval 不依赖 seg valid mask
-pose_fusion_valid_mask_source: labels     # 保留占位
+pose_fusion_use_valid_mask: true          # eval 使用 seg valid mask
+pose_fusion_valid_mask_source: seg
 pose_fusion_conf_floor: 1.0e-4
 
 # ===== seg head =====
