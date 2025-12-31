@@ -44,8 +44,8 @@ try:
 except ImportError:
     from lgff.utils.geometry import GeometryToolkit
 
-from lgff.datasets.single_loader import SingleObjectDataset
-from lgff.engines.trainer_sc import TrainerSC
+from lgff.datasets.single_loader_seg import SingleObjectDataset as SingleObjectDatasetSeg
+from lgff.engines.trainer_sc_seg import TrainerSC as TrainerSCSeg
 
 
 def parse_args() -> argparse.Namespace:
@@ -136,7 +136,7 @@ def _is_seg_enabled(cfg: LGFFConfig) -> bool:
     return bool(getattr(cfg, "use_seg_head", False)) or str(getattr(cfg, "model_variant", "sc")).endswith("seg")
 
 
-def _check_seg_requirements(cfg: LGFFConfig, train_ds: SingleObjectDataset, logger: logging.Logger) -> None:
+def _check_seg_requirements(cfg: LGFFConfig, train_ds: SingleObjectDatasetSeg, logger: logging.Logger) -> None:
     """
     If seg is enabled, verify dataset returns seg GT keys.
     This does not modify dataset; it just warns early.
@@ -217,9 +217,9 @@ def main() -> None:
 
     # 7) datasets & loaders
     logger.info("Initializing Datasets...")
-    train_ds = SingleObjectDataset(cfg, split="train")
+    train_ds = SingleObjectDatasetSeg(cfg, split="train")
     val_split_name = getattr(cfg, "val_split", "test")
-    val_ds = SingleObjectDataset(cfg, split=val_split_name)
+    val_ds = SingleObjectDatasetSeg(cfg, split=val_split_name)
 
     logger.info(f"  - Train Set : {len(train_ds)} samples")
     logger.info(f"  - Val Set   : {len(val_ds)} samples (split='{val_split_name}')")
@@ -270,7 +270,7 @@ def main() -> None:
 
     # 9) trainer
     logger.info("Initializing Trainer...")
-    trainer = TrainerSC(
+    trainer = TrainerSCSeg(
         model=model,
         loss_fn=loss_fn,
         train_loader=train_loader,

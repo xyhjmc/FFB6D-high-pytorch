@@ -19,8 +19,8 @@ from torch.amp import autocast, GradScaler
 from tqdm.auto import tqdm
 
 from lgff.utils.config import LGFFConfig
-from lgff.models.lgff_sc import LGFF_SC
-from lgff.losses.lgff_loss import LGFFLoss
+from lgff.models.lgff_sc_seg import LGFF_SC_SEG
+from lgff.losses.lgff_loss_seg import LGFFLoss_SEG
 from lgff.utils.geometry import GeometryToolkit
 from lgff.utils.pose_metrics import (
     fuse_pose_from_outputs,
@@ -50,8 +50,8 @@ class AverageMeter:
 class TrainerSC:
     def __init__(
         self,
-        model: LGFF_SC,
-        loss_fn: LGFFLoss,
+        model: LGFF_SC_SEG,
+        loss_fn: LGFFLoss_SEG,
         train_loader: DataLoader,
         val_loader: Optional[DataLoader],
         cfg: LGFFConfig,

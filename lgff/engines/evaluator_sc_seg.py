@@ -32,7 +32,7 @@ from tqdm import tqdm
 
 from lgff.utils.config import LGFFConfig
 from lgff.utils.geometry import GeometryToolkit
-from lgff.models.lgff_sc import LGFF_SC
+from lgff.models.lgff_sc_seg import LGFF_SC_SEG
 from lgff.utils.pose_metrics import (
     fuse_pose_from_outputs,
     compute_batch_pose_metrics,
@@ -59,7 +59,7 @@ def _safe_mean(x: np.ndarray) -> float:
 class EvaluatorSC:
     def __init__(
         self,
-        model: LGFF_SC,
+        model: LGFF_SC_SEG,
         test_loader: DataLoader,
         cfg: LGFFConfig,
         geometry: GeometryToolkit,
