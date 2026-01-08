@@ -26,6 +26,19 @@ except Exception as ex:
     print(ex)
 
 
+_BOP_CACHE = {}
+
+
+def _build_bop_utils(cfg_path=None):
+    cache_key = cfg_path or "__default__"
+    if cache_key in _BOP_CACHE:
+        return _BOP_CACHE[cache_key]
+    config_bop = Config(ds_name="bop", cfg_path=cfg_path)
+    bs_utils_bop = Basic_Utils(config_bop)
+    _BOP_CACHE[cache_key] = (config_bop, bs_utils_bop)
+    return config_bop, bs_utils_bop
+
+
 def best_fit_transform(A, B):
     '''
     Calculates the least-squares best-fit transform that maps corresponding points A to B in m spatial dimensions
@@ -323,6 +336,125 @@ def eval_one_frame_pose_lm(
 # ###############################End LineMOD Evaluation###############################
 
 
+# ###############################BOP Evaluation###############################
+def cal_frame_poses_bop(
+    pcld, mask, ctr_of, pred_kp_of, use_ctr, n_cls, use_ctr_clus_flter,
+    obj_id, cfg_path=None
+):
+    config_bop, bs_utils_bop = _build_bop_utils(cfg_path=cfg_path)
+    n_kps, n_pts, _ = pred_kp_of.size()
+    pred_ctr = pcld - ctr_of[0]
+    pred_kp = pcld.view(1, n_pts, 3).repeat(n_kps, 1, 1) - pred_kp_of
+
+    radius = 0.04
+    if use_ctr:
+        cls_kps = torch.zeros(n_cls, n_kps + 1, 3).cuda()
+    else:
+        cls_kps = torch.zeros(n_cls, n_kps, 3).cuda()
+
+    pred_cls_ids = np.unique(mask[mask > 0].contiguous().cpu().numpy())
+    if use_ctr_clus_flter:
+        ctrs = []
+        for cls_id in pred_cls_ids:
+            cls_msk = (mask == cls_id)
+            ms = MeanShiftTorch(bandwidth=radius)
+            ctr, ctr_labels = ms.fit(pred_ctr[cls_msk, :])
+            ctrs.append(ctr.detach().contiguous().cpu().numpy())
+        try:
+            ctrs = torch.from_numpy(np.array(ctrs).astype(np.float32)).cuda()
+            n_ctrs, _ = ctrs.size()
+            pred_ctr_rp = pred_ctr.view(n_pts, 1, 3).repeat(1, n_ctrs, 1)
+            ctrs_rp = ctrs.view(1, n_ctrs, 3).repeat(n_pts, 1, 1)
+            ctr_dis = torch.norm((pred_ctr_rp - ctrs_rp), dim=2)
+            min_dis, min_idx = torch.min(ctr_dis, dim=1)
+            msk_closest_ctr = torch.LongTensor(pred_cls_ids).cuda()[min_idx]
+            new_msk = mask.clone()
+            for cls_id in pred_cls_ids:
+                if cls_id == 0:
+                    break
+                min_msk = min_dis < 0.04
+                update_msk = (mask > 0) & (msk_closest_ctr == cls_id) & min_msk
+                new_msk[update_msk] = msk_closest_ctr[update_msk]
+            mask = new_msk
+        except Exception:
+            pass
+
+    pred_pose_lst = []
+    for cls_id in pred_cls_ids:
+        if cls_id == 0:
+            break
+        cls_msk = mask == cls_id
+        if cls_msk.sum() < 1:
+            pred_pose_lst.append(np.identity(4)[:3, :])
+            continue
+
+        cls_voted_kps = pred_kp[:, cls_msk, :]
+        ms = MeanShiftTorch(bandwidth=radius)
+        ctr, ctr_labels = ms.fit(pred_ctr[cls_msk, :])
+        if ctr_labels.sum() < 1:
+            ctr_labels[0] = 1
+        if use_ctr:
+            cls_kps[cls_id, n_kps, :] = ctr
+
+        if use_ctr_clus_flter:
+            in_pred_kp = cls_voted_kps[:, ctr_labels, :]
+        else:
+            in_pred_kp = cls_voted_kps
+
+        for ikp, kps3d in enumerate(in_pred_kp):
+            cls_kps[cls_id, ikp, :], _ = ms.fit(kps3d)
+
+        mesh_kps = bs_utils_bop.get_kps(obj_id, ds_type="bop")
+        if use_ctr:
+            mesh_ctr = bs_utils_bop.get_ctr(obj_id, ds_type="bop").reshape(1, 3)
+            mesh_kps = np.concatenate((mesh_kps, mesh_ctr), axis=0)
+        pred_RT = best_fit_transform(
+            mesh_kps,
+            cls_kps[cls_id].squeeze().contiguous().cpu().numpy()
+        )
+        pred_pose_lst.append(pred_RT)
+
+    return pred_pose_lst
+
+
+def eval_metric_bop(cls_ids, pred_pose_lst, RTs, mask, label, obj_id, cfg_path=None):
+    config_bop, bs_utils_bop = _build_bop_utils(cfg_path=cfg_path)
+    n_cls = config_bop.n_classes
+    cls_add_dis = [list() for _ in range(n_cls)]
+    cls_adds_dis = [list() for _ in range(n_cls)]
+
+    pred_RT = pred_pose_lst[0]
+    pred_RT = torch.from_numpy(pred_RT.astype(np.float32)).cuda()
+    gt_RT = RTs[0]
+    mesh_pts = bs_utils_bop.get_pointxyz_cuda(obj_id, ds_type="bop").clone()
+    add = bs_utils_bop.cal_add_cuda(pred_RT, gt_RT, mesh_pts)
+    adds = bs_utils_bop.cal_adds_cuda(pred_RT, gt_RT, mesh_pts)
+    cls_add_dis[1].append(add.item())
+    cls_adds_dis[1].append(adds.item())
+    cls_add_dis[0].append(add.item())
+    cls_adds_dis[0].append(adds.item())
+
+    return (cls_add_dis, cls_adds_dis)
+
+
+def eval_one_frame_pose_bop(
+    item
+):
+    pcld, mask, ctr_of, pred_kp_of, RTs, cls_ids, use_ctr, n_cls, \
+        min_cnt, use_ctr_clus_flter, label, epoch, ibs, obj_id, cfg_path = item
+    pred_pose_lst = cal_frame_poses_bop(
+        pcld, mask, ctr_of, pred_kp_of, use_ctr, n_cls, use_ctr_clus_flter,
+        obj_id, cfg_path=cfg_path
+    )
+
+    cls_add_dis, cls_adds_dis = eval_metric_bop(
+        cls_ids, pred_pose_lst, RTs, mask, label, obj_id, cfg_path=cfg_path
+    )
+    return (cls_add_dis, cls_adds_dis)
+
+# ###############################End BOP Evaluation###############################
+
+
 # ###############################Shared Evaluation Entry###############################
 class TorchEval():
 
@@ -335,6 +467,19 @@ class TorchEval():
         self.pred_kp_errs = [list() for i in range(n_cls)]
         self.pred_id2pose_lst = []
         self.sym_cls_ids = []
+        self._bop_config = None
+        self._bop_bs_utils = None
+
+    def _ensure_bop(self, cfg_path=None):
+        if self._bop_config is None:
+            self._bop_config, self._bop_bs_utils = _build_bop_utils(cfg_path=cfg_path)
+            if self.n_cls != self._bop_config.n_classes:
+                self.n_cls = self._bop_config.n_classes
+                self.cls_add_dis = [list() for _ in range(self.n_cls)]
+                self.cls_adds_dis = [list() for _ in range(self.n_cls)]
+                self.cls_add_s_dis = [list() for _ in range(self.n_cls)]
+                self.pred_kp_errs = [list() for _ in range(self.n_cls)]
+        return self._bop_config, self._bop_bs_utils
 
     def cal_auc(self):
         add_auc_lst = []
@@ -446,12 +591,37 @@ class TorchEval():
         )
         pkl.dump(sv_info, open(sv_pth, 'wb'))
 
+    def cal_bop_add(self, obj_id, cfg_path=None):
+        config_bop, bs_utils_bop = self._ensure_bop(cfg_path=cfg_path)
+        cls_id = 1
+        add_auc = bs_utils_bop.cal_auc(self.cls_add_dis[cls_id])
+        adds_auc = bs_utils_bop.cal_auc(self.cls_adds_dis[cls_id])
+        add_s_auc = bs_utils_bop.cal_auc(self.cls_adds_dis[cls_id])
+        print("bop obj_id: ", obj_id)
+        print("***************add auc:\t", add_auc)
+        print("***************adds auc:\t", adds_auc)
+        print("***************add(-s) auc:\t", add_s_auc)
+        sv_info = dict(
+            add_dis_lst=self.cls_add_dis,
+            adds_dis_lst=self.cls_adds_dis,
+            add_auc_lst=[add_auc],
+            adds_auc_lst=[adds_auc],
+            add_s_auc_lst=[add_s_auc],
+        )
+        sv_pth = os.path.join(
+            config_bop.log_eval_dir,
+            'pvn3d_eval_bop_{}_{}_{}.pkl'.format(adds_auc, add_auc, add_s_auc)
+        )
+        pkl.dump(sv_info, open(sv_pth, 'wb'))
+
     def eval_pose_parallel(
         self, pclds, rgbs, masks, pred_ctr_ofs, gt_ctr_ofs, labels, cnt,
         cls_ids, RTs, pred_kp_ofs, gt_kps, gt_ctrs, min_cnt=20, merge_clus=False,
         use_ctr_clus_flter=True, use_ctr=True, obj_id=0, kp_type='farthest',
-        ds='ycb'
+        ds='ycb', cfg_path=None
     ):
+        if ds == "bop":
+            self._ensure_bop(cfg_path=cfg_path)
         bs, n_kps, n_pts, c = pred_kp_ofs.size()
         masks = masks.long()
         cls_ids = cls_ids.long()
@@ -469,6 +639,12 @@ class TorchEval():
                 cls_ids, use_ctr_lst, n_cls_lst, min_cnt_lst, use_ctr_clus_flter_lst,
                 labels, epoch_lst, bs_lst, gt_kps, gt_ctrs, kp_type
             )
+        elif ds == "bop":
+            data_gen = zip(
+                pclds, masks, pred_ctr_ofs, pred_kp_ofs, RTs,
+                cls_ids, use_ctr_lst, n_cls_lst, min_cnt_lst, use_ctr_clus_flter_lst,
+                labels, epoch_lst, bs_lst, obj_id_lst, [cfg_path for _ in range(bs)]
+            )
         else:
             data_gen = zip(
                 pclds, masks, pred_ctr_ofs, pred_kp_ofs, RTs,
@@ -480,6 +656,8 @@ class TorchEval():
         ) as executor:
             if ds == "ycb":
                 eval_func = eval_one_frame_pose
+            elif ds == "bop":
+                eval_func = eval_one_frame_pose_bop
             else:
                 eval_func = eval_one_frame_pose_lm
             for res in executor.map(eval_func, data_gen):

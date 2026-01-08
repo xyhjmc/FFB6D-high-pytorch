@@ -186,6 +186,7 @@ class Config:
         bop_use_mask_visib: true
         bop_kps_npy: /abs/path/or/relpath/kps.npy
         bop_ctr_npy: /abs/path/or/relpath/ctr.npy
+        bop_models_dir: /abs/path/or/relpath/models
         """
 
         # FFB6D 单类场景：仍然保持 n_objects=2（foreground + background）
@@ -218,6 +219,10 @@ class Config:
         # keypoints (npy) - provide either absolute or relative
         self.bop_kps_npy = _abs_or_join(self.user_cfg.get("bop_kps_npy", ""))
         self.bop_ctr_npy = _abs_or_join(self.user_cfg.get("bop_ctr_npy", ""))
+
+        # models directory (for ADD/ADDS evaluation)
+        bop_models_dir = self.user_cfg.get("bop_models_dir", os.path.join(self.bop_root, "models"))
+        self.bop_models_dir = _abs_or_join(bop_models_dir)
 
         # Optional: symmetry ids, if you need ADD-S etc.
         self.bop_sym_obj_ids = list(self.user_cfg.get("bop_sym_obj_ids", []))

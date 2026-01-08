@@ -1,0 +1,35 @@
+# MinePose (BOP-format) example config for FFB6D
+# Use absolute paths if possible to avoid path ambiguity.
+
+# Dataset root: should contain split folders like train/test or your custom subsets.
+bop_root: /abs/path/to/minepose_bop
+
+# Split lists (one item per line): either "scene_id/im_id" or "subset/scene_id/im_id".
+bop_train_list: /abs/path/to/minepose_bop/splits/train.txt
+bop_test_list: /abs/path/to/minepose_bop/splits/test.txt
+
+# Target object id in BOP annotations (scene_gt.json). Single-object training uses this id.
+bop_obj_id: 1
+
+# Use mask_visib (true) or mask (false).
+bop_use_mask_visib: true
+
+# Object-frame keypoints / center (npy, meters). If stored in mm, loader auto-scales by /1000.
+bop_kps_npy: /abs/path/to/minepose_bop/keypoints/obj_000001_kps.npy
+bop_ctr_npy: /abs/path/to/minepose_bop/keypoints/obj_000001_ctr.npy
+
+# Mesh models directory for ADD/ADD-S evaluation.
+# Should contain obj_000001.ply (and other objects if needed).
+bop_models_dir: /abs/path/to/minepose_bop/models
+
+# Training defaults (optional overrides)
+n_total_epoch: 25
+mini_batch_size: 2
+val_mini_batch_size: 2
+test_mini_batch_size: 1
+n_sample_points: 12800
+n_keypoints: 8
+n_min_points: 400
+
+# Optional: cache/preprocess paths
+bop_cache_dir: /abs/path/to/minepose_bop/cache

@@ -250,6 +250,8 @@ def model_fn_decorator(criterion, criterion_of, test=False, use_autocast=False):
             # [CHANGED] avoid calling linemod-only summary on bop
             if args.ds == 'linemod':
                 teval.cal_lm_add(config.cls_id)
+            elif args.ds == 'bop':
+                teval.cal_bop_add(_eval_obj_id, cfg_path=args.cfg)
             return None
 
         if is_eval:
@@ -317,7 +319,7 @@ def model_fn_decorator(criterion, criterion_of, test=False, use_autocast=False):
                         cu_dt['ctr_targ_ofst'], labels, epoch, cu_dt['cls_ids'],
                         cu_dt['RTs'], end_points['pred_kp_ofs'],
                         cu_dt['kp_3ds'], cu_dt['ctr_3ds'],
-                        ds=_eval_ds, obj_id=_eval_obj_id,
+                        ds=_eval_ds, obj_id=_eval_obj_id, cfg_path=args.cfg,
                         min_cnt=1, use_ctr_clus_flter=True, use_ctr=True,
                     )
                 else:
@@ -328,7 +330,7 @@ def model_fn_decorator(criterion, criterion_of, test=False, use_autocast=False):
                         cu_dt['ctr_targ_ofst'], labels, epoch, cu_dt['cls_ids'],
                         cu_dt['RTs'], gt_kp_ofs,
                         cu_dt['kp_3ds'], cu_dt['ctr_3ds'],
-                        ds=_eval_ds, obj_id=_eval_obj_id,
+                        ds=_eval_ds, obj_id=_eval_obj_id, cfg_path=args.cfg,
                         min_cnt=1, use_ctr_clus_flter=True, use_ctr=True
                     )
 
