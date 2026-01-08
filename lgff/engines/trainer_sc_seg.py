@@ -113,25 +113,114 @@ class TrainerSCSeg(TrainerSC):
     # -------------------------------------------------------------------------
     # Seg Metrics Helper
     # -------------------------------------------------------------------------
-    def _compute_seg_metrics(self, pred_seg: torch.Tensor, gt_mask: torch.Tensor) -> Dict[str, float]:
-        """Compute IoU and Accuracy for binary segmentation."""
-        if pred_seg.shape[1] == 1:
-            pred_mask = (torch.sigmoid(pred_seg) > 0.5).float()
+    def _seg_binary_metrics_from_logits(
+        self,
+        pred_logits: torch.Tensor,
+        gt_mask: torch.Tensor,
+        valid_mask_2d: Optional[torch.Tensor] = None,
+        thr: float = 0.5,
+    ) -> Dict[str, torch.Tensor]:
+        if pred_logits.shape[1] == 1:
+            prob = torch.sigmoid(pred_logits)[:, 0]  # [B,H,W]
         else:
-            pred_mask = torch.argmax(pred_seg, dim=1, keepdim=True).float()
+            prob = torch.softmax(pred_logits, dim=1)[:, 1]  # [B,H,W]
 
-        gt_mask = gt_mask.float()
+        pred = (prob > float(thr)).to(dtype=torch.bool)  # [B,H,W]
 
-        intersection = (pred_mask * gt_mask).sum()
-        union = pred_mask.sum() + gt_mask.sum() - intersection
+        gt = gt_mask
+        if gt.dim() == 4:
+            gt = gt[:, 0]
+        gt = (gt > 0.5).to(dtype=torch.bool)  # [B,H,W]
 
-        iou = (intersection + 1e-6) / (union + 1e-6)
+        if valid_mask_2d is not None:
+            vm = valid_mask_2d
+            if vm.dim() == 4:
+                vm = vm[:, 0]
+            vm = (vm > 0.5)
+        else:
+            vm = None
 
-        correct = (pred_mask == gt_mask).sum()
-        total = gt_mask.numel()
-        acc = correct.float() / total
+        def _safe_div(num: torch.Tensor, den: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+            return num / den.clamp_min(eps)
 
-        return {"seg_iou": iou.item(), "seg_acc": acc.item()}
+        def compute_on(mask_eval: Optional[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            if mask_eval is None:
+                pe = pred
+                ge = gt
+            else:
+                pe = pred & mask_eval
+                ge = gt & mask_eval
+
+            tp = (pe & ge).flatten(1).sum(dim=1).float()
+            fp = (pe & (~ge)).flatten(1).sum(dim=1).float()
+            fn = ((~pe) & ge).flatten(1).sum(dim=1).float()
+
+            iou = _safe_div(tp, tp + fp + fn)
+            dice = _safe_div(2 * tp, 2 * tp + fp + fn)
+            prec = _safe_div(tp, tp + fp)
+            rec = _safe_div(tp, tp + fn)
+            return iou, dice, prec, rec
+
+        iou_full, dice_full, prec_full, rec_full = compute_on(None)
+        iou_valid, dice_valid, prec_valid, rec_valid = compute_on(vm)
+
+        return {
+            "seg_iou_full": iou_full,
+            "seg_dice_full": dice_full,
+            "seg_prec_full": prec_full,
+            "seg_rec_full": rec_full,
+            "seg_iou_valid": iou_valid,
+            "seg_dice_valid": dice_valid,
+            "seg_prec_valid": prec_valid,
+            "seg_rec_valid": rec_valid,
+        }
+
+    def _compute_valid_mask_from_seg(
+        self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        pred_logits = outputs.get("pred_mask_logits", None)
+        if not isinstance(pred_logits, torch.Tensor):
+            return None
+        choose = batch.get("choose", None)
+        if not isinstance(choose, torch.Tensor):
+            return None
+
+        if pred_logits.shape[1] == 1:
+            probs = torch.sigmoid(pred_logits)  # [B,1,H,W]
+        else:
+            probs = torch.softmax(pred_logits, dim=1)[:, 1:2]  # [B,1,H,W]
+
+        B, _, H, W = probs.shape
+        HW = H * W
+        if int(choose.max().item()) >= HW:
+            return None
+
+        probs_flat = probs.view(B, -1)
+        point_probs = torch.gather(probs_flat, 1, choose)
+        thr = float(getattr(self.cfg, "seg_point_thresh", 0.5))
+        return point_probs > thr
+
+    def _resolve_pose_valid_mask(
+        self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        if not bool(getattr(self.cfg, "pose_fusion_use_valid_mask", False)):
+            return None
+        mask_src = str(getattr(self.cfg, "pose_fusion_valid_mask_source", "")).lower().strip()
+        if mask_src == "seg":
+            vm = outputs.get("pred_valid_mask_bool", None)
+            if isinstance(vm, torch.Tensor):
+                if vm.dim() == 3 and vm.shape[-1] == 1:
+                    return vm.squeeze(-1).bool()
+                return vm.bool()
+            return self._compute_valid_mask_from_seg(outputs, batch)
+        if mask_src == "labels":
+            lbl = batch.get("labels", None)
+            if isinstance(lbl, torch.Tensor):
+                valid_mask = lbl > 0
+                if valid_mask.dim() == 1:
+                    valid_mask = valid_mask.unsqueeze(0).expand(outputs["pred_quat"].shape[0], -1)
+                return valid_mask
+        return None
 
     # -------------------------------------------------------------------------
     # Validation Loop (With Detailed Losses)
@@ -145,8 +234,14 @@ class TrainerSCSeg(TrainerSC):
         pose_meter: Dict[str, list[float]] = {}
 
         seg_meters = {
-            "seg_iou": AverageMeter(),
-            "seg_acc": AverageMeter()
+            "seg_iou_full": AverageMeter(),
+            "seg_dice_full": AverageMeter(),
+            "seg_prec_full": AverageMeter(),
+            "seg_rec_full": AverageMeter(),
+            "seg_iou_valid": AverageMeter(),
+            "seg_dice_valid": AverageMeter(),
+            "seg_prec_valid": AverageMeter(),
+            "seg_rec_valid": AverageMeter(),
         }
 
         with torch.no_grad():
@@ -174,14 +269,18 @@ class TrainerSCSeg(TrainerSC):
 
                 # 3. Update Seg Metrics
                 if "mask" in batch and "pred_mask_logits" in outputs and outputs["pred_mask_logits"] is not None:
-                    seg_res = self._compute_seg_metrics(outputs["pred_mask_logits"], batch["mask"])
+                    valid_2d = batch.get("mask_valid", None)
+                    seg_res = self._seg_binary_metrics_from_logits(
+                        outputs["pred_mask_logits"], batch["mask"], valid_mask_2d=valid_2d, thr=0.5
+                    )
                     for k, v in seg_res.items():
-                        seg_meters[k].update(v, bs)
+                        if k in seg_meters:
+                            seg_meters[k].update(v.mean().item(), bs)
 
                 # 4. Pose Metrics
+                valid_mask = self._resolve_pose_valid_mask(outputs, batch)
                 pred_rt = fuse_pose_from_outputs(
-                    outputs, self.geometry, self.cfg, stage="eval",
-                    valid_mask=batch.get("labels", None)
+                    outputs, self.geometry, self.cfg, stage="eval", valid_mask=valid_mask
                 )
 
                 if self.obj_diameter is None and batch["model_points"].size(1) > 1:
@@ -223,17 +322,17 @@ class TrainerSCSeg(TrainerSC):
                         postfix[k] = f"{meters[k].avg:.4f}"
 
                 # 3. Seg IoU
-                if seg_meters["seg_iou"].count > 0:
-                    postfix["mIoU"] = f"{seg_meters['seg_iou'].avg:.2%}"
+                if seg_meters["seg_iou_full"].count > 0:
+                    postfix["mIoU"] = f"{seg_meters['seg_iou_full'].avg:.2%}"
 
                 pbar.set_postfix(postfix)
 
         # Summarize
         avg_metrics = {k: m.avg for k, m in meters.items()} if meters else {}
 
-        if seg_meters["seg_iou"].count > 0:
-            avg_metrics["val_seg_iou"] = seg_meters["seg_iou"].avg
-            avg_metrics["val_seg_acc"] = seg_meters["seg_acc"].avg
+        if seg_meters["seg_iou_full"].count > 0:
+            for k, meter in seg_meters.items():
+                avg_metrics[f"val_{k}"] = meter.avg
 
         obj_diam = float(self.obj_diameter) if self.obj_diameter else 0.0
         pose_summary = summarize_pose_metrics(pose_meter, obj_diam, self.cmd_acc_threshold_m)
@@ -253,7 +352,7 @@ class TrainerSCSeg(TrainerSC):
 
         val_loss = val_metrics.get("loss_total", float("nan"))
         val_seg = val_metrics.get("loss_seg", float("nan"))  # [NEW] Log val seg loss
-        val_iou = val_metrics.get("val_seg_iou", float("nan"))
+        val_iou = val_metrics.get("val_seg_iou_full", float("nan"))
 
         add_s_5mm = val_metrics.get("acc_adds<5mm", float("nan"))
 

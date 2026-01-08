@@ -453,9 +453,13 @@ def main():
                 out = model(batch)
 
                 # --- Seg Mask Logic ---
-                probs = torch.sigmoid(out["pred_mask_logits"]).view(1, -1)
-                point_probs = torch.gather(probs, 1, batch["choose"])
-                valid_mask = (point_probs > 0.5).float().unsqueeze(-1)
+                pred_mask_logits = out.get("pred_mask_logits", None)
+                if isinstance(pred_mask_logits, torch.Tensor):
+                    probs = torch.sigmoid(pred_mask_logits).view(1, -1)
+                    point_probs = torch.gather(probs, 1, batch["choose"])
+                    valid_mask = (point_probs > 0.5).float().unsqueeze(-1)
+                else:
+                    valid_mask = torch.ones_like(batch["choose"], dtype=torch.float32).unsqueeze(-1)
 
                 # --- Prepare PnP Inputs ---
                 pred_conf = out.get("pred_conf", valid_mask)

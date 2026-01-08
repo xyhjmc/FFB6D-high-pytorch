@@ -298,6 +298,10 @@ def main():
     ckpt_path = resolve_checkpoint_path(args.checkpoint)
     ckpt = torch.load(ckpt_path, map_location="cpu")
     cfg = merge_cfg_from_checkpoint(cfg_cli, ckpt.get("config"))
+    cfg.use_seg_head = True
+    cfg.return_mask = True
+    if bool(getattr(cfg, "seg_ignore_invalid", True)):
+        cfg.return_valid_mask = True
 
     # FORCE CORRECT SETTINGS
     cfg.eval_use_pnp = not args.no_pnp
