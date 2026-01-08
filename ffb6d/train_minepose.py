@@ -1,0 +1,739 @@
+from __future__ import (
+    division,
+    absolute_import,
+    with_statement,
+    print_function,
+    unicode_literals,
+)
+
+import os
+import sys
+import time
+import tqdm
+import shutil
+import argparse
+import resource
+import numpy as np
+import cv2
+import pickle as pkl
+from collections import namedtuple
+from cv2 import imshow, waitKey
+
+import torch
+import torch.optim as optim
+import torch.optim.lr_scheduler as lr_sched
+import torch.nn as nn
+import torch.multiprocessing as mp
+from torch import amp
+from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import CyclicLR
+import torch.backends.cudnn as cudnn
+from tensorboardX import SummaryWriter
+
+parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, parent_dir)
+
+from common import Config, ConfigRandLA
+import models.pytorch_utils as pt_utils
+from models.ffb6d import FFB6D
+from models.loss import OFLoss, FocalLoss
+from common.ffb6d_utils.pvn3d_eval_utils_kpls import TorchEval
+from common.ffb6d_utils.basic_utils import Basic_Utils
+from common.ffb6d_utils.model_complexity import ModelComplexityLogger
+
+
+parser = argparse.ArgumentParser(description="Arg parser")
+parser.add_argument(
+    "-weight_decay", type=float, default=0,
+    help="L2 regularization coeff [default: 0.0]",
+)
+parser.add_argument(
+    "-lr", type=float, default=1e-2,
+    help="Initial learning rate [default: 1e-2]"
+)
+parser.add_argument(
+    "-lr_decay", type=float, default=0.5,
+    help="Learning rate decay gamma [default: 0.5]",
+)
+parser.add_argument(
+    "-decay_step", type=float, default=2e5,
+    help="Learning rate decay step [default: 2e5]",
+)
+parser.add_argument(
+    "-bn_momentum", type=float, default=0.9,
+    help="Initial batch norm momentum [default: 0.9]",
+)
+parser.add_argument(
+    "-bn_decay", type=float, default=0.5,
+    help="Batch norm momentum decay gamma [default: 0.5]",
+)
+parser.add_argument(
+    "-checkpoint", type=str, default=None,
+    help="Checkpoint to start from"
+)
+
+# [FIX] remove duplicated --epochs definitions; keep a single one
+parser.add_argument(
+    "--epochs", type=int, default=25,
+    help="Number of epochs to train for (override config.n_total_epoch)."
+)
+
+parser.add_argument(
+    "-eval_net", action='store_true', help="whether is to eval net."
+)
+parser.add_argument(
+    '--cls', type=str, default="ape",
+    help="Target object (for linemod: ape, benchvise, cam, ...). For bop: any name for logging."
+)
+
+# [NEW] dataset switch + optional yaml
+parser.add_argument(
+    '--ds', type=str, default='linemod', choices=['linemod', 'bop', 'ycb'],
+    help="Dataset name."
+)
+parser.add_argument(
+    '--cfg', type=str, default=None,
+    help="Optional dataset yaml config path (used for ds=bop)."
+)
+
+parser.add_argument(
+    '--test_occ', action="store_true", help="To eval occlusion linemod or not."
+)
+parser.add_argument("-test", action="store_true")
+parser.add_argument("-test_pose", action="store_true")
+parser.add_argument("-test_gt", action="store_true")
+parser.add_argument("-cal_metrics", action="store_true")
+parser.add_argument("-view_dpt", action="store_true")
+parser.add_argument('-debug', action='store_true')
+
+# Torch distributed passes --local-rank; keep backward-compatible --local_rank.
+parser.add_argument('--local_rank', '--local-rank', dest='local_rank', type=int, default=0)
+parser.add_argument('--gpu_id', type=list, default=[0, 1, 2, 3, 4, 5, 6, 7])
+parser.add_argument('-n', '--nodes', default=1, type=int, metavar='N')
+parser.add_argument('-g', '--gpus', default=1, type=int, help='number of gpus per node')
+parser.add_argument('-nr', '--nr', default=0, type=int, help='ranking within the nodes')
+parser.add_argument('--gpu', type=str, default="0")
+parser.add_argument('--deterministic', action='store_true')
+parser.add_argument('--keep_batchnorm_fp32', default=True)
+parser.add_argument('--opt_level', default="O0", type=str,
+                    help='opt level for mixed precision (use "O0" to disable).')
+args = parser.parse_args()
+
+os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+
+# [CHANGED] Config now follows args.ds, and allows cfg_path for BOP
+config = Config(ds_name=args.ds, cls_type=args.cls, cfg_path=args.cfg)
+# [CHANGED] allow CLI override epochs
+if args.epochs is not None:
+    config.n_total_epoch = int(args.epochs)
+
+bs_utils = Basic_Utils(config)
+writer = SummaryWriter(log_dir=config.log_traininfo_dir)
+
+rlimit = resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE, (30000, rlimit[1]))
+
+color_lst = [(0, 0, 0)]
+for i in range(config.n_objects):
+    col_mul = (255 * 255 * 255) // (i + 1)
+    color = (col_mul // (255 * 255), (col_mul // 255) % 255, col_mul % 255)
+    color_lst.append(color)
+
+lr_clip = 1e-5
+bnm_clip = 1e-2
+
+
+def worker_init_fn(worker_id):
+    np.random.seed(np.random.get_state()[1][0] + worker_id)
+
+
+def get_lr(optimizer):
+    for param_group in optimizer.param_groups:
+        return param_group['lr']
+
+
+def checkpoint_state(model=None, optimizer=None, scaler=None, best_prec=None, epoch=None, it=None):
+    optim_state = optimizer.state_dict() if optimizer is not None else None
+    scaler_state = scaler.state_dict() if scaler is not None else None
+    if model is not None:
+        if isinstance(model, torch.nn.DataParallel) or isinstance(model, torch.nn.parallel.DistributedDataParallel):
+            model_state = model.module.state_dict()
+        else:
+            model_state = model.state_dict()
+    else:
+        model_state = None
+
+    return {
+        "epoch": epoch,
+        "it": it,
+        "best_prec": best_prec,
+        "model_state": model_state,
+        "optimizer_state": optim_state,
+        "scaler": scaler_state,
+    }
+
+
+def save_checkpoint(state, is_best, filename="checkpoint", bestname="model_best", bestname_pure='ffb6d_best'):
+    filename = "{}.pth.tar".format(filename)
+    torch.save(state, filename)
+    if is_best:
+        shutil.copyfile(filename, "{}.pth.tar".format(bestname))
+        shutil.copyfile(filename, "{}.pth.tar".format(bestname_pure))
+
+
+def load_checkpoint(model=None, optimizer=None, scaler=None, filename="checkpoint"):
+    filename = "{}.pth.tar".format(filename)
+    if os.path.isfile(filename):
+        print("==> Loading from checkpoint '{}'".format(filename))
+        ck = torch.load(filename, map_location="cpu")
+        epoch = ck.get("epoch", 0)
+        it = ck.get("it", 0.0)
+        best_prec = ck.get("best_prec", None)
+        if model is not None and ck["model_state"] is not None:
+            ck_st = ck['model_state']
+            if len(ck_st) > 0 and 'module' in list(ck_st.keys())[0]:
+                tmp_ck_st = {}
+                for k, v in ck_st.items():
+                    tmp_ck_st[k.replace("module.", "")] = v
+                ck_st = tmp_ck_st
+            model.load_state_dict(ck_st, strict=True)
+        if optimizer is not None and ck["optimizer_state"] is not None:
+            optimizer.load_state_dict(ck["optimizer_state"])
+        if scaler is not None and ck.get("scaler", None) is not None:
+            scaler.load_state_dict(ck["scaler"])
+        print("==> Done")
+        return it, epoch, best_prec
+    else:
+        print("==> ck '{}' not found".format(filename))
+        return None
+
+
+def view_labels(rgb_chw, cld_cn, labels, K=None):
+    # K: [3,3] float32, if None fallback to linemod preset (debug only)
+    if K is None:
+        K = config.intrinsic_matrix.get('linemod', np.eye(3, dtype=np.float32))
+
+    rgb_hwc = np.transpose(rgb_chw[0].numpy(), (1, 2, 0)).astype("uint8").copy()
+    cld_nc = np.transpose(cld_cn.numpy(), (1, 0)).copy()
+    p2ds = bs_utils.project_p3d(cld_nc, 1.0, K).astype(np.int32)
+
+    labels = labels.squeeze().contiguous().cpu().numpy()
+    colors = []
+    h, w = rgb_hwc.shape[0], rgb_hwc.shape[1]
+    rgb_hwc = np.zeros((h, w, 3), "uint8")
+    for lb in labels:
+        if int(lb) == 0:
+            c = (0, 0, 0)
+        else:
+            c = color_lst[int(lb)]
+        colors.append(c)
+    show = bs_utils.draw_p2ds(rgb_hwc, p2ds, 3, colors)
+    return show
+
+
+def model_fn_decorator(criterion, criterion_of, test=False, use_autocast=False):
+    teval = TorchEval()
+
+    # [CHANGED] eval dataset tag and obj_id
+    _eval_ds = 'linemod' if args.ds == 'linemod' else ('ycb' if args.ds == 'ycb' else 'bop')
+    _eval_obj_id = None
+    if args.ds == 'linemod':
+        _eval_obj_id = getattr(config, "cls_id", None)
+    elif args.ds == 'bop':
+        _eval_obj_id = int(getattr(config, "bop_obj_id", 1))
+    elif args.ds == 'ycb':
+        # ycb may be multi-class; keep cls_id if you set it, otherwise None
+        _eval_obj_id = getattr(config, "cls_id", None)
+
+    def model_fn(model, data, it=0, epoch=0, is_eval=False, is_test=False, finish_test=False, test_pose=False):
+        if finish_test:
+            # [CHANGED] avoid calling linemod-only summary on bop
+            if args.ds == 'linemod':
+                teval.cal_lm_add(config.cls_id)
+            return None
+
+        if is_eval:
+            model.eval()
+
+        with torch.set_grad_enabled(not is_eval):
+            cu_dt = {}
+            for key in data.keys():
+                # numpy -> cuda tensor
+                if hasattr(data[key], "dtype") and data[key].dtype in [np.float32, np.uint8]:
+                    cu_dt[key] = torch.from_numpy(data[key].astype(np.float32)).cuda()
+                elif hasattr(data[key], "dtype") and data[key].dtype in [np.int32, np.uint32]:
+                    cu_dt[key] = torch.LongTensor(data[key].astype(np.int32)).cuda()
+                elif torch.is_tensor(data[key]) and data[key].dtype in [torch.uint8, torch.float32]:
+                    cu_dt[key] = data[key].float().cuda()
+                elif torch.is_tensor(data[key]) and data[key].dtype in [torch.int32, torch.int16, torch.int64]:
+                    cu_dt[key] = data[key].long().cuda()
+                else:
+                    # ignore non-tensor meta
+                    pass
+
+            with amp.autocast('cuda', enabled=use_autocast):
+                end_points = model(cu_dt)
+
+                labels = cu_dt['labels']
+                loss_rgbd_seg = criterion(end_points['pred_rgbd_segs'], labels.view(-1)).sum()
+                loss_kp_of = criterion_of(end_points['pred_kp_ofs'], cu_dt['kp_targ_ofst'], labels).sum()
+                loss_ctr_of = criterion_of(end_points['pred_ctr_ofs'], cu_dt['ctr_targ_ofst'], labels).sum()
+
+                loss_lst = [(loss_rgbd_seg, 2.0), (loss_kp_of, 1.0), (loss_ctr_of, 1.0)]
+                loss = sum([ls * w for ls, w in loss_lst])
+
+            _, cls_rgbd = torch.max(end_points['pred_rgbd_segs'], 1)
+            acc_rgbd = (cls_rgbd == labels).float().sum() / labels.numel()
+
+            if args.debug:
+                K_dbg = data.get("K", None)  # BOPDataset(DEBUG=True) can provide K
+                show_lb = view_labels(data['rgb'], data['cld_rgb_nrm'][0, :3, :], cls_rgbd, K=K_dbg)
+                show_gt_lb = view_labels(data['rgb'], data['cld_rgb_nrm'][0, :3, :], cu_dt['labels'].squeeze(), K=K_dbg)
+                imshow("pred_lb", show_lb)
+                imshow("gt_lb", show_gt_lb)
+                waitKey(0)
+
+            loss_dict = {
+                'loss_rgbd_seg': loss_rgbd_seg.item(),
+                'loss_kp_of': loss_kp_of.item(),
+                'loss_ctr_of': loss_ctr_of.item(),
+                'loss_all': loss.item(),
+                'loss_target': loss.item()
+            }
+            acc_dict = {'acc_rgbd': acc_rgbd.item()}
+            info_dict = loss_dict.copy()
+            info_dict.update(acc_dict)
+
+            if not is_eval and args.local_rank == 0:
+                writer.add_scalars('loss', loss_dict, it)
+                writer.add_scalars('train_acc', acc_dict, it)
+
+            if is_test and test_pose:
+                cld = cu_dt['cld_rgb_nrm'][:, :3, :].permute(0, 2, 1).contiguous()
+
+                if not args.test_gt:
+                    teval.eval_pose_parallel(
+                        cld, cu_dt['rgb'], cls_rgbd, end_points['pred_ctr_ofs'],
+                        cu_dt['ctr_targ_ofst'], labels, epoch, cu_dt['cls_ids'],
+                        cu_dt['RTs'], end_points['pred_kp_ofs'],
+                        cu_dt['kp_3ds'], cu_dt['ctr_3ds'],
+                        ds=_eval_ds, obj_id=_eval_obj_id,
+                        min_cnt=1, use_ctr_clus_flter=True, use_ctr=True,
+                    )
+                else:
+                    gt_ctr_ofs = cu_dt['ctr_targ_ofst'].unsqueeze(2).permute(0, 2, 1, 3)
+                    gt_kp_ofs = cu_dt['kp_targ_ofst'].permute(0, 2, 1, 3)
+                    teval.eval_pose_parallel(
+                        cld, cu_dt['rgb'], labels, gt_ctr_ofs,
+                        cu_dt['ctr_targ_ofst'], labels, epoch, cu_dt['cls_ids'],
+                        cu_dt['RTs'], gt_kp_ofs,
+                        cu_dt['kp_3ds'], cu_dt['ctr_3ds'],
+                        ds=_eval_ds, obj_id=_eval_obj_id,
+                        min_cnt=1, use_ctr_clus_flter=True, use_ctr=True
+                    )
+
+        return (end_points, loss, info_dict)
+
+    return model_fn
+
+
+class Trainer(object):
+    def __init__(
+        self,
+        model,
+        model_fn,
+        optimizer,
+        scaler=None,
+        checkpoint_name="ckpt",
+        best_name="best",
+        lr_scheduler=None,
+        bnm_scheduler=None,
+        viz=None,
+    ):
+        self.model = model
+        self.model_fn = model_fn
+        self.optimizer = optimizer
+        self.lr_scheduler = lr_scheduler
+        self.bnm_scheduler = bnm_scheduler
+        self.scaler = scaler
+
+        self.checkpoint_name = checkpoint_name
+        self.best_name = best_name
+
+        self.training_best, self.eval_best = {}, {}
+        self.viz = viz
+        self.complexity_logger = ModelComplexityLogger()
+        self._last_train_batch = None
+
+    def eval_epoch(self, d_loader, is_test=False, test_pose=False, it=0):
+        self.model.eval()
+
+        eval_dict = {}
+        total_loss = 0.0
+        count = 1
+        for i, data in tqdm.tqdm(enumerate(d_loader), leave=False, desc="val"):
+            count += 1
+            self.optimizer.zero_grad(set_to_none=True)
+
+            if i == 0:
+                stage = "evaluation" if is_test else "validation"
+                self.complexity_logger.maybe_log(self.model, data, stage=stage)
+
+            _, loss, eval_res = self.model_fn(
+                self.model, data, is_eval=True, is_test=is_test, test_pose=test_pose
+            )
+
+            if 'loss_target' in eval_res.keys():
+                total_loss += eval_res['loss_target']
+            else:
+                total_loss += loss.item()
+
+            for k, v in eval_res.items():
+                if v is not None:
+                    eval_dict[k] = eval_dict.get(k, []) + [v]
+
+        mean_eval_dict = {}
+        acc_dict = {}
+        for k, v in eval_dict.items():
+            per = 100 if 'acc' in k else 1
+            mean_eval_dict[k] = np.array(v).mean() * per
+            if 'acc' in k:
+                acc_dict[k] = v
+
+        for k, v in mean_eval_dict.items():
+            print(k, v)
+
+        if is_test:
+            if test_pose:
+                self.model_fn(
+                    self.model, data, is_eval=True, is_test=is_test,
+                    finish_test=True, test_pose=test_pose
+                )
+            seg_res_fn = 'seg_res'
+            for k, v in acc_dict.items():
+                # v is list
+                seg_res_fn += '_%s%.2f' % (k, float(np.mean(v)))
+            with open(os.path.join(config.log_eval_dir, seg_res_fn), 'w', encoding="utf-8") as of:
+                for k, v in acc_dict.items():
+                    print(k, v, file=of)
+
+        if args.local_rank == 0:
+            mean_acc_dict = {k: float(np.mean(v)) for k, v in acc_dict.items()}
+            writer.add_scalars('val_acc', mean_acc_dict, it)
+
+        return total_loss / count, eval_dict
+
+    def train(
+        self,
+        start_it,
+        start_epoch,
+        n_epochs,
+        train_loader,
+        train_sampler,
+        test_loader=None,
+        best_loss=0.0,
+        log_epoch_f=None,
+        tot_iter=1,
+        clr_div=6,
+    ):
+        print("Totally train %d iters per gpu." % tot_iter)
+        iter_per_epoch = max(tot_iter // n_epochs, 1)
+
+        def is_to_eval(epoch, it):
+            if it == 100:
+                return True, 1
+            wid = max(tot_iter // clr_div, 1)
+            if (it // wid) % 2 == 1:
+                eval_frequency = max(wid // 15, 1)
+            else:
+                eval_frequency = max(wid // 6, 1)
+            to_eval = (it % eval_frequency) == 0
+            return to_eval, eval_frequency
+
+        it = start_it
+        _, eval_frequency = is_to_eval(0, it)
+
+        def create_pbar(cur_it):
+            return tqdm.tqdm(
+                total=eval_frequency,
+                leave=False,
+                desc="train",
+                initial=cur_it % eval_frequency,
+            )
+
+        epoch_pbar = create_pbar(it)
+
+        with tqdm.tqdm(range(start_epoch, config.n_total_epoch + 1), desc="%s_epochs" % args.cls) as tbar:
+            for epoch in tbar:
+                if epoch > config.n_total_epoch:
+                    break
+                if train_sampler is not None:
+                    train_sampler.set_epoch(epoch)
+
+                np.random.seed()
+                if log_epoch_f is not None and args.local_rank == 0:
+                    log_dir = os.path.dirname(log_epoch_f)
+                    if log_dir:
+                        os.makedirs(log_dir, exist_ok=True)
+                    with open(log_epoch_f, "w", encoding="utf-8") as f:
+                        f.write(str(epoch))
+
+                for batch in train_loader:
+                    self.model.train()
+                    self._last_train_batch = batch
+
+                    self.optimizer.zero_grad(set_to_none=True)
+                    _, loss, res = self.model_fn(self.model, batch, it=it)
+
+                    if self.scaler is not None:
+                        self.scaler.scale(loss).backward()
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                    else:
+                        loss.backward()
+                        self.optimizer.step()
+
+                    lr = get_lr(self.optimizer)
+                    if args.local_rank == 0:
+                        writer.add_scalar('lr/lr', lr, it)
+
+                    if self.lr_scheduler is not None:
+                        self.lr_scheduler.step()
+
+                    if self.bnm_scheduler is not None:
+                        self.bnm_scheduler.step(it)
+
+                    it += 1
+
+                    epoch_pbar.update()
+                    epoch_pbar.set_postfix(dict(total_it=it, epoch=epoch))
+                    tbar.refresh()
+
+                    if self.viz is not None:
+                        self.viz.update("train", it, res)
+
+                    eval_flag, eval_frequency = is_to_eval(epoch, it)
+                    if eval_flag:
+                        epoch_pbar.close()
+                        if test_loader is not None:
+                            val_loss, res = self.eval_epoch(test_loader, it=it)
+                            epoch_pbar.write(f"val_loss {val_loss}")
+
+                            is_best = val_loss < best_loss
+                            best_loss = min(best_loss, val_loss)
+                            if args.local_rank == 0:
+                                save_checkpoint(
+                                    checkpoint_state(
+                                        self.model, self.optimizer, self.scaler,
+                                        val_loss, epoch, it
+                                    ),
+                                    is_best,
+                                    filename=self.checkpoint_name,
+                                    bestname=self.best_name + '_%.4f' % val_loss,
+                                    bestname_pure=self.best_name
+                                )
+                                info_p = self.checkpoint_name.replace('.pth.tar', '_epoch.txt')
+                                os.makedirs(os.path.dirname(info_p), exist_ok=True)
+                                with open(info_p, "a", encoding="utf-8") as f:
+                                    f.write(f"{it} {val_loss}\n")
+
+                        epoch_pbar = create_pbar(it)
+                        epoch_pbar.set_postfix(dict(total_it=it, epoch=epoch))
+
+        epoch_pbar.close()
+        if self._last_train_batch is not None:
+            self.complexity_logger.maybe_log(self.model, self._last_train_batch, stage="train_end")
+        if args.local_rank == 0:
+            writer.export_scalars_to_json("./all_scalars.json")
+            writer.close()
+        return best_loss
+
+
+def train():
+    print("local_rank:", args.local_rank)
+    cudnn.benchmark = True
+    if args.deterministic:
+        cudnn.benchmark = False
+        cudnn.deterministic = True
+        torch.manual_seed(args.local_rank)
+        torch.set_printoptions(precision=10)
+
+    torch.cuda.set_device(args.local_rank)
+    torch.distributed.init_process_group(backend='nccl', init_method='env://')
+    torch.manual_seed(0)
+
+    # -------------------- dataset selection --------------------
+    if args.ds == 'bop':
+        # You must have this file in your project:
+        # from datasets.bop.bop_dataset_ffb6d import BOPDataset
+        from ffb6d.datasets.minepose.minepose_dataset import BOPDataset
+        dataset_desc = None
+    else:
+        import datasets.linemod.linemod_dataset as dataset_desc
+        BOPDataset = None
+
+    if not args.eval_net:
+        if args.ds == 'bop':
+            train_ds = BOPDataset('train', cls_type=args.cls, cfg_path=args.cfg, DEBUG=args.debug)
+            val_ds = BOPDataset('test', cls_type=args.cls, cfg_path=args.cfg, DEBUG=args.debug)
+        else:
+            train_ds = dataset_desc.Dataset('train', cls_type=args.cls)
+            val_ds = dataset_desc.Dataset('test', cls_type=args.cls)
+
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_ds)
+        train_loader = torch.utils.data.DataLoader(
+            train_ds,
+            batch_size=config.mini_batch_size,
+            shuffle=False,
+            drop_last=True,
+            num_workers=0,
+            sampler=train_sampler,
+            pin_memory=True
+        )
+
+        val_sampler = torch.utils.data.distributed.DistributedSampler(val_ds)
+        val_loader = torch.utils.data.DataLoader(
+            val_ds,
+            batch_size=config.val_mini_batch_size,
+            shuffle=False,
+            drop_last=False,
+            num_workers=0,
+            sampler=val_sampler
+        )
+    else:
+        if args.ds == 'bop':
+            test_ds = BOPDataset('test', cls_type=args.cls, cfg_path=args.cfg, DEBUG=args.debug)
+        else:
+            test_ds = dataset_desc.Dataset('test', cls_type=args.cls)
+
+        test_loader = torch.utils.data.DataLoader(
+            test_ds, batch_size=config.test_mini_batch_size, shuffle=False, num_workers=0
+        )
+
+    # -------------------- model --------------------
+    rndla_cfg = ConfigRandLA
+    model = FFB6D(
+        n_classes=config.n_objects,
+        n_pts=config.n_sample_points,
+        rndla_cfg=rndla_cfg,
+        n_kps=config.n_keypoints
+    )
+    model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    device = torch.device('cuda:{}'.format(args.local_rank))
+    print('local_rank:', args.local_rank)
+    model.to(device)
+
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    use_autocast = args.opt_level != "O0"
+    scaler = amp.GradScaler('cuda', enabled=use_autocast)
+
+    # default value
+    it = -1
+    best_loss = 1e10
+    start_epoch = 1
+
+    # load status from checkpoint
+    if args.checkpoint is not None:
+        if args.eval_net:
+            checkpoint_status = load_checkpoint(model, None, scaler, filename=args.checkpoint[:-8])
+        else:
+            checkpoint_status = load_checkpoint(model, optimizer, scaler, filename=args.checkpoint[:-8])
+        if checkpoint_status is not None:
+            it, start_epoch, best_loss = checkpoint_status
+        if args.eval_net:
+            assert checkpoint_status is not None, "Failed loading model."
+
+    # -------------------- schedulers --------------------
+    if not args.eval_net:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[args.local_rank],
+            output_device=args.local_rank,
+            find_unused_parameters=False,
+        )
+
+        clr_div = 2
+
+        # [CHANGED] do not rely on train_ds.minibatch_per_epoch (BOPDataset may not have it)
+        minibatch_per_epoch = len(train_loader)
+        step_up = max(1, config.n_total_epoch * minibatch_per_epoch // clr_div // max(args.gpus, 1))
+        step_dn = max(1, config.n_total_epoch * minibatch_per_epoch // clr_div // max(args.gpus, 1))
+
+        lr_scheduler = CyclicLR(
+            optimizer,
+            base_lr=1e-5,
+            max_lr=1e-3,
+            cycle_momentum=False,
+            step_size_up=step_up,
+            step_size_down=step_dn,
+            mode='triangular'
+        )
+    else:
+        lr_scheduler = None
+        clr_div = 2
+
+    bnm_lmbd = lambda it_: max(
+        args.bn_momentum * (args.bn_decay ** int(it_ * config.mini_batch_size / args.decay_step)),
+        bnm_clip,
+    )
+    bnm_scheduler = pt_utils.BNMomentumScheduler(model, bn_lambda=bnm_lmbd, last_epoch=it)
+
+    it = max(it, 0)
+
+    if args.eval_net:
+        model_fn = model_fn_decorator(
+            FocalLoss(gamma=2), OFLoss(),
+            args.test, use_autocast=use_autocast,
+        )
+    else:
+        model_fn = model_fn_decorator(
+            FocalLoss(gamma=2).to(device), OFLoss().to(device),
+            args.test, use_autocast=use_autocast,
+        )
+
+    checkpoint_fd = config.log_model_dir
+
+    trainer = Trainer(
+        model,
+        model_fn,
+        optimizer,
+        scaler,
+        checkpoint_name=os.path.join(checkpoint_fd, "FFB6D_%s" % args.cls),
+        best_name=os.path.join(checkpoint_fd, "FFB6D_%s_best" % args.cls),
+        lr_scheduler=lr_scheduler,
+        bnm_scheduler=bnm_scheduler,
+    )
+
+    if args.eval_net:
+        start = time.time()
+        val_loss, res = trainer.eval_epoch(test_loader, is_test=True, test_pose=args.test_pose)
+        end = time.time()
+        print("\nUse time: ", end - start, 's')
+    else:
+        minibatch_per_epoch = len(train_loader)
+        tot_iter = config.n_total_epoch * minibatch_per_epoch // max(args.gpus, 1)
+
+        trainer.train(
+            it,
+            start_epoch,
+            config.n_total_epoch,
+            train_loader,
+            train_sampler,  # [CHANGED] pass sampler so set_epoch works
+            val_loader,
+            best_loss=best_loss,
+            tot_iter=tot_iter,
+            clr_div=clr_div
+        )
+
+        if start_epoch == config.n_total_epoch:
+            _ = trainer.eval_epoch(val_loader)
+
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
+
+
+if __name__ == "__main__":
+    mp.set_start_method('spawn', force=True)
+    args.world_size = args.gpus * args.nodes
+    train()

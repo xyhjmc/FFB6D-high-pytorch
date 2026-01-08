@@ -8,7 +8,7 @@ dataset_name: "bop-single"
 
 # 指向完整的 BOP 数据集根目录（LINEMOD = lm）。
 # 训练/评估时只会通过 obj_id=1 过滤出 ape 的图像。
-dataset_root: "/home/xyh/PycharmProjects/FFB6D-high-pytorch/lgff/data/linemod_ape_crop128_all"
+dataset_root: "/home/xyh/PycharmProjects/FFB6D-high-pytorch/lgff/data/minepose_helmet_crop128_all"
 
 obj_id: 1
 num_points: 1024
@@ -117,13 +117,9 @@ train_use_best_point: true    # 训练阶段内部融合时：默认使用 best 
 eval_topk: 8                  # 若使用 top-k 融合，可通过 cfg 控制 k 值
 
 
-# CMD & obj 直径（单位 m）
-cmd_threshold_m: 0.02
-obj_diameter_m: 0.1016561314   # eval log 中估计得到的 ape 直径，可写死进配置
-
 
 # ---------- Logging / Output ----------
-log_dir: "/home/xyh/PycharmProjects/FFB6D-high-pytorch/output/linemod_ape_sc_mnl_all_seg"
+log_dir: "/home/xyh/PycharmProjects/FFB6D-high-pytorch/output/minepose_helmet_sc_mnl_all_seg"
 # 不写 work_dir 会默认使用 log_dir
 # [Seg 专用] 强制开启掩码返回
 return_mask: true                # 必须开启，否则 Loss 计算时拿不到 GT
@@ -147,7 +143,7 @@ seg_point_thresh: 0.5            # 推理时：Mask 概率大于多少算前景�
 loss_variant: "seg"
 
 # [Seg 专用] 分割 Loss 权重与类型
-lambda_seg: 0.1                  # Seg Loss 的总权重 (建议 0.1~1.0，太小不收敛，太大影响 Pose)
+lambda_seg: 0.05                  # Seg Loss 的总权重 (建议 0.1~1.0，太小不收敛，太大影响 Pose)
 seg_loss_type: "focal_dice"      # 使用 BCE + Dice 的混合 Loss (Dice 对物体形状学习更有利)
 seg_dice_weight: 0.5             # 混合 Loss 中 Dice 的占比 (0.5 表示 BCE 和 Dice 各占一半)
 

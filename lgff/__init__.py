@@ -3,11 +3,11 @@
 # Models / engines
 from lgff.models import LGFF_SC, LGFF_SC_SEG, LGFFBase
 from lgff.datasets import SingleObjectDataset
-from lgff.datasets.single_loader_seg import SingleObjectDataset as SingleObjectDatasetSeg
+from lgff.datasets.single_loader_seg import SingleObjectDatasetSeg as SingleObjectDatasetSeg
 from lgff.losses import LGFFLoss, LGFFLoss_SEG
 from lgff.engines import TrainerSC
 from lgff.engines.trainer_sc_seg import TrainerSC as TrainerSCSeg
-from lgff.engines.evaluator_sc_seg import EvaluatorSC as EvaluatorSCSeg
+from lgff.engines.evaluator_sc_seg import EvaluatorSCSeg as EvaluatorSCSeg
 
 # Configuration & utilities
 from lgff.utils import (
