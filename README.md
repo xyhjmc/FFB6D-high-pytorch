@@ -17,6 +17,44 @@ This repository contains a lightweight, high-PyTorch version of the single-objec
 3. Optional: provide `keypoints/obj_xxxxxx.npy` for predefined object-frame keypoints; otherwise they are sampled from the CAD points.
 4. A standalone alignment checker is available: `python lgff/check_gt_alignment.py --config ... --split test --num-samples 8 --save-dir output/check_align_xx` overlays CAD projections and depth points while reporting bidirectional nearest-neighbor distances (meters).
 
+## FFB6D + MinePose (BOP) Pipeline
+This repo also ships a BOP-compatible single-object pipeline for FFB6D (`ffb6d/train_minepose.py`). It expects BOP-format RGB/depth/mask and a per-object keypoints/center `.npy`.
+
+### 1) Environment setup
+Install the shared dependencies:
+```bash
+pip install -r requirement.txt
+```
+Optional dataset tools (mesh rendering / keypoint extraction) live under `common/ffb6d_utils/dataset_tools` and may require:
+```bash
+pip install pyrender trimesh
+```
+
+### 2) MinePose config
+Create a YAML config based on:
+```
+ffb6d/datasets/bop/dataset_config/minepose_sample.yaml
+```
+Key fields:
+- `bop_root`: BOP dataset root (contains `train`/`test` subsets).
+- `bop_train_list` / `bop_test_list`: split lists (one item per line).
+- `bop_obj_id`: object id in `scene_gt.json`.
+- `bop_kps_npy` / `bop_ctr_npy`: object-frame keypoints & center.
+- `bop_models_dir`: directory containing `obj_000001.ply` etc (for ADD/ADD-S).
+
+### 3) Train / Eval
+```bash
+torchrun --nproc_per_node=1 ffb6d/train_minepose.py \\
+  --ds bop --cls minepose --cfg ffb6d/datasets/bop/dataset_config/minepose_sample.yaml \\
+  --gpus 1 --gpu 0
+```
+Evaluation (pose metrics) uses the same script:
+```bash
+torchrun --nproc_per_node=1 ffb6d/train_minepose.py \\
+  --ds bop --cls minepose --cfg ffb6d/datasets/bop/dataset_config/minepose_sample.yaml \\
+  --eval_net --test_pose --gpus 1 --gpu 0
+```
+
 ## Training
 ```bash
 python lgff/train_lgff_sc.py --config lgff/configs/linemod_ape_sc_resnet34.yaml \

@@ -174,6 +174,10 @@ class Basic_Utils():
         self.lm_cls_ptsxyz_cuda_dict = {}
         self.lm_cls_kps_dict = {}
         self.lm_cls_ctr_dict = {}
+        self.bop_cls_ptsxyz_dict = {}
+        self.bop_cls_ptsxyz_cuda_dict = {}
+        self.bop_cls_kps_dict = {}
+        self.bop_cls_ctr_dict = {}
 
     def read_lines(self, p):
         with open(p, 'r') as f:
@@ -540,7 +544,7 @@ class Basic_Utils():
             pointxyz = np.loadtxt(ptxyz_ptn.format(cls), dtype=np.float32)
             self.ycb_cls_ptsxyz_dict[cls] = pointxyz
             return pointxyz
-        else:
+        if ds_type == "linemod":
             ptxyz_pth = os.path.join(
                 'datasets/linemod/Linemod_preprocessed/models',
                 'obj_%02d.ply' % cls
@@ -551,6 +555,16 @@ class Basic_Utils():
             pointxyz = np.delete(pointxyz, dellist, axis=0)
             self.lm_cls_ptsxyz_dict[cls] = pointxyz
             return pointxyz
+        if ds_type == "bop":
+            if cls in self.bop_cls_ptsxyz_dict.keys():
+                return self.bop_cls_ptsxyz_dict[cls]
+            model_pth = os.path.join(
+                self.config.bop_models_dir, 'obj_%06d.ply' % int(cls)
+            )
+            pointxyz = self.ply_vtx(model_pth) / 1000.0
+            self.bop_cls_ptsxyz_dict[cls] = pointxyz
+            return pointxyz
+        raise ValueError(f"Unknown ds_type: {ds_type}")
 
     def get_pointxyz_cuda(
         self, cls, ds_type='ycb'
@@ -562,13 +576,21 @@ class Basic_Utils():
             ptsxyz_cu = torch.from_numpy(ptsxyz.astype(np.float32)).cuda()
             self.ycb_cls_ptsxyz_cuda_dict[cls] = ptsxyz_cu
             return ptsxyz_cu.clone()
-        else:
+        if ds_type == "linemod":
             if cls in self.lm_cls_ptsxyz_cuda_dict.keys():
                 return self.lm_cls_ptsxyz_cuda_dict[cls].clone()
             ptsxyz = self.get_pointxyz(cls, ds_type)
             ptsxyz_cu = torch.from_numpy(ptsxyz.astype(np.float32)).cuda()
             self.lm_cls_ptsxyz_cuda_dict[cls] = ptsxyz_cu
             return ptsxyz_cu.clone()
+        if ds_type == "bop":
+            if cls in self.bop_cls_ptsxyz_cuda_dict.keys():
+                return self.bop_cls_ptsxyz_cuda_dict[cls].clone()
+            ptsxyz = self.get_pointxyz(cls, ds_type)
+            ptsxyz_cu = torch.from_numpy(ptsxyz.astype(np.float32)).cuda()
+            self.bop_cls_ptsxyz_cuda_dict[cls] = ptsxyz_cu
+            return ptsxyz_cu.clone()
+        raise ValueError(f"Unknown ds_type: {ds_type}")
 
     def get_kps(
         self, cls, kp_type='farthest', ds_type='ycb', kp_pth=None
@@ -576,6 +598,17 @@ class Basic_Utils():
         if kp_pth:
             kps = np.loadtxt(kp_pth, dtype=np.float32)
             return kps
+        if ds_type == "bop":
+            if "bop" in self.bop_cls_kps_dict:
+                return self.bop_cls_kps_dict["bop"].copy()
+            kps_pth = self.config.bop_kps_npy
+            if not kps_pth:
+                raise FileNotFoundError("Missing bop_kps_npy in config for BOP keypoints.")
+            kps = np.load(kps_pth).astype(np.float32)
+            if kps.max() > 10:
+                kps = kps / 1000.0
+            self.bop_cls_kps_dict["bop"] = kps
+            return kps.copy()
         if type(cls) is int:
             if ds_type == 'ycb':
                 cls = self.ycb_cls_lst[cls - 1]
@@ -615,6 +648,18 @@ class Basic_Utils():
         if ctr_pth:
             ctr = np.loadtxt(ctr_pth, dtype=np.float32)
             return ctr
+        if ds_type == "bop":
+            if "bop" in self.bop_cls_ctr_dict:
+                return self.bop_cls_ctr_dict["bop"].copy()
+            ctr_pth = self.config.bop_ctr_npy
+            if not ctr_pth:
+                raise FileNotFoundError("Missing bop_ctr_npy in config for BOP center.")
+            ctr = np.load(ctr_pth).astype(np.float32).reshape(-1)
+            if ctr.max() > 10:
+                ctr = ctr / 1000.0
+            ctr = ctr.reshape(3)
+            self.bop_cls_ctr_dict["bop"] = ctr
+            return ctr.copy()
         if type(cls) is int:
             if ds_type == 'ycb':
                 cls = self.ycb_cls_lst[cls - 1]
