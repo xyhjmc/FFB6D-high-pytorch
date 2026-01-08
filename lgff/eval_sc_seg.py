@@ -73,6 +73,10 @@ def main() -> None:
 
     # Merge config
     cfg = merge_cfg_from_checkpoint(cfg_cli, ckpt_state.get("config"))
+    cfg.use_seg_head = True
+    cfg.return_mask = True
+    if bool(getattr(cfg, "seg_ignore_invalid", True)):
+        cfg.return_valid_mask = True
 
     # Work dir
     work_dir = args.work_dir or getattr(cfg, "work_dir", None) or getattr(cfg, "log_dir", "output/eval_seg")
