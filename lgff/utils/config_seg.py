@@ -184,6 +184,8 @@ class LGFFConfigSeg:
     eval_use_pnp: bool = True
     eval_abs_add_thresholds: List[float] = field(default_factory=lambda: [0.005, 0.01, 0.015, 0.02, 0.03])
     eval_rel_add_thresholds: List[float] = field(default_factory=lambda: [0.02, 0.05, 0.10])
+    best_metric_use_eval: bool = False
+    best_metric_eval_save_csv: bool = False
 
     # ICP
     icp_enable: bool = False
