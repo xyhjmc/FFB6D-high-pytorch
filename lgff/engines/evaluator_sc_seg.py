@@ -72,6 +72,7 @@ class EvaluatorSCSeg:
         cfg: LGFFConfigSeg,
         geometry: GeometryToolkit,
         save_dir: Optional[str] = None,
+        save_per_image: bool = True,
     ) -> None:
         self.cfg = cfg
         self.logger = logging.getLogger("lgff.evaluator_seg")
@@ -133,6 +134,7 @@ class EvaluatorSCSeg:
         # per-image records
         self.per_image_records: List[Dict[str, Any]] = []
         self.sample_counter: int = 0
+        self.save_per_image = save_per_image
 
         # ===== PnP =====
         self.use_pnp = bool(getattr(cfg, "eval_use_pnp", True))
@@ -273,14 +275,16 @@ class EvaluatorSCSeg:
                 self._accumulate_meters(batch_pose_metrics, batch_seg_metrics)
 
                 # per-image CSV record
-                self._record_per_image(batch, outputs, pred_rt_final, gt_rt, batch_pose_metrics, batch_seg_metrics)
+                if self.save_per_image:
+                    self._record_per_image(batch, outputs, pred_rt_final, gt_rt, batch_pose_metrics, batch_seg_metrics)
 
         self.logger.info(
             f"Inference Stats: PnP used for {pnp_trigger_count} samples, Regression used for {reg_trigger_count} samples."
         )
 
         summary = self._summarize_metrics()
-        self._dump_per_image_csv()
+        if self.save_per_image:
+            self._dump_per_image_csv()
         return summary
 
     # ==========================================================

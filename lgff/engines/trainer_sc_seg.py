@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import logging
+import os
+from dataclasses import asdict
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -15,6 +17,7 @@ from lgff.utils.pose_metrics_seg import (
     compute_batch_pose_metrics,
     summarize_pose_metrics,
 )
+from lgff.engines.evaluator_sc_seg import EvaluatorSCSeg
 
 # [FIX] 使用新的 amp 接口
 from torch.amp import autocast
@@ -43,10 +46,105 @@ class TrainerSCSeg(TrainerSC):
         super().__init__(model, loss_fn, train_loader, val_loader, cfg, output_dir, resume_path)
         self.logger = logging.getLogger("lgff.trainer_seg")
         self.cfg = cfg
+        self.best_metric_name = self._resolve_best_metric_name()
+        self.best_metric_value = float("-inf")
+
+    def _resolve_best_metric_name(self) -> str:
+        sym_ids = getattr(self.cfg, "sym_class_ids", [])
+        obj_id = getattr(self.cfg, "obj_id", None)
+        if obj_id is not None and obj_id in sym_ids:
+            return "acc_adds<0.100d"
+        return "acc_add<0.100d"
+
+    def _get_best_metric_value(self, val_metrics: Dict[str, float]) -> Optional[float]:
+        metric_name = self._resolve_best_metric_name()
+        metric_value = val_metrics.get(metric_name, None)
+        if metric_value is None:
+            return None
+        if not torch.isfinite(torch.tensor(metric_value)):
+            return None
+        return float(metric_value)
+
+    def _save_checkpoint(self, epoch, is_best=False):
+        state = {
+            "epoch": epoch,
+            "state_dict": self.model.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "best_val_loss": self.best_val_loss,
+            "best_metric_name": self.best_metric_name,
+            "best_metric_value": self.best_metric_value,
+            "config": asdict(self.cfg) if hasattr(self.cfg, "__dataclass_fields__") else self.cfg.__dict__,
+        }
+        torch.save(state, os.path.join(self.output_dir, "checkpoint_last.pth"))
+        if is_best:
+            torch.save(state, os.path.join(self.output_dir, "checkpoint_best.pth"))
+
+    def _load_checkpoint(self, path):
+        ckpt = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(ckpt["state_dict"])
+        self.optimizer.load_state_dict(ckpt["optimizer"])
+        self.start_epoch = ckpt["epoch"] + 1
+        self.best_val_loss = ckpt.get("best_val_loss", float("inf"))
+        self.best_metric_name = ckpt.get("best_metric_name", self._resolve_best_metric_name())
+        self.best_metric_value = ckpt.get("best_metric_value", float("-inf"))
 
     # -------------------------------------------------------------------------
     # [NEW] 重写训练循环
     # -------------------------------------------------------------------------
+    def fit(self) -> None:
+        self.logger.info(f"Start training on device: {self.device}")
+
+        epochs = getattr(self.cfg, "epochs", 50)
+
+        for epoch in range(self.start_epoch, epochs):
+            epoch_idx = epoch + 1
+
+            self._update_loss_schedule(epoch)
+
+            # --- Training ---
+            train_metrics = self._train_one_epoch(epoch)
+
+            # --- Validation ---
+            metric_for_sched: Optional[float] = None
+            val_metrics: Dict[str, float] = {"loss_total": float("nan")}
+
+            if self.val_loader is not None:
+                val_metrics = self._validate(epoch)
+                val_loss = float(val_metrics.get("loss_total", float("nan")))
+                best_metric_value = self._get_best_metric_value(val_metrics)
+
+                if not torch.isfinite(torch.tensor(val_loss)):
+                    self.logger.warning(f"Epoch {epoch_idx}: val_loss is NaN/Inf.")
+                else:
+                    metric_for_sched = val_loss
+                    if best_metric_value is None:
+                        if val_loss < self.best_val_loss:
+                            self.best_val_loss = val_loss
+                            self.best_metric_name = "loss_total"
+                            self.best_metric_value = val_loss
+                            self._save_checkpoint(epoch, is_best=True)
+                    else:
+                        if best_metric_value > self.best_metric_value:
+                            self.best_metric_name = self._resolve_best_metric_name()
+                            self.best_metric_value = best_metric_value
+                            self._save_checkpoint(epoch, is_best=True)
+            else:
+                train_loss = float(train_metrics.get("loss_total", float("nan")))
+                if torch.isfinite(torch.tensor(train_loss)):
+                    metric_for_sched = train_loss
+
+            self._step_scheduler(metric_for_sched)
+            self._save_checkpoint(epoch, is_best=False)
+            self._record_epoch_metrics(epoch_idx, train_metrics, val_metrics)
+
+            self._append_loss_components(epoch_idx, train_metrics)
+
+            self._log_epoch_summary(epoch_idx, epochs, train_metrics, val_metrics)
+
+        self._save_metrics_history()
+        if hasattr(self, "writer") and self.writer:
+            self.writer.close()
+
     def _train_one_epoch(self, epoch: int) -> Dict[str, float]:
         self.model.train()
         self.loss_fn.train()
@@ -232,6 +330,7 @@ class TrainerSCSeg(TrainerSC):
         self.model.eval()
         meters: Dict[str, AverageMeter] = {}
         pose_meter: Dict[str, list[float]] = {}
+        use_eval_metrics = bool(getattr(self.cfg, "best_metric_use_eval", False))
 
         seg_meters = {
             "seg_iou_full": AverageMeter(),
@@ -278,33 +377,34 @@ class TrainerSCSeg(TrainerSC):
                             seg_meters[k].update(v.mean().item(), bs)
 
                 # 4. Pose Metrics
-                valid_mask = self._resolve_pose_valid_mask(outputs, batch)
-                pred_rt = fuse_pose_from_outputs(
-                    outputs, self.geometry, self.cfg, stage="eval", valid_mask=valid_mask
-                )
+                if not use_eval_metrics:
+                    valid_mask = self._resolve_pose_valid_mask(outputs, batch)
+                    pred_rt = fuse_pose_from_outputs(
+                        outputs, self.geometry, self.cfg, stage="eval", valid_mask=valid_mask
+                    )
 
-                if self.obj_diameter is None and batch["model_points"].size(1) > 1:
-                    mp0 = batch["model_points"][0]
-                    self.obj_diameter = float(torch.cdist(mp0.unsqueeze(0), mp0.unsqueeze(0)).max().item())
+                    if self.obj_diameter is None and batch["model_points"].size(1) > 1:
+                        mp0 = batch["model_points"][0]
+                        self.obj_diameter = float(torch.cdist(mp0.unsqueeze(0), mp0.unsqueeze(0)).max().item())
 
-                batch_pose_metrics = compute_batch_pose_metrics(
-                    pred_rt=pred_rt,
-                    gt_rt=batch["pose"],
-                    model_points=batch["model_points"],
-                    cls_ids=batch.get("cls_id"),
-                    geometry=self.geometry,
-                    cfg=self.cfg,
-                )
+                    batch_pose_metrics = compute_batch_pose_metrics(
+                        pred_rt=pred_rt,
+                        gt_rt=batch["pose"],
+                        model_points=batch["model_points"],
+                        cls_ids=batch.get("cls_id"),
+                        geometry=self.geometry,
+                        cfg=self.cfg,
+                    )
 
-                for name, val_list in batch_pose_metrics.items():
-                    if name not in pose_meter: pose_meter[name] = []
-                    if torch.is_tensor(val_list):
-                        if val_list.numel() == 1:
-                            pose_meter[name].append(val_list.item())
+                    for name, val_list in batch_pose_metrics.items():
+                        if name not in pose_meter: pose_meter[name] = []
+                        if torch.is_tensor(val_list):
+                            if val_list.numel() == 1:
+                                pose_meter[name].append(val_list.item())
+                            else:
+                                pose_meter[name].extend(val_list.detach().cpu().numpy().tolist())
                         else:
-                            pose_meter[name].extend(val_list.detach().cpu().numpy().tolist())
-                    else:
-                        pose_meter[name].append(float(val_list))
+                            pose_meter[name].append(float(val_list))
 
                 # Update PBar (Dynamic Detailed Losses)
                 postfix = {}
@@ -334,9 +434,20 @@ class TrainerSCSeg(TrainerSC):
             for k, meter in seg_meters.items():
                 avg_metrics[f"val_{k}"] = meter.avg
 
-        obj_diam = float(self.obj_diameter) if self.obj_diameter else 0.0
-        pose_summary = summarize_pose_metrics(pose_meter, obj_diam, self.cmd_acc_threshold_m)
-        avg_metrics.update(pose_summary)
+        if use_eval_metrics:
+            evaluator = EvaluatorSCSeg(
+                model=self.model,
+                test_loader=self.val_loader,
+                cfg=self.cfg,
+                geometry=self.geometry,
+                save_dir=self.output_dir,
+                save_per_image=bool(getattr(self.cfg, "best_metric_eval_save_csv", False)),
+            )
+            avg_metrics.update(evaluator.run())
+        else:
+            obj_diam = float(self.obj_diameter) if self.obj_diameter else 0.0
+            pose_summary = summarize_pose_metrics(pose_meter, obj_diam, self.cmd_acc_threshold_m)
+            avg_metrics.update(pose_summary)
 
         # Tensorboard
         if hasattr(self, "writer") and self.writer:
@@ -362,7 +473,8 @@ class TrainerSCSeg(TrainerSC):
         msg = (
             f"Epoch [{epoch_idx}/{epochs}] | LR: {lr_now:.2e} | "
             f"T-Loss: {train_loss:.4f} (Seg: {train_seg:.4f}) | "
-            f"V-Loss: {val_loss:.4f} (Seg: {val_seg:.4f}) | V-mIoU: {val_iou:.2%} | V-ADD-S(5mm): {add_s_5mm:.2%}"
+            f"V-Loss: {val_loss:.4f} (Seg: {val_seg:.4f}) | V-mIoU: {val_iou:.2%} | "
+            f"V-ADD-S(5mm): {add_s_5mm:.2%} | Best={self.best_metric_name}={self.best_metric_value:.6f}"
         )
         self.logger.info(msg)
 
